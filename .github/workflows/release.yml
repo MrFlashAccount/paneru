@@ -56,8 +56,24 @@ jobs:
           cargo --version
           xcodebuild -version
 
+      - name: Resolve Rust cache key
+        id: rust_cache_key
+        run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache universal Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/aarch64-apple-darwin/release
+            target/x86_64-apple-darwin/release
+          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-universal-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-universal-
 
       - name: Verify updater configuration
         run: |

@@ -13,10 +13,30 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v4
-    - run: rustup update
-    - run: cargo build --release --verbose
-    - uses: actions/upload-artifact@v4
-      with:
-        name: paneru-macos
-        path: target/release/paneru
+      - uses: actions/checkout@v4
+
+      - name: Update Rust toolchain
+        run: rustup update
+
+      - name: Resolve Rust cache key
+        id: rust_cache_key
+        run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache host Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-host-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-host-
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paneru-macos
+          path: target/release/paneru
