@@ -1,7 +1,8 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use clap::{Parser, Subcommand};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -31,7 +32,7 @@ use platform::service;
 use reader::CommandReader;
 
 use crate::ecs::setup_bevy_app;
-use crate::events::Event;
+use crate::events::{Event, EventReceiver};
 use crate::manager::check_ax_privilege;
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bool {
+fn wait_for_accessibility(sender: EventSender, receiver: &EventReceiver) -> bool {
     let mut platform_callbacks = PlatformCallbacks::new(sender.clone());
     let _menu_bar =
         MenuBarManager::new_accessibility_required(platform_callbacks.main_thread_marker, sender);
@@ -192,7 +193,7 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
     );
 
     loop {
-        platform_callbacks.pump_cocoa_event_loop(0.25);
+        platform_callbacks.pump_cocoa_event_loop(Some(Duration::from_millis(250)));
 
         if check_ax_privilege() {
             return true;
