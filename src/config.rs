@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     env,
     ffi::c_void,
-    fs::{OpenOptions, create_dir_all, read_to_string},
+    fs::{OpenOptions, create_dir_all, read_to_string, write},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     ptr::NonNull,
@@ -40,17 +40,65 @@ pub mod swipe;
 /// XDG configuration directory so a fresh app installation can start with the
 /// built-in defaults.
 pub static CONFIGURATION_FILE: LazyLock<PathBuf> = LazyLock::new(|| {
-    discover_configuration_file().unwrap_or_else(|| {
-        create_default_configuration_file().unwrap_or_else(|error| {
-            panic!(
-                "{}: Unable to create default configuration: {error}",
-                function_name!()
-            )
-        })
+    if let Some(path) = discover_configuration_file() {
+        if let Err(error) = upgrade_generated_configuration(&path) {
+            warn!(%error, path = %path.display(), "Unable to upgrade generated configuration");
+        }
+        return path;
+    }
+
+    create_default_configuration_file().unwrap_or_else(|error| {
+        panic!(
+            "{}: Unable to create default configuration: {error}",
+            function_name!()
+        )
     })
 });
 
-const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
+const LEGACY_DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
+
+const DEFAULT_CONFIGURATION: &str = r#"# Paneru configuration
+
+[options]
+preset_column_widths = [0.5, 0.75, 1.0, 1.5, 2.0]
+window_resize_cycle = false
+
+[swipe]
+sensitivity = 0.20
+deceleration = 4.0
+continuous = true
+sticky = true
+
+[swipe.gesture]
+direction = "Reversed"
+
+[swipe.scroll]
+modifier = "alt"
+
+[decorations]
+workspace_menu_status = true
+workspace_popup_status = false
+
+[bindings]
+window_width_50 = "ctrl+alt+cmd-1"
+window_width_75 = "ctrl+alt+cmd-2"
+window_width_100 = "ctrl+alt+cmd-3"
+window_width_150 = "ctrl+alt+cmd-4"
+window_width_200 = "ctrl+alt+cmd-5"
+window_center = "ctrl+alt+cmd-c"
+window_manage = "ctrl+alt+cmd-m"
+quit = "ctrl+alt+cmd-q"
+"#;
+
+fn upgrade_generated_configuration(path: &Path) -> std::io::Result<bool> {
+    if read_to_string(path)? != LEGACY_DEFAULT_CONFIGURATION {
+        return Ok(false);
+    }
+
+    write(path, DEFAULT_CONFIGURATION)?;
+    info!("Upgraded generated configuration at {}", path.display());
+    Ok(true)
+}
 
 fn default_configuration_file() -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
@@ -2068,7 +2116,21 @@ fn test_first_launch_creates_parseable_config_without_overwriting_it() {
     let path = directory.join("paneru.toml");
 
     assert!(create_configuration_file_at(&path).unwrap());
-    Config::new(&path).expect("generated configuration should parse");
+    let generated = Config::new(&path).expect("generated configuration should parse");
+    assert!(matches!(
+        generated.swipe_gesture_direction(),
+        SwipeGestureDirection::Reversed
+    ));
+    assert!((generated.swipe_sensitivity() - 0.20).abs() < f64::EPSILON);
+    assert!(generated.sticky_scroll());
+
+    std::fs::write(&path, LEGACY_DEFAULT_CONFIGURATION).unwrap();
+    assert!(upgrade_generated_configuration(&path).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        DEFAULT_CONFIGURATION
+    );
+    assert!(!upgrade_generated_configuration(&path).unwrap());
 
     let custom = "[options]\nauto_center = false\n\n[bindings]\n";
     std::fs::write(&path, custom).unwrap();

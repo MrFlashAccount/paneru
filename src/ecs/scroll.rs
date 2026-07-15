@@ -330,6 +330,20 @@ fn smooth_native_scroll(position: f64, target: f64, dt: f64) -> (f64, bool) {
     }
 }
 
+/// Preserve the integrator's subpixel remainder unless viewport constraints
+/// actually changed the integer position that macOS can apply.
+fn reconcile_integrated_position(
+    integrated_position: f64,
+    effective_position: i32,
+    clamped_position: i32,
+) -> f64 {
+    if effective_position == clamped_position {
+        integrated_position
+    } else {
+        f64::from(clamped_position)
+    }
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
@@ -345,8 +359,9 @@ fn apply_scrolling_constraints(
     let (strip, ref mut position, ref mut scroll) = *strip;
 
     let get_window_frame = |entity| windows.moving_frame(entity);
+    let effective_offset = scroll.position as i32;
     if let Some(clamped_offset) = clamp_viewport_offset(
-        scroll.position as i32,
+        effective_offset,
         strip,
         &windows,
         &get_window_frame,
@@ -354,10 +369,12 @@ fn apply_scrolling_constraints(
         &config,
     ) {
         position.x = clamped_offset;
-        scroll.position = f64::from(clamped_offset);
+        scroll.position =
+            reconcile_integrated_position(scroll.position, effective_offset, clamped_offset);
         if let Some(target) = scroll.target_position
+            && let effective_target = target as i32
             && let Some(clamped_target) = clamp_viewport_offset(
-                target as i32,
+                effective_target,
                 strip,
                 &windows,
                 &get_window_frame,
@@ -365,7 +382,11 @@ fn apply_scrolling_constraints(
                 &config,
             )
         {
-            scroll.target_position = Some(f64::from(clamped_target));
+            scroll.target_position = Some(reconcile_integrated_position(
+                target,
+                effective_target,
+                clamped_target,
+            ));
         }
     } else {
         scroll.velocity = 0.0;
@@ -507,7 +528,17 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
 
 #[cfg(test)]
 mod tests {
-    use super::smooth_native_scroll;
+    use std::time::{Duration, Instant};
+
+    use bevy::ecs::query::With;
+    use bevy::prelude::Entity;
+    use bevy::time::TimeUpdateStrategy;
+
+    use super::{Scrolling, smooth_native_scroll};
+    use crate::commands::Command;
+    use crate::ecs::{ActiveWorkspaceMarker, Position};
+    use crate::events::Event;
+    use crate::tests::TestHarness;
 
     #[test]
     fn native_scroll_smoothing_converges_without_overshoot() {
@@ -527,5 +558,52 @@ mod tests {
 
         assert!((position - 100.0).abs() < f64::EPSILON);
         assert!(settled);
+    }
+
+    #[test]
+    fn scrolling_component_is_removed_after_integer_effective_dead_zone() {
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+
+        TestHarness::new()
+            .with_windows(3)
+            .on_iteration(0, |world, _state| {
+                world.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                    16,
+                )));
+                let entity = {
+                    let mut query = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+                    query.single(world).expect("one active workspace")
+                };
+                world.entity_mut(entity).insert(Scrolling {
+                    velocity: 0.0,
+                    position: 0.0,
+                    target_position: Some(-1.0),
+                    snap_pending: false,
+                    is_user_swiping: false,
+                    last_event: Instant::now()
+                        .checked_sub(Duration::from_millis(100))
+                        .expect("100ms must fit before the current instant"),
+                });
+            })
+            .on_iteration(1, |world, _state| {
+                let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+                assert!(
+                    query.single(world).is_err(),
+                    "settled integer-effective motion must remove Scrolling"
+                );
+                let mut positions =
+                    world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+                assert_eq!(
+                    positions.single(world).expect("one active workspace").x,
+                    -1,
+                    "the final effective pixel must be applied before settlement"
+                );
+            })
+            .run(commands);
     }
 }
