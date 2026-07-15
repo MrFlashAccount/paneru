@@ -19,13 +19,26 @@ fi
 /usr/bin/ditto "$APP_DIR" "$STAGE_DIR/Paneru.app"
 /bin/ln -s /Applications "$STAGE_DIR/Applications"
 
-/usr/bin/hdiutil create \
-  -volname Paneru \
-  -srcfolder "$STAGE_DIR" \
-  -ov \
-  -format UDZO \
-  -imagekey zlib-level=9 \
-  "$DMG_PATH"
+for attempt in 1 2 3; do
+  /bin/rm -f "$DMG_PATH"
+  if /usr/bin/hdiutil create \
+    -volname Paneru \
+    -srcfolder "$STAGE_DIR" \
+    -ov \
+    -format UDZO \
+    -imagekey zlib-level=9 \
+    "$DMG_PATH"; then
+    break
+  fi
+
+  if [[ "$attempt" -eq 3 ]]; then
+    echo "Unable to create DMG after $attempt attempts." >&2
+    exit 1
+  fi
+
+  echo "hdiutil create failed on attempt $attempt; retrying..." >&2
+  /bin/sleep "$((attempt * 2))"
+done
 
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
   /usr/bin/codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
