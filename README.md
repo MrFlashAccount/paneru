@@ -145,9 +145,9 @@ scroll wheel.
 
 The generated configuration uses a reversed direction, sensitivity `0.20`,
 and sticky scrolling. When scrolling ends, Paneru smoothly snaps the nearest
-window column to the center. Paneru does not claim the native three-finger
-gesture by default, so the usual macOS gesture for switching Spaces remains
-available.
+window edge to the matching viewport edge and keeps a small outer gap. Paneru
+does not claim the native three-finger gesture by default, so the usual macOS
+gesture for switching Spaces remains available.
 
 #### Default controls
 

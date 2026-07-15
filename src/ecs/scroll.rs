@@ -26,6 +26,7 @@ pub struct ScrollEventsPlugin;
 
 const NATIVE_SCROLL_RESPONSE_SECONDS: f64 = 0.04;
 const NATIVE_SCROLL_SETTLE_PX: f64 = 0.25;
+const STICKY_EDGE_GAP_PX: i32 = 12;
 
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
@@ -253,28 +254,43 @@ fn apply_snap_force(
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let viewport_center = viewport.center().x;
     let snap_threshold = SNAP_DISPLAY_RATIO * f64::from(viewport.width());
 
     if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 || scroll.target_position.is_some() {
         return;
     }
 
-    let target_offset = layout_strip
-        .all_columns()
-        .into_iter()
-        .filter_map(|entity| {
-            windows
-                .layout_position(entity)
-                .map(|p| p.0.x)
-                .zip(Some(entity))
-        })
-        .map(|(position, entity)| {
-            let col_width = windows.moving_frame(entity).map_or(0, |f| f.width());
-            viewport_center - (position + col_width / 2)
-        })
-        .min_by_key(|target| (position.x - target).abs())
-        .unwrap_or(position.x);
+    let get_window_frame = |entity| windows.moving_frame(entity);
+    let target_offset = if sticky {
+        sticky_edge_snap_target(
+            position.x,
+            &viewport,
+            layout_strip.columns().filter_map(|column| {
+                let entity = column.top()?;
+                let column_position = windows.layout_position(entity)?.0.x;
+                let column_width = column.width(&get_window_frame)?;
+                Some((column_position, column_width))
+            }),
+        )
+        .unwrap_or(position.x)
+    } else {
+        let viewport_center = viewport.center().x;
+        layout_strip
+            .all_columns()
+            .into_iter()
+            .filter_map(|entity| {
+                windows
+                    .layout_position(entity)
+                    .map(|p| p.0.x)
+                    .zip(Some(entity))
+            })
+            .map(|(column_position, entity)| {
+                let column_width = windows.moving_frame(entity).map_or(0, |f| f.width());
+                viewport_center - (column_position + column_width / 2)
+            })
+            .min_by_key(|target| (position.x - target).abs())
+            .unwrap_or(position.x)
+    };
 
     let dist_to_snap = f64::from(position.x - target_offset);
     scroll.snap_pending = false;
@@ -284,6 +300,26 @@ fn apply_snap_force(
         scroll.velocity = 0.0;
         scroll.target_position = Some(f64::from(target_offset));
     }
+}
+
+fn sticky_edge_snap_target(
+    current_offset: i32,
+    viewport: &IRect,
+    columns: impl IntoIterator<Item = (i32, i32)>,
+) -> Option<i32> {
+    let edge_gap = STICKY_EDGE_GAP_PX.min(viewport.width().saturating_sub(1) / 2);
+    let left_anchor = viewport.min.x + edge_gap;
+    let right_anchor = viewport.max.x - edge_gap;
+
+    columns
+        .into_iter()
+        .flat_map(|(column_position, column_width)| {
+            [
+                left_anchor - column_position,
+                right_anchor - (column_position + column_width),
+            ]
+        })
+        .min_by_key(|target| (i64::from(current_offset) - i64::from(*target)).abs())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -434,21 +470,33 @@ where
     let left_snap = strip_position(layout_strip.last());
     let right_snap = strip_position(layout_strip.get(1));
 
-    Some(
-        if continuous_swipe
-            && !has_oversized_column
-            && let Some((left_snap, right_snap)) = left_snap.zip(right_snap)
-        {
-            // Allow to scroll away until the last or first window snaps.
-            current_offset.clamp(viewport.min.x - left_snap, viewport.max.x - right_snap)
-        } else if viewport.width() < total_strip_width {
-            // Snap the strip directly to the edges.
-            current_offset.clamp(viewport.max.x - total_strip_width, viewport.min.x)
-        } else {
-            // Snap the strip directly to the edges.
-            current_offset.clamp(viewport.min.x, viewport.max.x - total_strip_width)
-        },
-    )
+    let edge_gap = if config.sticky_scroll() {
+        STICKY_EDGE_GAP_PX.min(viewport.width().saturating_sub(1) / 2)
+    } else {
+        0
+    };
+
+    let (first_edge, last_edge) = if continuous_swipe
+        && !has_oversized_column
+        && let Some((left_snap, right_snap)) = left_snap.zip(right_snap)
+    {
+        // Allow to scroll away until the last or first window reaches the
+        // viewport edge, preserving the sticky outer gap.
+        (
+            viewport.min.x + edge_gap - left_snap,
+            viewport.max.x - edge_gap - right_snap,
+        )
+    } else {
+        // Pan between the leading and trailing strip edges. The min/max form
+        // also handles strips narrower than the viewport without an inverted
+        // clamp range.
+        (
+            viewport.min.x + edge_gap,
+            viewport.max.x - edge_gap - total_strip_width,
+        )
+    };
+
+    Some(current_offset.clamp(first_edge.min(last_edge), first_edge.max(last_edge)))
 }
 
 #[derive(Default)]
@@ -534,7 +582,9 @@ mod tests {
     use bevy::prelude::Entity;
     use bevy::time::TimeUpdateStrategy;
 
-    use super::{Scrolling, smooth_native_scroll};
+    use bevy::math::IRect;
+
+    use super::{Scrolling, smooth_native_scroll, sticky_edge_snap_target};
     use crate::commands::Command;
     use crate::ecs::{ActiveWorkspaceMarker, Position};
     use crate::events::Event;
@@ -558,6 +608,38 @@ mod tests {
 
         assert!((position - 100.0).abs() < f64::EPSILON);
         assert!(settled);
+    }
+
+    #[test]
+    fn sticky_scroll_snaps_column_edges_instead_of_centers() {
+        let viewport = IRect::new(0, 0, 1000, 800);
+        let columns = [(0, 600), (600, 600)];
+
+        assert_eq!(
+            sticky_edge_snap_target(-520, &viewport, columns),
+            Some(-588),
+            "the next column's left edge should land 12px from the viewport edge"
+        );
+        assert_eq!(
+            sticky_edge_snap_target(-260, &viewport, columns),
+            Some(-212),
+            "the current column's right edge should land 12px from the viewport edge"
+        );
+    }
+
+    #[test]
+    fn sticky_scroll_exposes_both_edges_of_an_oversized_column() {
+        let viewport = IRect::new(0, 0, 1000, 800);
+        let oversized_column = [(0, 1500)];
+
+        assert_eq!(
+            sticky_edge_snap_target(-100, &viewport, oversized_column),
+            Some(12)
+        );
+        assert_eq!(
+            sticky_edge_snap_target(-450, &viewport, oversized_column),
+            Some(-512)
+        );
     }
 
     #[test]
