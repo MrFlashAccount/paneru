@@ -70,8 +70,10 @@ inspired by [Niri] and [PaperWM.spoon].
 Download `Paneru-<version>.dmg` from the
 [latest GitHub Release](https://github.com/MrFlashAccount/paneru/releases/latest),
 open it, and drag `Paneru.app` to Applications. Paneru lives in the menu bar;
-there is no Dock icon or main window. Grant it access in **System Settings →
-Privacy & Security → Accessibility** when macOS asks.
+there is no Dock icon or main window. Until Accessibility access is granted it
+stays alive as **Paneru !** in the menu bar. Use **Open Accessibility
+Settings…**, press `+`, select `/Applications/Paneru.app`, and enable it. Paneru
+starts automatically as soon as macOS grants access.
 
 The current releases are ad-hoc signed but not Apple-notarized. If macOS blocks
 the first launch, control-click Paneru in Applications and choose **Open**. If
@@ -84,6 +86,10 @@ xattr -dr com.apple.quarantine /Applications/Paneru.app
 Paneru checks the signed GitHub update feed automatically in the background.
 Use **Check for Updates…** in the menu bar to check immediately. Update
 archives and the appcast are protected with Sparkle's Ed25519 signatures.
+
+Because the current builds are ad-hoc signed, macOS may require Accessibility
+approval again after installing a different Paneru version. A stable Developer
+ID signature is required to preserve that approval safely across updates.
 
 ### Recommended System Options
 

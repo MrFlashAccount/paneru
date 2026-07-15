@@ -1,6 +1,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use clap::{Parser, Subcommand};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -30,6 +31,10 @@ use platform::service;
 use reader::CommandReader;
 
 use crate::ecs::setup_bevy_app;
+use crate::events::Event;
+use crate::manager::check_ax_privilege;
+use crate::menubar::MenuBarManager;
+use crate::platform::PlatformCallbacks;
 
 /// `Paneru` is the main command-line interface structure for the window manager.
 /// It defines the available subcommands for controlling the Paneru daemon.
@@ -146,6 +151,9 @@ fn main() -> Result<()> {
             })
             .expect("setting Ctrl-C handler should succeed");
             CommandReader::new(sender.clone()).start();
+            if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
+                return Ok(());
+            }
             match setup_bevy_app(sender, receiver) {
                 Ok(mut app) => {
                     app.run();
@@ -172,6 +180,39 @@ fn main() -> Result<()> {
         SubCmd::Subscribe { json: _ } => CommandReader::subscribe_json()?,
     }
     Ok(())
+}
+
+fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bool {
+    let mut platform_callbacks = PlatformCallbacks::new(sender.clone());
+    let _menu_bar =
+        MenuBarManager::new_accessibility_required(platform_callbacks.main_thread_marker, sender);
+
+    warn!(
+        "Accessibility access is required. Paneru will remain in the menu bar and start automatically once access is granted."
+    );
+
+    loop {
+        platform_callbacks.pump_cocoa_event_loop(0.25);
+
+        if check_ax_privilege() {
+            return true;
+        }
+
+        match receiver.try_recv() {
+            Ok(
+                Event::Exit
+                | Event::Command {
+                    command: commands::Command::Quit,
+                },
+            )
+            | Err(TryRecvError::Disconnected) => return false,
+            Ok(event) => warn!(
+                ?event,
+                "ignoring event while waiting for Accessibility access"
+            ),
+            Err(TryRecvError::Empty) => {}
+        }
+    }
 }
 
 impl QueryCmd {

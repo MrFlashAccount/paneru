@@ -55,6 +55,16 @@ define_class!(
             self.send_command(Command::Window(Operation::Manage));
         }
 
+        #[unsafe(method(openAccessibilitySettings:))]
+        fn open_accessibility_settings(&self, _: &NSMenuItem) {
+            if let Err(error) = std::process::Command::new("/usr/bin/open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                .spawn()
+            {
+                warn!(%error, "unable to open Accessibility settings");
+            }
+        }
+
         #[unsafe(method(quitPaneru:))]
         fn quit_paneru(&self, _: &NSMenuItem) {
             self.send_command(Command::Quit);
@@ -150,6 +160,33 @@ impl MenuBarManager {
             updater: SparkleUpdater::load(mtm),
             check_for_updates_item: None,
         }
+    }
+
+    pub fn new_accessibility_required(mtm: MainThreadMarker, events: EventSender) -> Self {
+        let mut manager = Self::new(mtm, events);
+        manager.rebuild_accessibility_menu();
+        manager.show_label("Paneru !".to_owned());
+        manager
+    }
+
+    fn rebuild_accessibility_menu(&mut self) {
+        self.menu.removeAllItems();
+
+        let status = self.add_item("Paneru — Accessibility Required", None, None);
+        status.setEnabled(false);
+
+        let hint = self.add_item("Grant access; Paneru will start automatically", None, None);
+        hint.setEnabled(false);
+
+        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
+        self.add_item(
+            "Open Accessibility Settings…",
+            Some(sel!(openAccessibilitySettings:)),
+            None,
+        );
+
+        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
+        self.add_item("Quit Paneru", Some(sel!(quitPaneru:)), None);
     }
 
     fn update(

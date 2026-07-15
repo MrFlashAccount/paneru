@@ -1,4 +1,4 @@
-use accessibility_sys::{AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt};
+use accessibility_sys::AXIsProcessTrusted;
 use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
@@ -7,7 +7,7 @@ use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
-    CGPoint, CGRect, CGSize, kCFBooleanTrue,
+    CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
@@ -782,22 +782,13 @@ pub fn bruteforce_windows(
     found_windows
 }
 
-/// Checks if the application has Accessibility privileges.
-/// It will prompt the user to grant permission if not already granted.
+/// Checks if the application has Accessibility privileges without prompting.
 ///
 /// # Returns
 ///
 /// `true` if Accessibility privileges are granted, `false` otherwise.
 pub fn check_ax_privilege() -> bool {
-    unsafe {
-        let keys = [kAXTrustedCheckOptionPrompt
-            .cast::<CFString>()
-            .as_ref()
-            .unwrap()];
-        let values = [kCFBooleanTrue.unwrap()];
-        let opts = CFDictionary::from_slices(&keys, &values);
-        AXIsProcessTrustedWithOptions((&raw const *opts).cast())
-    }
+    unsafe { AXIsProcessTrusted() }
 }
 
 /// Checks if the macOS "Displays have separate Spaces" option is enabled.
