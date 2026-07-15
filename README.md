@@ -75,6 +75,9 @@ stays alive as **Paneru !** in the menu bar. Use **Open Accessibility
 Settings…**, press `+`, select `/Applications/Paneru.app`, and enable it. Paneru
 starts automatically as soon as macOS grants access.
 
+Prebuilt GitHub releases require an Apple Silicon Mac. Intel Macs are not
+supported by the downloadable app.
+
 The current releases are ad-hoc signed but not Apple-notarized. If macOS blocks
 the first launch, control-click Paneru in Applications and choose **Open**. If
 that is still blocked, remove the downloaded quarantine attribute once:
@@ -222,8 +225,8 @@ To build a local `.app` bundle instead, run:
 open .build/release/Paneru.app
 ```
 
-Local builds target the current Mac architecture. Release builds set
-`PANERU_BUILD_ARCHS=universal` and contain both Apple Silicon and Intel slices.
+Local builds target the current Mac architecture. GitHub release builds target
+Apple Silicon (`arm64`) only.
 
 ### Installing with Homebrew
 

@@ -8,30 +8,28 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Update Rust toolchain
-        run: rustup update
 
       - name: Resolve Rust cache key
         id: rust_cache_key
         run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache host Rust build
+      - name: Cache Apple Silicon Rust build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target/release
-          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-host-${{ hashFiles('Cargo.lock') }}
+          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-host-
+            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-
 
       - name: Build release binary
         run: cargo build --locked --release --verbose

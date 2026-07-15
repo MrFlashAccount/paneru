@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   release:
-    name: Build universal app and publish release
+    name: Build Apple Silicon app and publish release
     runs-on: macos-15
     environment: release
     env:
@@ -60,20 +60,16 @@ jobs:
         id: rust_cache_key
         run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - name: Cache universal Rust build
+      - name: Cache Apple Silicon Rust build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/aarch64-apple-darwin/release
-            target/x86_64-apple-darwin/release
-          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-universal-${{ hashFiles('Cargo.lock') }}
+            target/release
+          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-universal-
+            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-
 
       - name: Verify updater configuration
         run: |
@@ -89,9 +85,9 @@ jobs:
           echo "SPARKLE_DIR=$sparkle_dir" >> "$GITHUB_ENV"
           echo "SPARKLE_BIN=$sparkle_dir/bin" >> "$GITHUB_ENV"
 
-      - name: Build universal app and DMG
+      - name: Build Apple Silicon app and DMG
         env:
-          PANERU_BUILD_ARCHS: universal
+          PANERU_BUILD_ARCHS: host
           PANERU_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           ./scripts/build-app.sh "$PANERU_VERSION"
@@ -131,9 +127,9 @@ jobs:
       - name: Verify release artifacts
         run: |
           executable_archs="$(lipo -archs "$APP_PATH/Contents/MacOS/paneru")"
-          [[ "$executable_archs" == *arm64* && "$executable_archs" == *x86_64* ]]
+          [[ "$executable_archs" == "arm64" ]]
           framework_archs="$(lipo -archs "$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle")"
-          [[ "$framework_archs" == *arm64* && "$framework_archs" == *x86_64* ]]
+          [[ "$framework_archs" == *arm64* ]]
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           hdiutil verify "$DMG_PATH"
           unzip -t "$ZIP_PATH"
