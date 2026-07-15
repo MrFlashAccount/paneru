@@ -91,6 +91,80 @@ Because the current builds are ad-hoc signed, macOS may require Accessibility
 approval again after installing a different Paneru version. A stable Developer
 ID signature is required to preserve that approval safely across updates.
 
+### Getting started
+
+Paneru has no main window. After launch, click **Paneru** in the menu bar to
+control the window that was focused immediately before you opened the menu.
+The currently configured shortcuts appear at the right side of their menu
+items, using the standard macOS symbols.
+
+#### 1. Add windows to the managed strip
+
+1. Click the application window you want Paneru to control.
+2. Open **Paneru** in the menu bar.
+3. Choose **Toggle Managed** or press `Control-Option-Command-M`
+   (`⌃⌥⌘M`).
+4. Repeat for the other application windows you want in the same horizontal
+   strip.
+
+Managed windows are tiled next to one another on the current display and macOS
+Space. **Toggle Managed** switches the focused window between the managed strip
+and a normal floating window. Standard application windows may already be
+managed automatically; use the same action to remove them from or return them
+to the strip.
+
+If the width actions are disabled, the focused window is currently floating.
+Choose **Toggle Managed** first. If **Toggle Managed** is also disabled, click a
+normal application window and reopen the menu; panels, popovers, and some
+non-standard windows cannot be managed automatically.
+
+#### 2. Set the window width
+
+Focus a managed window, then choose a percentage under **Window width** in the
+menu bar or use its shortcut:
+
+| Width | Shortcut |
+| :--- | :--- |
+| 50% | `⌃⌥⌘1` |
+| 75% | `⌃⌥⌘2` |
+| 100% | `⌃⌥⌘3` |
+| 150% | `⌃⌥⌘4` |
+| 200% | `⌃⌥⌘5` |
+
+The percentage is relative to the usable width of the display. A 150% or 200%
+window is intentionally wider than the screen; Paneru keeps it in the
+scrollable strip instead of shrinking it to fit. Use **Center Window** or
+`⌃⌥⌘C` to bring the focused window to the center of the viewport.
+
+#### 3. Scroll through the strip
+
+Hold `Option` (`⌥`) and scroll with two fingers on the trackpad. A horizontal
+gesture moves along the strip; a vertical two-finger scroll is also accepted
+when it has no horizontal component. The same modifier works with a mouse
+scroll wheel.
+
+The generated configuration uses a reversed direction, sensitivity `0.20`,
+and sticky scrolling. When scrolling ends, Paneru smoothly snaps the nearest
+window column to the center. Paneru does not claim the native three-finger
+gesture by default, so the usual macOS gesture for switching Spaces remains
+available.
+
+#### Default controls
+
+| Action | Menu item | Shortcut |
+| :--- | :--- | :--- |
+| Add or remove the focused window from the strip | **Toggle Managed** | `⌃⌥⌘M` |
+| Set an exact width | **Window width → 50–200%** | `⌃⌥⌘1`–`⌃⌥⌘5` |
+| Center the focused window | **Center Window** | `⌃⌥⌘C` |
+| Check for a new version | **Check for Updates…** | — |
+| Quit Paneru | **Quit Paneru** | `⌃⌥⌘Q` |
+
+Paneru writes the first-run configuration to
+`$XDG_CONFIG_HOME/paneru/paneru.toml` (usually
+`~/.config/paneru/paneru.toml`). Changes are reloaded while Paneru is running.
+See the **[Configuration Guide](./CONFIGURATION.md)** to change gestures,
+shortcuts, width presets, window rules, or session restore behavior.
+
 ### Recommended System Options
 
 - Like all non-native window managers for MacOS, Paneru requires accessibility
