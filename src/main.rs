@@ -6,6 +6,7 @@ use std::time::Duration;
 use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+mod accessibility_prompt;
 mod commands;
 mod config;
 mod ecs;
@@ -31,9 +32,10 @@ use errors::Result;
 use platform::service;
 use reader::CommandReader;
 
+use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 use crate::ecs::setup_bevy_app;
 use crate::events::{Event, EventReceiver};
-use crate::manager::check_ax_privilege;
+use crate::manager::{check_ax_privilege, request_ax_privilege};
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 
@@ -188,12 +190,18 @@ fn wait_for_accessibility(sender: EventSender, receiver: &EventReceiver) -> bool
     let _menu_bar =
         MenuBarManager::new_accessibility_required(platform_callbacks.main_thread_marker, sender);
 
+    if show_accessibility_setup(platform_callbacks.main_thread_marker)
+        == AccessibilitySetupAction::Continue
+    {
+        request_ax_privilege();
+    }
+
     warn!(
         "Accessibility access is required. Paneru will remain in the menu bar and start automatically once access is granted."
     );
 
     loop {
-        platform_callbacks.pump_cocoa_event_loop(Some(Duration::from_millis(250)));
+        platform_callbacks.pump_cocoa_event_loop(Some(Duration::from_secs(1)), None);
 
         if check_ax_privilege() {
             return true;

@@ -16,6 +16,7 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use std::time::Instant;
 use tracing::warn;
 
+use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 use crate::commands::{
     Command, Operation, bind_window_command_target, set_last_focused_window_target,
 };
@@ -23,7 +24,7 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged, WidthRatio};
 use crate::events::{Event, EventSender};
-use crate::manager::Window;
+use crate::manager::{Window, request_ax_privilege};
 use crate::platform::Modifiers;
 use crate::updater::SparkleUpdater;
 
@@ -69,6 +70,20 @@ define_class!(
                 .spawn()
             {
                 warn!(%error, "unable to open Accessibility settings");
+            }
+        }
+
+        #[unsafe(method(showAccessibilityInstructions:))]
+        fn show_accessibility_instructions(&self, _: &NSMenuItem) {
+            let Some(main_thread_marker) = MainThreadMarker::new() else {
+                warn!("unable to show Accessibility instructions outside the main thread");
+                return;
+            };
+
+            if show_accessibility_setup(main_thread_marker)
+                == AccessibilitySetupAction::Continue
+            {
+                request_ax_privilege();
             }
         }
 
@@ -234,6 +249,11 @@ impl MenuBarManager {
         hint.setEnabled(false);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
+        self.add_item(
+            "Show Setup Instructions…",
+            Some(sel!(showAccessibilityInstructions:)),
+            None,
+        );
         self.add_item(
             "Open Accessibility Settings…",
             Some(sel!(openAccessibilitySettings:)),
