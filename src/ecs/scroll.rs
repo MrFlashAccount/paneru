@@ -38,6 +38,26 @@ const NATIVE_SCROLL_SETTLE_PX: f64 = 0.25;
 /// engages. This is a hit zone, not a visual gap: the snap lands on the edge.
 const STICKY_EDGE_THRESHOLD_POINTS: i32 = 32;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapMode {
+    Disabled,
+    AutoCenter,
+    Paging,
+    Sticky,
+}
+
+fn snap_mode(paging: bool, sticky: bool, auto_center: bool) -> SnapMode {
+    if sticky {
+        SnapMode::Sticky
+    } else if paging {
+        SnapMode::Paging
+    } else if auto_center {
+        SnapMode::AutoCenter
+    } else {
+        SnapMode::Disabled
+    }
+}
+
 #[derive(Default)]
 struct GestureInput {
     scroll_delta: Option<f64>,
@@ -479,9 +499,9 @@ fn apply_snap_force(
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
 
     let paging = config.swipe_paging();
-    let sticky = config.sticky_scroll();
+    let mode = snap_mode(paging, config.sticky_scroll(), config.auto_center());
     for (layout_strip, position, mut scroll, parent) in &mut strips {
-        if !paging && !sticky && !config.auto_center() {
+        if mode == SnapMode::Disabled {
             scroll.snap_pending = false;
             continue;
         }
@@ -497,49 +517,57 @@ fn apply_snap_force(
         }
 
         let get_window_frame = |entity| windows.moving_frame(entity);
-        let target_offset = if paging {
-            let Some(paging_gesture) = scroll.paging_gesture else {
-                scroll.snap_pending = false;
-                continue;
-            };
-            paging_snap_target(scroll.position, f64::from(viewport.width()), paging_gesture) as i32
-        } else if sticky {
-            let Some(target_offset) = sticky_edge_snap_target(
-                position.x,
-                &viewport,
-                layout_strip.columns().filter_map(|column| {
-                    let entity = column.top()?;
-                    let column_position = windows.layout_position(entity)?.0.x;
-                    let column_width = column.width(&get_window_frame)?;
-                    Some((column_position, column_width))
-                }),
-            ) else {
-                scroll.snap_pending = false;
-                continue;
-            };
-            target_offset
-        } else {
-            let viewport_center = viewport.center().x;
-            layout_strip
-                .all_columns()
-                .into_iter()
-                .filter_map(|entity| {
-                    windows
-                        .layout_position(entity)
-                        .map(|p| p.0.x)
-                        .zip(Some(entity))
-                })
-                .map(|(column_position, entity)| {
-                    let column_width = windows.moving_frame(entity).map_or(0, |f| f.width());
-                    viewport_center - (column_position + column_width / 2)
-                })
-                .min_by_key(|target| (position.x - target).abs())
-                .unwrap_or(position.x)
+        let target_offset = match mode {
+            SnapMode::Sticky => {
+                let Some(target_offset) = sticky_edge_snap_target(
+                    position.x,
+                    &viewport,
+                    layout_strip.columns().filter_map(|column| {
+                        let entity = column.top()?;
+                        let column_position = windows.layout_position(entity)?.0.x;
+                        let column_width = column.width(&get_window_frame)?;
+                        Some((column_position, column_width))
+                    }),
+                ) else {
+                    scroll.snap_pending = false;
+                    continue;
+                };
+                target_offset
+            }
+            SnapMode::Paging => {
+                let Some(paging_gesture) = scroll.paging_gesture else {
+                    scroll.snap_pending = false;
+                    continue;
+                };
+                paging_snap_target(scroll.position, f64::from(viewport.width()), paging_gesture)
+                    as i32
+            }
+            SnapMode::AutoCenter => {
+                let viewport_center = viewport.center().x;
+                layout_strip
+                    .all_columns()
+                    .into_iter()
+                    .filter_map(|entity| {
+                        windows
+                            .layout_position(entity)
+                            .map(|p| p.0.x)
+                            .zip(Some(entity))
+                    })
+                    .map(|(column_position, entity)| {
+                        let column_width = windows.moving_frame(entity).map_or(0, |f| f.width());
+                        viewport_center - (column_position + column_width / 2)
+                    })
+                    .min_by_key(|target| (position.x - target).abs())
+                    .unwrap_or(position.x)
+            }
+            SnapMode::Disabled => unreachable!("disabled snap mode exits before target selection"),
         };
 
         let dist_to_snap = f64::from(position.x - target_offset);
         scroll.snap_pending = false;
-        if paging || sticky || dist_to_snap.abs() < snap_threshold {
+        if matches!(mode, SnapMode::Paging | SnapMode::Sticky)
+            || dist_to_snap.abs() < snap_threshold
+        {
             // Keep Scrolling alive until the shared target integrator reaches
             // the anchor for native modifier-scroll and raw gestures alike.
             scroll.velocity = 0.0;

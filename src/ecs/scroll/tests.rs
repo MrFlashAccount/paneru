@@ -5,7 +5,10 @@ use bevy::math::IRect;
 use bevy::prelude::Entity;
 use bevy::time::TimeUpdateStrategy;
 
-use super::{Scrolling, resume_touchpad_gesture, smooth_native_scroll, sticky_edge_snap_target};
+use super::{
+    Scrolling, SnapMode, resume_touchpad_gesture, smooth_native_scroll, snap_mode,
+    sticky_edge_snap_target,
+};
 use crate::commands::Command;
 use crate::ecs::{ActiveWorkspaceMarker, Position};
 use crate::events::Event;
@@ -63,6 +66,25 @@ fn sticky_scroll_snaps_only_inside_the_edge_hit_zone() {
     );
     assert_eq!(sticky_edge_snap_target(-591, &viewport, columns), None);
     assert_eq!(sticky_edge_snap_target(-167, &viewport, columns), None);
+}
+
+#[test]
+fn sticky_release_zone_overrides_paging_snap_selection() {
+    assert_eq!(snap_mode(true, true, false), SnapMode::Sticky);
+    assert_eq!(snap_mode(true, false, false), SnapMode::Paging);
+
+    let viewport = IRect::new(0, 0, 1000, 800);
+    let columns = [(0, 1000), (1000, 1000)];
+    assert_eq!(
+        sticky_edge_snap_target(-500, &viewport, columns),
+        None,
+        "paging may constrain the gesture, but sticky release must not snap from mid-strip"
+    );
+    assert_eq!(
+        sticky_edge_snap_target(-968, &viewport, columns),
+        Some(-1000),
+        "the combined mode still snaps inside the 32-point edge zone"
+    );
 }
 
 #[test]
