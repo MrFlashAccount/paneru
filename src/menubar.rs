@@ -2,7 +2,7 @@ use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Added, Changed, Has, Or, With};
+use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::system::{Local, NonSendMut, Query, Res};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -16,11 +16,14 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use std::time::Instant;
 use tracing::warn;
 
-use crate::commands::{Command, Operation};
+use crate::commands::{
+    Command, Operation, bind_window_command_target, set_last_focused_window_target,
+};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged, WidthRatio};
 use crate::events::{Event, EventSender};
+use crate::manager::Window;
 use crate::platform::Modifiers;
 use crate::updater::SparkleUpdater;
 
@@ -56,7 +59,7 @@ define_class!(
 
         #[unsafe(method(toggleManaged:))]
         fn toggle_managed(&self, _: &NSMenuItem) {
-            self.send_command(Command::Window(Operation::Manage));
+            self.send_command(Command::Window(Operation::Manage(None)));
         }
 
         #[unsafe(method(openAccessibilitySettings:))]
@@ -92,6 +95,10 @@ impl MenuActionTarget {
     }
 
     fn send_command(&self, command: Command) {
+        let Some(command) = bind_window_command_target(command) else {
+            warn!("ignoring window command because no focused window target is known");
+            return;
+        };
         if let Err(error) = self.ivars().events.send(Event::Command { command }) {
             warn!(%error, "unable to send menu bar command");
         }
@@ -440,7 +447,7 @@ impl Drop for MenuBarManager {
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 pub fn update_menu_bar(
     active_workspace: Query<(Entity, &LayoutStrip), With<ActiveWorkspaceMarker>>,
-    focused: Query<(&WidthRatio, Has<Unmanaged>), With<FocusedMarker>>,
+    focused: Query<(&Window, &WidthRatio, Option<&Unmanaged>), With<FocusedMarker>>,
     config: Res<Config>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
 ) {
@@ -452,9 +459,14 @@ pub fn update_menu_bar(
     };
 
     let focused_window = focused.iter().next();
+    if let Some((window, _, _)) = focused_window {
+        set_last_focused_window_target(window.id());
+    }
+    let can_toggle_focused = focused_window
+        .is_some_and(|(_, _, unmanaged)| matches!(unmanaged, None | Some(Unmanaged::Passthrough)));
     let focused_width_ratio = focused_window
-        .filter(|(_, unmanaged)| !unmanaged)
-        .map(|(ratio, _)| ratio.0);
+        .filter(|(_, _, unmanaged)| unmanaged.is_none())
+        .map(|(_, ratio, _)| ratio.0);
 
     let preset_widths = config.preset_column_widths();
     let shortcuts = menu_shortcuts(&config, &preset_widths);
@@ -462,7 +474,7 @@ pub fn update_menu_bar(
         strip.virtual_index,
         config.workspace_menu_status(),
         &preset_widths,
-        focused_window.is_some(),
+        can_toggle_focused,
         focused_width_ratio,
         &shortcuts,
     );
