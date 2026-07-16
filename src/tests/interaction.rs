@@ -1165,15 +1165,19 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
 /// shifts to make room.
 #[test]
 fn test_mid_strip_insertion_preserves_window_x() {
-    let config: Config = (
-        MainOptions {
-            insert_windows_mid_strip: Some(true),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
+    let config = Config::try_from(
+        r"
+[options]
+insert_windows_mid_strip = true
+swipe_gesture_fingers = 3
+
+[swipe]
+paging = false
+
+[bindings]
+",
     )
-        .into();
+    .expect("valid config");
 
     let mut h = TestHarness::new().with_config(config).with_windows(8);
 

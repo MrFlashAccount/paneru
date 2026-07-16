@@ -149,13 +149,14 @@ when it has no horizontal component. The same modifier works with a mouse
 scroll wheel.
 
 The generated configuration uses a reversed direction, sensitivity `0.20`,
-sticky scrolling, and paging. Paging limits each gesture to adjacent stops: a
-regular window has one stop, while a window wider than the display has exactly
-two—its left and right edges. Sticky release snapping engages only within 32
-points of a real window edge, even when paging is enabled; outside that zone,
-the strip stays where you released it. Paneru does not claim the native
-three-finger gesture by default, so the usual macOS gesture for switching
-Spaces remains available.
+sticky scrolling, paging, and `snap_padding = 32`. Paging limits each gesture
+to adjacent stops: a regular window has one stop, while a window wider than the
+display has exactly two—its left and right edges. Starting a gesture between
+stops cannot skip the first edge in either direction. Sticky release snapping
+engages only within `snap_padding` logical points of a real window edge, even
+when paging is enabled; outside that zone, the strip stays where you released
+it. Paneru does not claim the native three-finger gesture by default, so the
+usual macOS gesture for switching Spaces remains available.
 
 #### Default controls
 

@@ -4,10 +4,12 @@ use bevy::math::IRect;
 
 use crate::ecs::{PagingGesture, Scrolling};
 
-use super::STICKY_EDGE_THRESHOLD_POINTS;
-
 pub(super) const FLING_VELOCITY_THRESHOLD: f64 = 0.5;
 const ADVANCE_RATIO: f64 = 0.25;
+// Window positions are integrated as floats but ultimately applied in integer
+// logical points. Treat sub-point drift as exact stop alignment so an already
+// consumed stop is not reintroduced as a movement boundary.
+const STOP_ALIGNMENT_EPSILON: f64 = 0.5;
 
 pub(super) fn capture_gesture(
     current_position: f64,
@@ -24,11 +26,36 @@ pub(super) fn capture_gesture(
                 .total_cmp(&(current_position - **right).abs())
         })?
         .0;
+    let start_stop = stops[start_index];
+    let (previous_stop, next_stop) =
+        if (current_position - start_stop).abs() <= STOP_ALIGNMENT_EPSILON {
+            (
+                start_index.checked_sub(1).map(|index| stops[index]),
+                stops.get(start_index + 1).copied(),
+            )
+        } else {
+            // The release target is still the nearest stop, but motion bounds
+            // must be derived from the real gesture origin. If the strip starts
+            // between two stops, deriving both neighbors from the nearest stop
+            // marks that edge as already consumed and lets one direction skip it.
+            (
+                stops
+                    .iter()
+                    .copied()
+                    .filter(|stop| *stop > current_position)
+                    .min_by(f64::total_cmp),
+                stops
+                    .iter()
+                    .copied()
+                    .filter(|stop| *stop < current_position)
+                    .max_by(f64::total_cmp),
+            )
+        };
 
     Some(PagingGesture {
-        start_stop: stops[start_index],
-        previous_stop: start_index.checked_sub(1).map(|index| stops[index]),
-        next_stop: stops.get(start_index + 1).copied(),
+        start_stop,
+        previous_stop,
+        next_stop,
         release_velocity: 0.0,
     })
 }
@@ -96,6 +123,7 @@ pub(super) fn snap_target(
     current_position: f64,
     viewport_width: f64,
     paging: PagingGesture,
+    snap_padding: i32,
 ) -> f64 {
     let edge_target = [
         Some(paging.start_stop),
@@ -104,7 +132,7 @@ pub(super) fn snap_target(
     ]
     .into_iter()
     .flatten()
-    .filter(|stop| (current_position - *stop).abs() <= f64::from(STICKY_EDGE_THRESHOLD_POINTS))
+    .filter(|stop| (current_position - *stop).abs() <= f64::from(snap_padding))
     .min_by(|left, right| {
         (current_position - *left)
             .abs()
@@ -197,6 +225,44 @@ mod tests {
             (right.previous_stop, right.next_stop),
             (Some(-600.0), Some(-1700.0))
         );
+        let sub_point_drift = capture_gesture(-599.75, &viewport, columns).unwrap();
+        assert_eq!(
+            (sub_point_drift.previous_stop, sub_point_drift.next_stop),
+            (Some(0.0), Some(-1100.0))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn unsnapped_origin_cannot_skip_the_first_stop_in_either_direction() {
+        let viewport = IRect::new(0, 0, 1000, 800);
+        let columns = [(0, 600), (600, 1500), (2100, 600)];
+        let paging = capture_gesture(-700.0, &viewport, columns).unwrap();
+        assert_eq!(paging.start_stop, -600.0);
+        assert_eq!(paging.previous_stop, Some(-600.0));
+        assert_eq!(paging.next_stop, Some(-1100.0));
+
+        let mut towards_previous = Scrolling {
+            position: 500.0,
+            target_position: Some(500.0),
+            velocity: 2.0,
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        constrain_motion(&mut towards_previous, 1.0);
+        assert_eq!(towards_previous.position, -600.0);
+        assert_eq!(towards_previous.target_position, Some(-600.0));
+
+        let mut towards_next = Scrolling {
+            position: -5000.0,
+            target_position: Some(-5000.0),
+            velocity: -2.0,
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        constrain_motion(&mut towards_next, 1.0);
+        assert_eq!(towards_next.position, -1100.0);
+        assert_eq!(towards_next.target_position, Some(-1100.0));
     }
 
     #[test]
@@ -235,9 +301,9 @@ mod tests {
     #[test]
     fn release_returns_or_advances_exactly_one_stop() {
         let paging = gesture();
-        assert_eq!(snap_target(-700.0, 1000.0, paging), -600.0);
-        assert_eq!(snap_target(-730.0, 1000.0, paging), -1100.0);
-        assert_eq!(snap_target(-1080.0, 1000.0, paging), -1100.0);
+        assert_eq!(snap_target(-700.0, 1000.0, paging, 32), -600.0);
+        assert_eq!(snap_target(-730.0, 1000.0, paging, 32), -1100.0);
+        assert_eq!(snap_target(-1080.0, 1000.0, paging, 32), -1100.0);
         assert_eq!(
             snap_target(
                 -650.0,
@@ -245,7 +311,8 @@ mod tests {
                 PagingGesture {
                     release_velocity: -0.5,
                     ..paging
-                }
+                },
+                32,
             ),
             -1100.0
         );
@@ -258,10 +325,19 @@ mod tests {
                     previous_stop: Some(-600.0),
                     next_stop: Some(-1700.0),
                     release_velocity: 0.0
-                }
+                },
+                32,
             ),
             -600.0
         );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn larger_snap_padding_prefers_a_nearby_stop() {
+        let paging = gesture();
+        assert_eq!(snap_target(-730.0, 1000.0, paging, 32), -1100.0);
+        assert_eq!(snap_target(-730.0, 1000.0, paging, 160), -600.0);
     }
 
     #[test]

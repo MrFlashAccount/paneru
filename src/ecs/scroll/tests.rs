@@ -57,15 +57,26 @@ fn sticky_scroll_snaps_only_inside_the_edge_hit_zone() {
     let viewport = IRect::new(0, 0, 1000, 800);
     let columns = [(0, 600), (600, 600)];
     assert_eq!(
-        sticky_edge_snap_target(-631, &viewport, columns),
+        sticky_edge_snap_target(-631, &viewport, columns, 32),
         Some(-600)
     );
     assert_eq!(
-        sticky_edge_snap_target(-169, &viewport, columns),
+        sticky_edge_snap_target(-169, &viewport, columns, 32),
         Some(-200)
     );
-    assert_eq!(sticky_edge_snap_target(-591, &viewport, columns), None);
-    assert_eq!(sticky_edge_snap_target(-167, &viewport, columns), None);
+    assert_eq!(sticky_edge_snap_target(-591, &viewport, columns, 32), None);
+    assert_eq!(sticky_edge_snap_target(-167, &viewport, columns, 32), None);
+}
+
+#[test]
+fn sticky_scroll_uses_configured_edge_hit_zone() {
+    let viewport = IRect::new(0, 0, 1000, 800);
+    let columns = [(0, 600), (600, 600)];
+    assert_eq!(sticky_edge_snap_target(-650, &viewport, columns, 32), None);
+    assert_eq!(
+        sticky_edge_snap_target(-650, &viewport, columns, 64),
+        Some(-600)
+    );
 }
 
 #[test]
@@ -76,12 +87,12 @@ fn sticky_release_zone_overrides_paging_snap_selection() {
     let viewport = IRect::new(0, 0, 1000, 800);
     let columns = [(0, 1000), (1000, 1000)];
     assert_eq!(
-        sticky_edge_snap_target(-500, &viewport, columns),
+        sticky_edge_snap_target(-500, &viewport, columns, 32),
         None,
         "paging may constrain the gesture, but sticky release must not snap from mid-strip"
     );
     assert_eq!(
-        sticky_edge_snap_target(-968, &viewport, columns),
+        sticky_edge_snap_target(-968, &viewport, columns, 32),
         Some(-1000),
         "the combined mode still snaps inside the 32-point edge zone"
     );
@@ -91,9 +102,12 @@ fn sticky_release_zone_overrides_paging_snap_selection() {
 fn sticky_scroll_exposes_both_edges_of_an_oversized_column() {
     let viewport = IRect::new(0, 0, 1000, 800);
     let column = [(0, 1500)];
-    assert_eq!(sticky_edge_snap_target(-9, &viewport, column), Some(0));
-    assert_eq!(sticky_edge_snap_target(-491, &viewport, column), Some(-500));
-    assert_eq!(sticky_edge_snap_target(-250, &viewport, column), None);
+    assert_eq!(sticky_edge_snap_target(-9, &viewport, column, 32), Some(0));
+    assert_eq!(
+        sticky_edge_snap_target(-491, &viewport, column, 32),
+        Some(-500)
+    );
+    assert_eq!(sticky_edge_snap_target(-250, &viewport, column, 32), None);
 }
 
 #[test]
@@ -316,10 +330,14 @@ fn physical_up_and_momentum_start_in_same_update_leave_momentum_active() {
 }
 
 fn assert_original_oversized_paging_session(world: &mut bevy::prelude::World) {
-    let (paging, _, _, _, _) = paging_snapshot(world);
+    let (paging, position, target_position, _, _) = paging_snapshot(world);
     assert_eq!(paging.start_stop, -1024.0);
     assert_eq!(paging.previous_stop, Some(0.0));
-    assert_eq!(paging.next_stop, None);
+    assert_eq!(
+        paging.next_stop,
+        Some(-1024.0),
+        "position={position}, target_position={target_position:?}"
+    );
 }
 
 fn paging_snapshot(

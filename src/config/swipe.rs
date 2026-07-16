@@ -27,6 +27,10 @@ pub struct SwipeOptions {
     /// Default: false.
     pub sticky: Option<bool>,
 
+    /// Logical-point distance from a column edge where release snapping engages.
+    /// Default: 32.
+    pub snap_padding: Option<u16>,
+
     /// Limit each physical gesture to one adjacent window-edge stop.
     /// Default: true.
     pub paging: Option<bool>,

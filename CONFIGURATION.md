@@ -59,8 +59,9 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | Controls strip edge limits while scrolling; disable to clamp strictly to the full content bounds. |
-| `paging` | Boolean | `true` | Limit one gesture to at most one adjacent stop. A regular column has one stop; an oversized column has exactly two, at its left and right edges. Set to `false` to restore free scrolling. |
-| `sticky` | Boolean | `false` | Snap exactly to a column edge only when scrolling ends inside its 32-point hit zone. With `paging = true`, paging still limits the gesture to adjacent stops, but `sticky` controls whether release snapping engages. |
+| `paging` | Boolean | `true` | Limit one gesture to at most one adjacent stop. A regular column has one stop; an oversized column has exactly two, at its left and right edges. If a gesture starts between stops, the first stop in either direction remains the gesture boundary. Set to `false` to restore free scrolling. |
+| `sticky` | Boolean | `false` | Snap exactly to a column edge only when scrolling ends inside its configured hit zone. With `paging = true`, paging still limits the gesture to adjacent stops, but `sticky` controls whether release snapping engages. |
+| `snap_padding` | Integer (≥ 0) | `32` | Size of the edge hit zone in logical points. Increase it to make nearby column edges capture the released strip from farther away, including the nearby-stop preference used by paging. The window still lands exactly on the edge. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |

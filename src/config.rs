@@ -68,6 +68,7 @@ sensitivity = 0.20
 deceleration = 4.0
 continuous = true
 sticky = true
+snap_padding = 32
 paging = true
 
 [swipe.gesture]
@@ -777,6 +778,14 @@ impl Config {
             .as_ref()
             .and_then(|swipe| swipe.sticky)
             .unwrap_or(false)
+    }
+
+    pub fn snap_padding(&self) -> i32 {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.snap_padding)
+            .map_or(32, i32::from)
     }
 
     pub fn swipe_paging(&self) -> bool {
@@ -1900,6 +1909,7 @@ fn test_sticky_scroll_config() {
 
 [swipe]
 sticky = true
+snap_padding = 64
 
 [bindings]
 ",
@@ -1907,6 +1917,7 @@ sticky = true
     .expect("sticky swipe config should parse");
 
     assert!(config.sticky_scroll());
+    assert_eq!(config.snap_padding(), 64);
 }
 
 #[test]
@@ -2139,6 +2150,7 @@ fn test_config_defaults() {
     assert_eq!(config.border_width(), 2.0);
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
+    assert_eq!(config.snap_padding(), 32);
 }
 
 #[test]
@@ -2162,6 +2174,7 @@ fn test_first_launch_creates_parseable_config_without_overwriting_it() {
     ));
     assert!((generated.swipe_sensitivity() - 0.20).abs() < f64::EPSILON);
     assert!(generated.sticky_scroll());
+    assert_eq!(generated.snap_padding(), 32);
     assert!(generated.swipe_paging());
 
     std::fs::write(&path, LEGACY_DEFAULT_CONFIGURATION).unwrap();

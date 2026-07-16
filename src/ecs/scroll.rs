@@ -34,9 +34,6 @@ pub struct ScrollEventsPlugin;
 
 const NATIVE_SCROLL_RESPONSE_SECONDS: f64 = 0.04;
 const NATIVE_SCROLL_SETTLE_PX: f64 = 0.25;
-/// Logical-point distance inside a window edge at which sticky scrolling
-/// engages. This is a hit zone, not a visual gap: the snap lands on the edge.
-const STICKY_EDGE_THRESHOLD_POINTS: i32 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnapMode {
@@ -499,6 +496,7 @@ fn apply_snap_force(
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
 
     let paging = config.swipe_paging();
+    let snap_padding = config.snap_padding();
     let mode = snap_mode(paging, config.sticky_scroll(), config.auto_center());
     for (layout_strip, position, mut scroll, parent) in &mut strips {
         if mode == SnapMode::Disabled {
@@ -528,6 +526,7 @@ fn apply_snap_force(
                         let column_width = column.width(&get_window_frame)?;
                         Some((column_position, column_width))
                     }),
+                    snap_padding,
                 ) else {
                     scroll.snap_pending = false;
                     continue;
@@ -539,8 +538,12 @@ fn apply_snap_force(
                     scroll.snap_pending = false;
                     continue;
                 };
-                paging_snap_target(scroll.position, f64::from(viewport.width()), paging_gesture)
-                    as i32
+                paging_snap_target(
+                    scroll.position,
+                    f64::from(viewport.width()),
+                    paging_gesture,
+                    snap_padding,
+                ) as i32
             }
             SnapMode::AutoCenter => {
                 let viewport_center = viewport.center().x;
@@ -580,9 +583,10 @@ fn sticky_edge_snap_target(
     current_offset: i32,
     viewport: &IRect,
     columns: impl IntoIterator<Item = (i32, i32)>,
+    snap_padding: i32,
 ) -> Option<i32> {
     let current_offset = i64::from(current_offset);
-    let threshold = i64::from(STICKY_EDGE_THRESHOLD_POINTS);
+    let threshold = i64::from(snap_padding);
 
     columns
         .into_iter()
