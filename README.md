@@ -111,12 +111,14 @@ items, using the standard macOS symbols.
    strip.
 
 Managed windows are tiled next to one another on the current display and macOS
-Space. **Toggle Managed** switches the focused window between the managed strip
-and a normal floating window. Standard application windows may already be
-managed automatically; use the same action to remove them from or return them
-to the strip.
+Space. Normal windows start in passthrough mode and behave like ordinary macOS
+windows until you opt them in. **Toggle Managed** changes only the concrete
+window that was focused when the shortcut was pressed or immediately before
+the menu opened; it does not toggle the workspace or every window in an
+application. Toggling the window off restores its pre-management frame when
+Paneru captured one.
 
-If the width actions are disabled, the focused window is currently floating.
+If the width actions are disabled, the focused window is not currently managed.
 Choose **Toggle Managed** first. If **Toggle Managed** is also disabled, click a
 normal application window and reopen the menu; panels, popovers, and some
 non-standard windows cannot be managed automatically.
@@ -339,7 +341,7 @@ $ paneru send-cmd <command> [args...]
 | `window grow`              | Grow to the next preset width                    |
 | `window shrink`            | Shrink to the previous preset width              |
 | `window fullwidth`         | Toggle full-width mode for the focused window    |
-| `window manage`            | Toggle managed/floating state                    |
+| `window manage`            | Toggle the last focused window in/out of the strip |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |
 | `window stack`             | Stack the focused window onto its left neighbour |
