@@ -34,6 +34,9 @@ pub struct ScrollEventsPlugin;
 
 const NATIVE_SCROLL_RESPONSE_SECONDS: f64 = 0.04;
 const NATIVE_SCROLL_SETTLE_PX: f64 = 0.25;
+const SCROLL_VELOCITY_EPSILON: f64 = 0.0001;
+const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
+const STALE_GESTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnapMode {
@@ -400,6 +403,37 @@ fn finish_touchpad_gesture(
     }
 }
 
+pub(super) fn scrolling_needs_frame(scroll: &Scrolling) -> bool {
+    scroll.target_position.is_some()
+        || scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON
+        || (!scroll.gesture_active && (scroll.is_user_swiping || scroll.snap_pending))
+}
+
+pub(super) fn scrolling_deadline(scroll: &Scrolling) -> Option<Instant> {
+    if scroll.gesture_active {
+        Some(scroll.last_event + STALE_GESTURE_TIMEOUT)
+    } else if scroll.is_user_swiping
+        && scroll.target_position.is_none()
+        && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
+    {
+        Some(scroll.last_event + FINGER_LIFT_THRESHOLD)
+    } else {
+        None
+    }
+}
+
+fn expire_stale_gesture(scroll: &mut Scrolling, now: Instant) -> bool {
+    if scroll.gesture_active
+        && now.saturating_duration_since(scroll.last_event) >= STALE_GESTURE_TIMEOUT
+    {
+        scroll.gesture_active = false;
+        scroll.is_user_swiping = false;
+        true
+    } else {
+        false
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
@@ -410,16 +444,17 @@ pub(super) fn swiping_timeout(
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
     let dt = time.delta_secs_f64();
+    let now = Instant::now();
 
     for (entity, mut scroll, parent) in strips {
         let Ok((display, dock)) = displays.get(parent.parent()) else {
             continue;
         };
         let viewport_width = f64::from(display.actual_display_bounds(dock, &config).width());
-        let timed_out =
-            !scroll.gesture_active && scroll.last_event.elapsed() > FINGER_LIFT_THRESHOLD;
+        expire_stale_gesture(&mut scroll, now);
+        let timed_out = !scroll.gesture_active
+            && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD;
         let outcome = update_swipe_timeout(&mut scroll, timed_out, dt, viewport_width);
         if outcome.remove
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -650,7 +685,7 @@ fn integrate_scrolling(
                 scroll.paging_gesture = None;
             }
         }
-    } else if scroll.velocity.abs() > 0.0001 {
+    } else if scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON {
         scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
         constrain_paging_motion(scroll, direction_modifier);
     }
@@ -681,6 +716,15 @@ fn reconcile_integrated_position(
     }
 }
 
+fn set_position_x_if_changed(
+    position: &mut bevy::ecs::change_detection::Mut<'_, Position>,
+    x: i32,
+) {
+    if position.x != x {
+        position.x = x;
+    }
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
@@ -704,7 +748,7 @@ fn apply_scrolling_constraints(
             &viewport,
             &config,
         ) {
-            position.x = clamped_offset;
+            set_position_x_if_changed(&mut position, clamped_offset);
             scroll.position =
                 reconcile_integrated_position(scroll.position, effective_offset, clamped_offset);
             if let Some(target) = scroll.target_position
@@ -885,9 +929,12 @@ mod performance_tests {
     use bevy::prelude::{App, ChildOf, Update};
 
     use super::{
-        Scrolling, cleanup_detached_scrolling, integrate_scrolling, reconcile_integrated_position,
-        update_swipe_timeout,
+        STALE_GESTURE_TIMEOUT, Scrolling, cleanup_detached_scrolling, expire_stale_gesture,
+        integrate_scrolling, reconcile_integrated_position, scrolling_needs_frame,
+        set_position_x_if_changed, update_swipe_timeout,
     };
+    use crate::ecs::Position;
+    use crate::manager::Origin;
 
     #[test]
     fn detached_strip_cancels_scrolling_on_next_ecs_update() {
@@ -903,6 +950,57 @@ mod performance_tests {
         app.update();
 
         assert!(!app.world().entity(strip).contains::<Scrolling>());
+    }
+
+    #[test]
+    fn stationary_contact_is_passive_until_the_stale_watchdog_expires() {
+        let last_event = Instant::now();
+        let mut scrolling = Scrolling {
+            is_user_swiping: true,
+            gesture_active: true,
+            snap_pending: true,
+            last_event,
+            ..Default::default()
+        };
+
+        assert!(!scrolling_needs_frame(&scrolling));
+        assert!(!expire_stale_gesture(
+            &mut scrolling,
+            last_event + STALE_GESTURE_TIMEOUT.saturating_sub(std::time::Duration::from_millis(1))
+        ));
+        assert!(scrolling.gesture_active);
+
+        assert!(expire_stale_gesture(
+            &mut scrolling,
+            last_event + STALE_GESTURE_TIMEOUT
+        ));
+        assert!(!scrolling.gesture_active);
+        assert!(!scrolling.is_user_swiping);
+        assert!(scrolling_needs_frame(&scrolling));
+    }
+
+    #[test]
+    fn unchanged_integer_scroll_position_does_not_trigger_change_detection() {
+        use bevy::ecs::change_detection::DetectChanges as _;
+
+        let mut world = bevy::prelude::World::new();
+        let strip = world.spawn(Position(Origin::new(42, 0))).id();
+        world.clear_trackers();
+
+        {
+            let mut entity = world.entity_mut(strip);
+            let mut position = entity.get_mut::<Position>().expect("strip position");
+            set_position_x_if_changed(&mut position, 42);
+        }
+
+        let position = world
+            .entity(strip)
+            .get_ref::<Position>()
+            .expect("strip position");
+        assert!(
+            !position.is_changed(),
+            "an idle scrolling component must not keep persistence dirty"
+        );
     }
 
     #[test]

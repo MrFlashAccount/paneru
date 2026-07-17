@@ -154,7 +154,7 @@ pub(super) struct RuntimeWork<'w, 's> {
         ),
         With<ResizeMarker>,
     >,
-    scrolling: Query<'w, 's, (), With<Scrolling>>,
+    scrolling: Query<'w, 's, &'static Scrolling>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     timeouts: Query<'w, 's, &'static Timeout>,
     fresh_polls: Query<'w, 's, &'static FreshPollDeadline, With<FreshMarker>>,
@@ -238,6 +238,11 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
         .menu_bar
         .as_deref()
         .and_then(MenuBarManager::updater_deadline);
+    let scrolling_deadline = work
+        .scrolling
+        .iter()
+        .filter_map(super::scroll::scrolling_deadline)
+        .min();
     let immediate_deferred = work
         .initializing
         .is_some()
@@ -253,7 +258,10 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
                 .copied()
                 .unwrap_or(WindowDisposition::Managed)
                 .owns_geometry(unmanaged)
-        }) || !work.scrolling.is_empty()
+        }) || work
+            .scrolling
+            .iter()
+            .any(super::scroll::scrolling_needs_frame)
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -267,6 +275,7 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
             restore_deadline,
             persistence_deadline,
             updater_deadline,
+            scrolling_deadline,
             immediate_deferred,
         ]),
     }
@@ -488,6 +497,65 @@ mod tests {
         let activity = app.world().resource::<CapturedActivity>().0.unwrap();
         assert_eq!(activity.nearest_deadline, Some(active_deadline));
         assert!(activity.wait(now).is_some_and(|wait| wait > Duration::ZERO));
+    }
+
+    #[test]
+    fn passive_touch_contact_does_not_request_display_frames() {
+        let mut app = App::new();
+        app.init_resource::<CapturedActivity>()
+            .add_systems(Update, capture_activity);
+        app.world_mut().spawn(Scrolling {
+            is_user_swiping: true,
+            gesture_active: true,
+            snap_pending: true,
+            ..Default::default()
+        });
+
+        app.update();
+
+        let activity = app.world().resource::<CapturedActivity>().0.unwrap();
+        assert!(
+            !activity.frame_work,
+            "a stationary finger or lost terminal event must not keep the display link armed"
+        );
+        assert!(
+            activity.nearest_deadline.is_some(),
+            "a passive contact still needs one bounded stale-session wake"
+        );
+    }
+
+    #[test]
+    fn scrolling_motion_requests_display_frames() {
+        for scrolling in [
+            Scrolling {
+                velocity: 0.5,
+                ..Default::default()
+            },
+            Scrolling {
+                target_position: Some(-100.0),
+                ..Default::default()
+            },
+            Scrolling {
+                snap_pending: true,
+                ..Default::default()
+            },
+        ] {
+            let mut app = App::new();
+            app.init_resource::<CapturedActivity>()
+                .add_systems(Update, capture_activity);
+            app.world_mut().spawn(scrolling);
+
+            app.update();
+
+            assert!(
+                app.world()
+                    .resource::<CapturedActivity>()
+                    .0
+                    .unwrap()
+                    .frame_work,
+                "velocity, target settlement, and actionable snapping need display frames"
+            );
+        }
     }
 
     #[derive(Resource, Default)]
