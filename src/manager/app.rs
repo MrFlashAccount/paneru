@@ -365,10 +365,31 @@ fn should_store_new_context(has_existing: bool, newly_registered: bool) -> bool 
     !has_existing && newly_registered
 }
 
-fn removal_allows_context_release(results: impl IntoIterator<Item = AXError>) -> bool {
-    results
+fn observer_context_ptr(
+    contexts: &[Pin<Box<ObserverContext>>],
+    which: ObserverType,
+) -> Option<NonNull<ObserverContext>> {
+    contexts
+        .iter()
+        .find(|context| context.which == which)
+        .map(|context| NonNull::from_ref(context.as_ref().get_ref()))
+}
+
+fn apply_removal_results(
+    contexts: &[Pin<Box<ObserverContext>>],
+    which: ObserverType,
+    results: impl IntoIterator<Item = AXError>,
+) -> bool {
+    let completed = results
         .into_iter()
-        .all(|result| result == kAXErrorSuccess || result == kAXErrorNotificationNotRegistered)
+        .all(|result| result == kAXErrorSuccess || result == kAXErrorNotificationNotRegistered);
+    if completed {
+        // AX may already have queued callbacks with this refcon. Removing the
+        // registration must never release it; contexts live until the handler's
+        // run-loop source is removed during destruction.
+        debug_assert!(observer_context_ptr(contexts, which).is_some());
+    }
+    completed
 }
 
 /// `ObserverContext` holds the `EventSender` and the `ObserverType`,
@@ -539,7 +560,7 @@ impl AxObserverHandler {
     ) -> Result<Vec<&str>> {
         let observer: AXObserverRef = self.observer.as_ptr();
         let mut contexts = self.contexts.force_write();
-        let existing_context = contexts.iter().find(|context| context.which == which);
+        let existing_context = observer_context_ptr(&contexts, which);
         let new_context = existing_context.is_none().then(|| {
             Box::pin(ObserverContext {
                 events: self.events.clone(),
@@ -548,7 +569,7 @@ impl AxObserverHandler {
         });
         let context_ptr = existing_context.map_or_else(
             || NonNull::from_ref(&**new_context.as_ref().expect("new context exists")).as_ptr(),
-            |context| NonNull::from_ref(context.as_ref().get_ref()).as_ptr(),
+            NonNull::as_ptr,
         );
 
         // TODO: retry re-registering these.
@@ -611,7 +632,7 @@ impl AxObserverHandler {
         element: &AXUIWrapper,
         notifications: &[&'static str],
     ) -> bool {
-        let mut existing = self.contexts.force_write();
+        let existing = self.contexts.force_read();
         if !existing.iter().any(|context| context.which == *which) {
             debug!("{which:?} ({element}) already un-observed, skipping!");
             return true;
@@ -629,8 +650,7 @@ impl AxObserverHandler {
                 debug!("error removing {name} {element:x?} {observer:?}: {result}");
             }
         }
-        if removal_allows_context_release(results) {
-            existing.retain(|context| context.which != *which);
+        if apply_removal_results(&existing, *which, results) {
             self.pending_removals
                 .retain(|pending| pending.which != *which);
             true
@@ -659,7 +679,7 @@ impl AxObserverHandler {
     fn retry_pending_removals(&mut self) -> bool {
         let observer: AXObserverRef = self.observer.deref().as_ptr();
         let mut still_pending = Vec::new();
-        let mut contexts = self.contexts.force_write();
+        let contexts = self.contexts.force_read();
         for pending in self.pending_removals.drain(..) {
             let results = pending.notifications.iter().map(|name| {
                 let notification = CFString::from_static_str(name);
@@ -667,8 +687,7 @@ impl AxObserverHandler {
                     AXObserverRemoveNotification(observer, pending.element.as_ptr(), &notification)
                 }
             });
-            if removal_allows_context_release(results) {
-                contexts.retain(|context| context.which != pending.which);
+            if apply_removal_results(&contexts, pending.which, results) {
                 debug!("observer removal retry completed for {:?}", pending.which);
             } else {
                 still_pending.push(pending);
@@ -708,12 +727,13 @@ impl AxObserverHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::ptr::NonNull;
-
-    use accessibility_sys::{kAXErrorCannotComplete, kAXErrorNotificationNotRegistered};
+    use accessibility_sys::{
+        kAXErrorCannotComplete, kAXErrorNotificationNotRegistered, kAXErrorSuccess,
+    };
 
     use super::{
-        ObserverContext, ObserverType, removal_allows_context_release, should_store_new_context,
+        ObserverContext, ObserverType, apply_removal_results, observer_context_ptr,
+        should_store_new_context,
     };
     use crate::events::EventSender;
 
@@ -726,23 +746,53 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_removal_retains_callback_context_until_retry_is_safe() {
+    fn successful_and_retry_completed_removals_retain_callback_context() {
         let (events, _receiver) = EventSender::new();
-        let mut contexts = vec![Box::pin(ObserverContext {
+        let contexts = vec![Box::pin(ObserverContext {
             events,
             which: ObserverType::Application,
         })];
-        let pointer = NonNull::from_ref(contexts[0].as_ref().get_ref());
+        let pointer = observer_context_ptr(&contexts, ObserverType::Application).unwrap();
 
-        let release = removal_allows_context_release([kAXErrorCannotComplete]);
-        if release {
-            contexts.clear();
-        }
-        assert!(!release);
+        assert!(apply_removal_results(
+            &contexts,
+            ObserverType::Application,
+            [kAXErrorSuccess]
+        ));
+        let retained = observer_context_ptr(&contexts, ObserverType::Application);
+        assert_eq!(retained, Some(pointer));
         assert_eq!(unsafe { pointer.as_ref().which }, ObserverType::Application);
 
-        assert!(removal_allows_context_release([
-            kAXErrorNotificationNotRegistered
-        ]));
+        assert!(!apply_removal_results(
+            &contexts,
+            ObserverType::Application,
+            [kAXErrorCannotComplete]
+        ));
+        assert!(apply_removal_results(
+            &contexts,
+            ObserverType::Application,
+            [kAXErrorNotificationNotRegistered]
+        ));
+        let retained = observer_context_ptr(&contexts, ObserverType::Application);
+        assert_eq!(retained, Some(pointer));
+    }
+
+    #[test]
+    fn same_type_lookup_reuses_stable_context_pointer() {
+        let (events, _receiver) = EventSender::new();
+        let mut contexts = vec![Box::pin(ObserverContext {
+            events: events.clone(),
+            which: ObserverType::Window(42),
+        })];
+        let pointer = observer_context_ptr(&contexts, ObserverType::Window(42)).unwrap();
+
+        contexts.push(Box::pin(ObserverContext {
+            events,
+            which: ObserverType::Window(7),
+        }));
+
+        let reused = observer_context_ptr(&contexts, ObserverType::Window(42));
+        assert_eq!(reused, Some(pointer));
+        assert_eq!(unsafe { pointer.as_ref().which }, ObserverType::Window(42));
     }
 }
