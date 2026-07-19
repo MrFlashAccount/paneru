@@ -36,12 +36,6 @@ jobs:
             exit 1
           fi
 
-          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-          if [[ "$version" != "$cargo_version" ]]; then
-            echo "Release version $version does not match Cargo.toml version $cargo_version."
-            exit 1
-          fi
-
           echo "PANERU_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
           echo "APP_PATH=.build/release/Paneru.app" >> "$GITHUB_ENV"
@@ -75,7 +69,6 @@ jobs:
         run: |
           plutil -lint assets/Info.plist
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' assets/Info.plist)" == "com.github.mrflashaccount.paneru" ]]
-          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' assets/Info.plist)" == "$PANERU_VERSION" ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' assets/Info.plist)" == "https://github.com/MrFlashAccount/paneru/releases/latest/download/appcast.xml" ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' assets/Info.plist)" == "8z1ChHWDW5rJJwCEZx6Q4cr7A7DLwpDWq5LYFCDhaVc=" ]]
 
@@ -126,6 +119,7 @@ jobs:
 
       - name: Verify release artifacts
         run: |
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")" == "$PANERU_VERSION" ]]
           executable_archs="$(lipo -archs "$APP_PATH/Contents/MacOS/paneru")"
           [[ "$executable_archs" == "arm64" ]]
           framework_archs="$(lipo -archs "$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle")"
