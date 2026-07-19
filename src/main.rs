@@ -21,8 +21,6 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-embed_plist::embed_info_plist!("../assets/Info.plist");
-
 use events::EventSender;
 
 use errors::Result;

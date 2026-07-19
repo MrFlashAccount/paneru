@@ -20,21 +20,21 @@ jobs:
         id: rust_cache_key
         run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Apple Silicon Rust build
+      - name: Cache Rust dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/release
-          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-${{ hashFiles('Cargo.lock') }}
+          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-
+            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-
 
-      - name: Build release binary
-        run: cargo build --locked --release --verbose
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: paneru-macos
-          path: target/release/paneru
+      - name: Run Clippy
+        run: cargo clippy --locked --bin paneru -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets -- --test-threads=1
