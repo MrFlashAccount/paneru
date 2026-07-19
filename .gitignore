@@ -2,8 +2,5 @@
 /.build
 /dist
 
-# Outputs from `nix build`
-/result
-
 # Claude Code project config
 CLAUDE.md

@@ -1,4 +1,4 @@
-name: Rust
+name: Tests/Lints
 
 on:
   push:
@@ -11,7 +11,8 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
-  build:
+  tests-lints:
+    name: Tests/Lints
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -20,21 +21,23 @@ jobs:
         id: rust_cache_key
         run: echo "version=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Apple Silicon Rust build
+      - name: Cache Cargo crates and build artifacts
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/release
-          key: paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-${{ hashFiles('Cargo.lock') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: paneru-rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            paneru-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-arm64-
+            paneru-rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache_key.outputs.version }}-
 
-      - name: Build release binary
-        run: cargo build --locked --release --verbose
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: paneru-macos
-          path: target/release/paneru
+      - name: Run Clippy
+        run: cargo clippy --locked --bin paneru -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets -- --test-threads=1
