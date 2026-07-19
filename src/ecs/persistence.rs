@@ -488,17 +488,14 @@ enabled = false
     }
 
     #[test]
-    fn production_title_notification_marks_restore_identity_dirty() {
+    fn scoped_title_event_marks_restore_identity_dirty() {
         let store = Arc::new(TestStore::default());
         let mut app = persistence_app(Config::default(), store);
         app.update();
         let window_id: crate::platform::WinID = 7;
-        let event =
-            crate::platform::notify::window_title_event_from_bytes(&window_id.to_ne_bytes())
-                .expect("CGS title payload should produce a persistence event");
         app.world_mut()
             .resource_mut::<Messages<Event>>()
-            .write(event);
+            .write(Event::WindowTitleChanged { window_id });
 
         app.update();
 

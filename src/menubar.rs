@@ -5,7 +5,6 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::system::{Local, NonSendMut, Query, Res};
 use std::cell::RefCell;
-use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -391,16 +390,6 @@ impl MenuBarManager {
         }
     }
 
-    pub(crate) fn updater_deadline(&self) -> Option<Instant> {
-        self.updater.as_ref().map(SparkleUpdater::next_silent_check)
-    }
-
-    fn tick_silent_updater(&mut self, now: Instant) {
-        if let Some(updater) = &mut self.updater {
-            updater.maybe_check_silently(now);
-        }
-    }
-
     fn rebuild_menu(&mut self, widths: &[i32], shortcuts: &MenuShortcuts) {
         self.menu.removeAllItems();
         self.width_items.clear();
@@ -516,12 +505,6 @@ impl MenuBarManager {
         button.setTitle(&title);
         button.setToolTip(Some(&tooltip));
         self.current_label = Some(label);
-    }
-}
-
-pub(crate) fn tick_silent_updater(menu_bar: Option<NonSendMut<MenuBarManager>>) {
-    if let Some(mut menu_bar) = menu_bar {
-        menu_bar.tick_silent_updater(Instant::now());
     }
 }
 

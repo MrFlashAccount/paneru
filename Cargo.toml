@@ -21,9 +21,7 @@ lto = true
 [dependencies]
 accessibility-sys = "0.2"
 arc-swap = "1.9"
-bevy = { version = "0.18.1", default-features = false, features = [
-  "multi_threaded",
-] }
+bevy = { version = "0.18.1", default-features = false, features = ["std"] }
 bitflags = "2.13"
 chrono = "0.4"
 clap = { version = "4.6", features = ["cargo", "derive"] }

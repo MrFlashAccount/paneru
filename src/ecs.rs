@@ -132,7 +132,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
             systems::retry_front_switch,
-            crate::menubar::tick_silent_updater,
             (
                 systems::window_resized_update_frame,
                 systems::window_moved_update_frame,
