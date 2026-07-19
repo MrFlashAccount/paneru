@@ -5,15 +5,13 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::CGDirectDisplayID;
 use std::ffi::c_void;
-use std::os::unix::net::UnixStream;
 use std::ptr::{from_ref, null_mut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError, channel};
-use std::sync::{Arc, Mutex};
 
 use crate::commands::Command;
 use crate::config::Config;
-use crate::ecs::state::StateQueryKind;
 use crate::errors::Result;
 use crate::platform::{Modifiers, ProcessSerialNumber, WinID, WorkspaceId, WorkspaceObserver};
 use crate::util::AXUIWrapper;
@@ -163,15 +161,6 @@ pub enum Event {
 
     /// A command has been issued to the window manager.
     Command { command: Command },
-
-    /// A structured state query has been issued by a socket client.
-    StateQuery {
-        kind: StateQueryKind,
-        respond_to: Sender<String>,
-    },
-
-    /// A socket client has subscribed to line-delimited state events.
-    StateSubscribe { stream: Arc<Mutex<UnixStream>> },
 }
 
 /// `EventSender` is a thin wrapper around a `std::sync::mpsc::Sender` for `Event`s.

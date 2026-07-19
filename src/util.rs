@@ -12,8 +12,7 @@ use objc2_core_foundation::{
 use objc2_core_graphics::{CGDirectDisplayID, CGError};
 use objc2_foundation::{NSNumber, NSString, NSUserDefaults, ns_string};
 use std::{
-    ffi::{CStr, OsStr, c_int, c_void},
-    os::unix::ffi::OsStrExt,
+    ffi::c_void,
     path::{Path, PathBuf},
     ptr::null_mut,
 };
@@ -304,22 +303,6 @@ pub fn remove_run_loop(observer: &AXUIWrapper) {
         );
         CFRunLoopSource::invalidate(run_loop_source);
     }
-}
-
-/// Returns the path of the current executable.
-#[must_use]
-pub fn exe_path() -> Option<PathBuf> {
-    #[link(name = "Foundation", kind = "framework")]
-    unsafe extern "C" {
-        fn _NSGetExecutablePath(buf: *mut u8, buf_size: *mut u32) -> c_int;
-    }
-
-    let mut path_buf = [0_u8; 4096];
-
-    let mut path_buf_size = u32::try_from(path_buf.len()).ok()?;
-    let path = unsafe { _NSGetExecutablePath(path_buf.as_mut_ptr(), &raw mut path_buf_size) == 0 }
-        .then(|| CStr::from_bytes_until_nul(&path_buf).ok())??;
-    Some(OsStr::from_bytes(path.to_bytes()).into())
 }
 
 pub fn symlink_target(path: &Path) -> Option<PathBuf> {

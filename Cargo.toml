@@ -24,10 +24,8 @@ arc-swap = "1.9"
 bevy = { version = "0.18.1", default-features = false, features = ["std"] }
 bitflags = "2.13"
 chrono = "0.4"
-clap = { version = "4.6", features = ["cargo", "derive"] }
 derive_more = { version = "2.1", features = ["deref", "deref_mut"] }
 embed_plist = "1.2"
-launchctl = "0.3"
 libc = "0.2"
 notify = { version = "8.2", features = ["macos_fsevent"] }
 num_enum = "0.7"
@@ -76,6 +74,5 @@ stdext = "0.3"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ctrlc = { version = "3.5", features = ["termination"] }
 xdg = "3.0"
 mockall = "0.14"

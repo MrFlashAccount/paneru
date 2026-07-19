@@ -47,7 +47,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 | `src/manager/` | OS-agnostic traits (`WindowApi`, `ProcessApi`) and their macOS implementations (`WindowOS`). |
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
-| `src/commands.rs` | Implementation of CLI subcommands and Unix socket communication. |
+| `src/commands.rs` | Internal window-management actions invoked by configuration bindings and the menu bar. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
 
 ## 4. Key Data Entities
@@ -85,8 +85,8 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 - **ECS as Source of Truth:** Tiling logic must operate on ECS components (`WidthRatio`, `LayoutStrip`). The physical macOS window state should be a reflection of the ECS state, not the other way around.
 - **Per-window Ownership:** `LayoutStrip` membership is derived from each
   window's disposition; there is no workspace-global managed-mode switch.
-  Runtime manage commands carry a concrete `WinID` captured at hotkey, menu, or
-  IPC ingress and never retarget from a later focus marker.
+  Runtime manage commands carry a concrete `WinID` captured at hotkey or menu
+  ingress and never retarget from a later focus marker.
 - **Passthrough Isolation:** Layout, scrolling, borders/dimming, persistence,
   restore, cleanup, and floating-layer operations must not mutate passthrough
   windows. Focus remains tracked so recovery does not steal focus.
@@ -139,7 +139,6 @@ graph TD
     F -->|Set RepositionMarker| E
     E -->|PostUpdate| G(commit_window_position)
     G -->|FFI Call| A
-    H[CommandReader] -->|Unix Socket| C
     S[PaneruState file] -->|Startup load| R(session restore)
     R -->|Rebuild saved strips| E
     E -->|Dirty debounce / exit flush| S

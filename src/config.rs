@@ -174,45 +174,6 @@ pub fn discover_configuration_file() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Returns the list of deprecated top-level `[options]` keys present in a TOML config.
-pub fn deprecated_options_in_input(input: &str) -> Result<Vec<String>> {
-    const DEPRECATED_KEYS: [&str; 16] = [
-        "padding_top",
-        "padding_bottom",
-        "padding_left",
-        "padding_right",
-        "dim_inactive_windows",
-        "dim_inactive_color",
-        "border_active_window",
-        "border_color",
-        "border_opacity",
-        "border_width",
-        "border_radius",
-        "swipe_gesture_fingers",
-        "swipe_gesture_direction",
-        "continuous_swipe",
-        "swipe_sensitivity",
-        "swipe_deceleration",
-    ];
-
-    let value: toml::Value = toml::from_str(input)?;
-    let Some(options) = value.get("options").and_then(toml::Value::as_table) else {
-        return Ok(Vec::new());
-    };
-
-    Ok(DEPRECATED_KEYS
-        .into_iter()
-        .filter(|key| options.contains_key(*key))
-        .map(str::to_string)
-        .collect())
-}
-
-/// Returns deprecated top-level `[options]` keys present in the config file.
-pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
-    let input = read_to_string(path)?;
-    deprecated_options_in_input(&input)
-}
-
 /// Parses a string into a `Direction` enum.
 ///
 /// # Arguments
@@ -408,7 +369,6 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
         "window" => Command::Window(parse_operation(&argv[1..])?),
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
-        "restart" => Command::Restart,
         _ => {
             return Err(Error::InvalidConfig(format!(
                 "{}: Unhandled command '{argv:?}'",
@@ -2011,14 +1971,6 @@ fn test_parse_exact_width_command() {
     ));
     assert!(parse_command(&["window", "width", "0"]).is_err());
     assert!(parse_command(&["window", "width", "invalid"]).is_err());
-}
-
-#[test]
-fn test_parse_restart_command() {
-    assert!(matches!(
-        parse_command(&["restart"]).unwrap(),
-        Command::Restart
-    ));
 }
 
 #[test]

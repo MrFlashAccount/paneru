@@ -10,9 +10,7 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, NonSend, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
-use tracing::{debug, error, info};
-
-mod query;
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
@@ -139,8 +137,6 @@ pub enum Command {
     Mouse(MouseMove),
     /// A command to quit the window manager application.
     Quit,
-    /// A command to restart the window manager service.
-    Restart,
     PrintState,
 }
 
@@ -167,12 +163,10 @@ pub fn bind_window_command_target(command: Command) -> Option<Command> {
 }
 
 pub fn register_commands(app: &mut bevy::app::App) {
-    query::register_query_commands(app);
     app.add_systems(
         PreUpdate,
         (
             command_quit_handler,
-            command_restart_handler,
             print_internal_state_handler,
             mouse_to_next_display,
             resize_window,
@@ -1364,22 +1358,6 @@ pub fn command_quit_handler(
         )
     }) {
         _ = window_manager.quit();
-    }
-}
-
-#[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::needless_pass_by_value)]
-pub fn command_restart_handler(mut messages: MessageReader<Event>) {
-    if messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Restart
-            }
-        )
-    }) && let Err(err) = crate::platform::service::Service::request_restart()
-    {
-        error!("failed to restart service: {err}");
     }
 }
 

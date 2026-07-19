@@ -36,7 +36,6 @@ pub(crate) mod login_item;
 mod mission_control;
 pub mod notify;
 mod process;
-pub mod service;
 mod workspace;
 
 /// Type alias for `OSStatus`, a 32-bit integer error code used by macOS system services.

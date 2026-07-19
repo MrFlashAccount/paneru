@@ -110,8 +110,6 @@ pub trait ApplicationApi: Send + Sync {
     fn is_frontmost(&self) -> bool;
     /// Returns the bundle identifier of the application.
     fn bundle_id(&self) -> Option<String>;
-    /// Returns the display name of the application.
-    fn name(&self) -> &str;
 }
 
 /// A wrapper struct for `ApplicationApi` trait objects, allowing for dynamic dispatch.
@@ -345,10 +343,6 @@ impl ApplicationApi for ApplicationOS {
     /// An `Option<&str>` containing the bundle ID if available, otherwise `None`.
     fn bundle_id(&self) -> Option<String> {
         self.bundle_id.clone()
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 

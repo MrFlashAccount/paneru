@@ -93,8 +93,7 @@ archives and the appcast are protected with Sparkle's Ed25519 signatures.
 On macOS 13 or later, use **Launch at Login** in the menu bar to let macOS
 start the installed `Paneru.app` when you sign in. If macOS requires manual
 approval, Paneru opens **System Settings → General → Login Items**. This native
-login item is separate from the legacy command-line service below; do not
-enable both startup methods.
+login item is the supported way to start Paneru automatically.
 
 Because the current builds are ad-hoc signed, macOS may require Accessibility
 approval again after installing a different Paneru version. A stable Developer
@@ -209,55 +208,17 @@ shortcuts, width presets, window rules, or session restore behavior.
   `sliver_height` options control the size of this sliver. This is a
   workaround for a macOS limitation, not a design choice.
 
-### Installing from Crates.io
-
-Paneru is built using Rust's `cargo`. It can be installed directly from
-`crates.io` or if you need the latest version, by fetching the source from Github.
-
-```shell
-$ cargo install paneru
-```
-
-### Installing from Github
+### Building the macOS app from source
 
 ```shell
 $ git clone https://github.com/karinushka/paneru.git
 $ cd paneru
-$ cargo build --release
-$ cargo install --path .
-```
-
-It can run directly from the command line or as a service.
-Note that you will need to grant accessibility privileges to the binary.
-
-To build a local `.app` bundle instead, run:
-
-```shell
-./scripts/build-app.sh
-open .build/release/Paneru.app
+$ ./scripts/build-app.sh
+$ open .build/release/Paneru.app
 ```
 
 Local builds target the current Mac architecture. GitHub release builds target
 Apple Silicon (`arm64`) only.
-
-### Installing with Homebrew
-
-If you are using Homebrew, you can install from the formula with:
-
-```shell
-$ brew install paneru
-```
-
-Or by first adding the tap and then installing by name:
-
-```shell
-$ brew tap karinushka/paneru
-$ brew install paneru
-```
-
-### Installing with Nix
-
-See [`nix/README.md`](/nix/README.md).
 
 ### Configuration
 
@@ -313,133 +274,6 @@ configured with `[restore]`; see the
 **[Session Restore](./CONFIGURATION.md#session-restore)** section in the
 configuration guide.
 When restore is disabled, Paneru neither reads nor writes the state file.
-
-### Running as a service
-
-This is the legacy startup method for command-line installations. Packaged app
-users on macOS 13 or later should use **Launch at Login** in the menu bar
-instead.
-
-```shell
-$ paneru install
-$ paneru start
-```
-
-### Running in the foreground
-
-```shell
-$ paneru
-```
-
-### Sending Commands
-
-Paneru exposes a `send-cmd` subcommand that lets you control the running
-instance from the command line via a Unix socket (`/tmp/paneru.socket`). Any
-command that can be bound to a hotkey can also be sent programmatically:
-
-```shell
-$ paneru send-cmd <command> [args...]
-```
-
-#### Available commands
-
-| Command                    | Description                                      |
-| -------------------------- | ------------------------------------------------ |
-| `window focus <direction>` | Move focus to a window in the given direction    |
-| `window swap <direction>`  | Swap the focused window with a neighbour         |
-| `window center`            | Center the focused window on screen              |
-| `window resize`            | Cycle through `preset_column_widths`             |
-| `window grow`              | Grow to the next preset width                    |
-| `window shrink`            | Shrink to the previous preset width              |
-| `window fullwidth`         | Toggle full-width mode for the focused window    |
-| `window manage`            | Toggle the last focused window in/out of the strip |
-| `window equalize`          | Distribute equal heights in the focused stack    |
-| `window balance`           | Make all columns match the focused window width  |
-| `window stack`             | Stack the focused window onto its left neighbour |
-| `window unstack`           | Unstack the focused window into its own column   |
-| `window nextdisplay`       | Move the focused window to the next display      |
-| `window nextdisplaysend`   | Move the window to the next display but stay here |
-| `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
-| `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
-| `window virtualmove <dir>` | Move the window to a different virtual workspace  |
-| `window virtualmovenum <n>` | Move the window to numbered virtual workspace and follow it |
-| `window virtualsend <dir>` | Send the window to a virtual workspace but stay  |
-| `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
-| `window snap`              | Snap the focused window into the visible viewport |
-| `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
-| `printstate`               | Print the internal ECS state to the debug log    |
-| `quit`                     | Quit Paneru                                      |
-| `restart`                  | Restart the Paneru service                         |
-
-Where `<direction>` is one of: `west`, `east`, `north`, `south`, `first`, `last`.
-
-#### Examples
-
-```shell
-# Move focus one window to the right.
-$ paneru send-cmd window focus east
-
-# Swap the current window to the left.
-$ paneru send-cmd window swap west
-
-# Center and resize in one shot (two separate calls).
-$ paneru send-cmd window center && paneru send-cmd window resize
-
-# Balance all columns to the focused window's width.
-$ paneru send-cmd window balance
-
-# Cycle backward through preset widths.
-$ paneru send-cmd window shrink
-
-# Jump to the left-most window.
-$ paneru send-cmd window focus first
-
-# Switch directly to virtual workspace 3.
-$ paneru send-cmd window virtualnum 3
-
-# Send the focused window to virtual workspace 3 without following it.
-$ paneru send-cmd window virtualsendnum 3
-```
-
-### Querying and Subscribing to State
-
-Paneru also exposes structured JSON state for scripts and status bars:
-
-```shell
-$ paneru query state --json
-$ paneru query virtual-workspaces --json
-$ paneru query active --json
-$ paneru subscribe --json
-```
-
-`query` prints a JSON snapshot and exits. `subscribe --json` keeps the socket
-open and emits line-delimited JSON events for changes that integrations usually
-care about, including focus changes, virtual workspace changes, window-list
-changes, title changes, and display changes. See
-[`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-full payload contract.
-
-#### Scripting ideas
-
-Because `send-cmd` works over a Unix socket, you can drive Paneru from shell
-scripts, `cron` jobs, or other automation tools:
-
-- **Launch-and-arrange workflow.** Open an application and immediately position
-  it: `open -a Safari && sleep 0.5 && paneru send-cmd window resize`.
-- **One-key layout reset.** Use `paneru send-cmd window balance` to make every
-  column the same width as the focused window — great for resetting layouts
-  after unplugging a monitor or when windows get shuffled.
-- **Integration with other tools.** Pipe focus events from tools like
-  [Hammerspoon](https://www.hammerspoon.org) or
-  [skhd](https://github.com/koekeishiya/skhd) into `paneru send-cmd` for
-  compound actions that go beyond a single hotkey.
-- **Multi-display orchestration.** Move a window to the next display and
-  immediately warp the mouse there:
-  ```shell
-  paneru send-cmd window nextdisplay && paneru send-cmd mouse nextdisplay
-  ```
-- **Status bar integration.** Use `paneru query state --json` to render the
-  initial workspace labels, then keep them current with `paneru subscribe --json`.
 
 
 ## Future Enhancements
