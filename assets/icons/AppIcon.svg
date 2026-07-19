@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="176" y1="128" x2="848" y2="896" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B5C60"/>
+      <stop offset="1" stop-color="#05363B"/>
+    </linearGradient>
+    <linearGradient id="belt" x1="96" y1="512" x2="928" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2CC9BD" stop-opacity="0.18"/>
+      <stop offset="0.5" stop-color="#56DED0" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#2CC9BD" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="centerPane" x1="512" y1="374" x2="512" y2="650" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FFFE"/>
+      <stop offset="1" stop-color="#C8EDE9"/>
+    </linearGradient>
+    <linearGradient id="sidePane" x1="0" y1="402" x2="0" y2="624" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#C7E8E6" stop-opacity="0.88"/>
+      <stop offset="1" stop-color="#79BBB8" stop-opacity="0.78"/>
+    </linearGradient>
+    <filter id="outerShadow" x="0" y="0" width="1024" height="1024" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#001D20" flood-opacity="0.36"/>
+    </filter>
+    <filter id="paneShadow" x="120" y="300" width="784" height="440" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#001D20" flood-opacity="0.34"/>
+    </filter>
+    <clipPath id="iconMask">
+      <rect x="72" y="72" width="880" height="880" rx="208"/>
+    </clipPath>
+  </defs>
+
+  <g filter="url(#outerShadow)">
+    <rect x="72" y="72" width="880" height="880" rx="208" fill="url(#background)"/>
+  </g>
+  <g clip-path="url(#iconMask)">
+    <path d="M72 170C72 116 116 72 170 72H854C908 72 952 116 952 170V252H72V170Z" fill="#FFFFFF" fill-opacity="0.055"/>
+    <rect x="72" y="370" width="880" height="284" fill="url(#belt)"/>
+    <path d="M72 370H952" stroke="#9BF4EA" stroke-opacity="0.14" stroke-width="4"/>
+    <path d="M72 654H952" stroke="#001F22" stroke-opacity="0.22" stroke-width="4"/>
+
+    <g filter="url(#paneShadow)">
+      <rect x="182" y="402" width="166" height="222" rx="54" fill="url(#sidePane)"/>
+      <rect x="676" y="402" width="166" height="222" rx="54" fill="url(#sidePane)"/>
+      <rect x="358" y="374" width="308" height="276" rx="70" fill="url(#centerPane)"/>
+    </g>
+
+    <path d="M402 276C363 276 344 295 344 334V690C344 729 363 748 402 748" fill="none" stroke="#E9FFFC" stroke-width="34" stroke-linecap="round"/>
+    <path d="M622 276C661 276 680 295 680 334V690C680 729 661 748 622 748" fill="none" stroke="#E9FFFC" stroke-width="34" stroke-linecap="round"/>
+    <path d="M402 276C363 276 344 295 344 334V690C344 729 363 748 402 748" fill="none" stroke="#4CD7CC" stroke-opacity="0.32" stroke-width="9" stroke-linecap="round"/>
+    <path d="M622 276C661 276 680 295 680 334V690C680 729 661 748 622 748" fill="none" stroke="#4CD7CC" stroke-opacity="0.32" stroke-width="9" stroke-linecap="round"/>
+  </g>
+  <rect x="74" y="74" width="876" height="876" rx="206" fill="none" stroke="#B5FCF4" stroke-opacity="0.18" stroke-width="4"/>
+</svg>

@@ -84,16 +84,13 @@ When `fingers_count` is omitted or set below 3, Paneru does not intercept native
 
 Visual styling for workspaces, active and inactive windows.
 
-### Virtual Workspace indicators
+### Virtual Workspace indicator
 
-Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default.
-(Note: disabling menubar indicator requires a restart)
+Toggles the brief status popup shown when switching virtual workspaces. It is disabled by default.
 
 **Example:**
 ```toml
 [decorations]
-# Both default to true
-workspace_menu_status = false
 workspace_popup_status = true
 ```
 
