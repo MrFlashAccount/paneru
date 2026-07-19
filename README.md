@@ -4,17 +4,21 @@
 
 # Paneru
 
-**A software ultrawide for laptop-first macOS work.**
+**Build a workspace wider than your MacBook.**
 
-Paneru lets an individual macOS window use 150% or 200% of your built-in display's width. Hold `Option` and scroll to pan across it. It is built for laptop-first work: a wide editor, terminal, research view, document, or canvas while you are traveling or away from a desk—without buying an ultrawide or carrying an external monitor.
+*An ultrawide workspace. No ultrawide monitor.*
 
-Paneru does not add pixels or show the entire wide window at once. It treats the physical display as a viewport over a wider working surface. Only windows you opt in are managed; everything else continues to behave like an ordinary macOS window.
+Paneru turns the windows you choose into one horizontal strip that can extend beyond the built-in display. Each managed window can use 150% or 200% of the display width, and you pan across the whole strip with `Option` + two-finger trackpad scroll.
+
+It is built for laptop-first professionals working while traveling, from cafés, hotels, coworking spaces, or anywhere away from a desk. A wide editor, research view, document, or canvas can keep its useful width without carrying an external display.
+
+Paneru does not add pixels or show the entire strip at once. It treats the physical display as a viewport over a wider working surface. Only windows you opt in are managed; everything else continues to behave like an ordinary macOS window.
 
 ## How it works
 
-- **Opt in only what you need.** Choose one window manually or through a rule; Paneru leaves everything else alone.
-- **Make it wider than the screen.** Fresh-install presets include 150% and 200% of the usable display width.
-- **Pan across it.** Hold `Option` and scroll to move between the oversized window's left and right edges. Opt in more windows to build a horizontal strip without resizing the existing windows.
+- **Build one horizontal strip.** Opt in windows individually—manually or through rules. Paneru leaves everything else alone.
+- **Give each window the width it needs.** Fresh-install presets include 150% and 200% of the usable display width.
+- **Pan across the whole workspace.** Hold `Option` and scroll to move through the strip, including both edges of an oversized window. Adding another window does not resize the windows already there.
 
 Paneru has no Dock icon or main window. Daily controls live in the menu bar, with configured shortcuts shown using native macOS menu equivalents.
 
