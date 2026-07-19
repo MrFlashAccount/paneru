@@ -4,17 +4,17 @@
 
 # Paneru
 
-**Keep macOS windows at the width you want—even when that is wider than the display.**
+**A software ultrawide for laptop-first macOS work.**
 
-Paneru is a menu-bar window manager that puts only the windows you choose—manually or through rules—onto a horizontal strip. Make a working pane 150% or 200% of the display width, then pan across it with `Option` + scroll instead of compressing it to fit.
+Paneru lets an individual macOS window use 150% or 200% of your built-in display's width. Hold `Option` and scroll to pan across it. It is built for laptop-first work: a wide editor, terminal, research view, document, or canvas while you are traveling or away from a desk—without buying an ultrawide or carrying an external monitor.
 
-Fixed-screen tiling typically fits tiled windows within the display, which can make terminals, editors, and other working panes narrower than you want. Paneru keeps the chosen widths and moves the strip behind the visible desktop. Windows you have not opted in continue to behave like ordinary macOS windows.
+Paneru does not add pixels or show the entire wide window at once. It treats the physical display as a viewport over a wider working surface. Only windows you opt in are managed; everything else continues to behave like an ordinary macOS window.
 
 ## How it works
 
-- **Opt in per window.** Managing one window does not capture its entire app or every window on the Space.
-- **Scroll one horizontal strip.** Managed windows are ordered on the current display and macOS Space. Add more windows without resizing the existing ones.
-- **Use more than 100% of the display.** Oversized windows remain in the strip and expose left- and right-edge scroll stops.
+- **Opt in only what you need.** Choose one window manually or through a rule; Paneru leaves everything else alone.
+- **Make it wider than the screen.** Fresh-install presets include 150% and 200% of the usable display width.
+- **Pan across it.** Hold `Option` and scroll to move between the oversized window's left and right edges. Opt in more windows to build a horizontal strip without resizing the existing windows.
 
 Paneru has no Dock icon or main window. Daily controls live in the menu bar, with configured shortcuts shown using native macOS menu equivalents.
 
