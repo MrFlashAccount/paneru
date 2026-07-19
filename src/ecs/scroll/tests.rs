@@ -53,7 +53,7 @@ fn momentum_resume_preserves_target_but_new_touch_interrupts_it() {
 }
 
 #[test]
-fn sticky_scroll_snaps_only_inside_the_edge_hit_zone() {
+fn sticky_scroll_snaps_on_both_sides_of_an_edge() {
     let viewport = IRect::new(0, 0, 1000, 800);
     let columns = [(0, 600), (600, 600)];
     assert_eq!(
@@ -64,8 +64,36 @@ fn sticky_scroll_snaps_only_inside_the_edge_hit_zone() {
         sticky_edge_snap_target(-169, &viewport, columns, 32),
         Some(-200)
     );
-    assert_eq!(sticky_edge_snap_target(-591, &viewport, columns, 32), None);
+    assert_eq!(
+        sticky_edge_snap_target(-591, &viewport, columns, 32),
+        Some(-600)
+    );
+    assert_eq!(
+        sticky_edge_snap_target(-209, &viewport, columns, 32),
+        Some(-200)
+    );
+    assert_eq!(sticky_edge_snap_target(-567, &viewport, columns, 32), None);
     assert_eq!(sticky_edge_snap_target(-167, &viewport, columns, 32), None);
+}
+
+#[test]
+fn sticky_scroll_returns_after_crossing_a_window_stop() {
+    let viewport = IRect::new(0, 0, 1000, 800);
+    let columns = [(0, 1000), (1000, 1000)];
+
+    assert_eq!(
+        sticky_edge_snap_target(-12, &viewport, columns, 32),
+        Some(0)
+    );
+    assert_eq!(sticky_edge_snap_target(12, &viewport, columns, 32), Some(0));
+    assert_eq!(
+        sticky_edge_snap_target(-988, &viewport, columns, 32),
+        Some(-1000)
+    );
+    assert_eq!(
+        sticky_edge_snap_target(-1012, &viewport, columns, 32),
+        Some(-1000)
+    );
 }
 
 #[test]

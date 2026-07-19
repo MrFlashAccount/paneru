@@ -20,7 +20,7 @@ use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 use crate::commands::{
-    Command, Operation, bind_window_command_target, set_last_focused_window_target,
+    Command, Direction, Operation, bind_window_command_target, set_last_focused_window_target,
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
@@ -60,6 +60,16 @@ define_class!(
         #[unsafe(method(centerWindow:))]
         fn center_window(&self, _: &NSMenuItem) {
             self.send_command(Command::Window(Operation::Center));
+        }
+
+        #[unsafe(method(moveWindowLeft:))]
+        fn move_window_left(&self, _: &NSMenuItem) {
+            self.send_command(Command::Window(Operation::Swap(Direction::West)));
+        }
+
+        #[unsafe(method(moveWindowRight:))]
+        fn move_window_right(&self, _: &NSMenuItem) {
+            self.send_command(Command::Window(Operation::Swap(Direction::East)));
         }
 
         #[unsafe(method(toggleManaged:))]
@@ -308,6 +318,8 @@ struct MenuShortcut {
 struct MenuShortcuts {
     widths: Vec<(i32, Option<MenuShortcut>)>,
     center: Option<MenuShortcut>,
+    move_left: Option<MenuShortcut>,
+    move_right: Option<MenuShortcut>,
     manage: Option<MenuShortcut>,
     quit: Option<MenuShortcut>,
 }
@@ -484,12 +496,23 @@ impl MenuBarManager {
             Some(sel!(centerWindow:)),
             shortcuts.center.as_ref(),
         );
+        let move_left = self.add_item(
+            "Move Window Left",
+            Some(sel!(moveWindowLeft:)),
+            shortcuts.move_left.as_ref(),
+        );
+        let move_right = self.add_item(
+            "Move Window Right",
+            Some(sel!(moveWindowRight:)),
+            shortcuts.move_right.as_ref(),
+        );
         let manage = self.add_item(
             "Toggle Managed",
             Some(sel!(toggleManaged:)),
             shortcuts.manage.as_ref(),
         );
-        self.managed_window_items.push(center);
+        self.managed_window_items
+            .extend([center, move_left, move_right]);
         self.manage_item = Some(manage);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
@@ -680,6 +703,8 @@ fn menu_shortcuts(config: &Config, widths: &[f64]) -> MenuShortcuts {
     MenuShortcuts {
         widths,
         center: shortcut("window_center"),
+        move_left: shortcut("window_swap_west"),
+        move_right: shortcut("window_swap_east"),
         manage: shortcut("window_manage"),
         quit: shortcut("quit"),
     }
@@ -793,6 +818,8 @@ mod tests {
 [bindings]
 window_width_150 = "ctrl+alt+cmd-4"
 window_center = "ctrl+alt+cmd-c"
+window_swap_west = "ctrl+alt+cmd-leftbracket"
+window_swap_east = "ctrl+alt+cmd-rightbracket"
 "#,
         )
         .expect("bindings should parse");
@@ -812,6 +839,20 @@ window_center = "ctrl+alt+cmd-c"
                 .as_ref()
                 .map(|shortcut| shortcut.key.as_str()),
             Some("c")
+        );
+        assert_eq!(
+            shortcuts
+                .move_left
+                .as_ref()
+                .map(|shortcut| shortcut.key.as_str()),
+            Some("[")
+        );
+        assert_eq!(
+            shortcuts
+                .move_right
+                .as_ref()
+                .map(|shortcut| shortcut.key.as_str()),
+            Some("]")
         );
     }
 
