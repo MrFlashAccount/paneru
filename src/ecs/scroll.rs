@@ -626,16 +626,14 @@ fn sticky_edge_snap_target(
     columns
         .into_iter()
         .flat_map(|(column_position, column_width)| {
+            // Keep the sticky zone symmetric around each stop. A gesture that
+            // crosses an edge by a few points should return to that edge just
+            // like a gesture released a few points before it.
             [
-                (
-                    viewport.min.x - column_position,
-                    // The viewport's left edge is inside the window.
-                    -threshold..=0,
-                ),
+                (viewport.min.x - column_position, -threshold..=threshold),
                 (
                     viewport.max.x - (column_position + column_width),
-                    // The viewport's right edge is inside the window.
-                    0..=threshold,
+                    -threshold..=threshold,
                 ),
             ]
         })
