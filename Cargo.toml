@@ -65,6 +65,11 @@ objc2-foundation = { version = "0.3", features = [
   "NSBundle",
   "NSRunLoop",
 ] }
+objc2-service-management = { version = "0.3", default-features = false, features = [
+  "SMAppService",
+  "objc2",
+  "objc2-foundation",
+] }
 regex = "1.12"
 scopeguard = "1.2"
 serde = { version = "1.0", features = ["derive"] }

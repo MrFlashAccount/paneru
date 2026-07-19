@@ -4,16 +4,19 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::system::{Local, NonSendMut, Query, Res};
+use std::cell::RefCell;
+use std::time::Instant;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSMenu,
-    NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSColor, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSEventModifierFlags, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
-use std::time::Instant;
 use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
@@ -26,11 +29,13 @@ use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged, WidthRatio};
 use crate::events::{Event, EventSender};
 use crate::manager::{Window, request_ax_privilege};
 use crate::platform::Modifiers;
+use crate::platform::login_item::{self, LoginItemStatus};
 use crate::updater::SparkleUpdater;
 
 #[derive(Debug, Clone)]
 struct MenuActionTargetIvars {
     events: EventSender,
+    launch_at_login_item: RefCell<Option<Retained<NSMenuItem>>>,
 }
 
 define_class!(
@@ -87,6 +92,15 @@ define_class!(
             }
         }
 
+        #[unsafe(method(toggleLaunchAtLogin:))]
+        fn toggle_launch_at_login(&self, _: &NSMenuItem) {
+            if let Err(error) = login_item::toggle() {
+                warn!(%error, "unable to toggle Launch at Login");
+                Self::show_login_item_error(&error);
+            }
+            self.refresh_launch_at_login_item();
+        }
+
         #[unsafe(method(quitPaneru:))]
         fn quit_paneru(&self, _: &NSMenuItem) {
             self.send_command(Command::Quit);
@@ -96,6 +110,7 @@ define_class!(
     unsafe impl NSMenuDelegate for MenuActionTarget {
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _: &NSMenu) {
+            self.refresh_launch_at_login_item();
             if let Err(error) = self.ivars().events.send(Event::StatusMenuOpened) {
                 warn!(%error, "unable to request menu refresh");
             }
@@ -105,8 +120,49 @@ define_class!(
 
 impl MenuActionTarget {
     fn new(mtm: MainThreadMarker, events: EventSender) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(MenuActionTargetIvars { events });
+        let this = Self::alloc(mtm).set_ivars(MenuActionTargetIvars {
+            events,
+            launch_at_login_item: RefCell::new(None),
+        });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn set_launch_at_login_item(&self, item: Retained<NSMenuItem>) {
+        self.ivars().launch_at_login_item.replace(Some(item));
+        self.refresh_launch_at_login_item();
+    }
+
+    fn refresh_launch_at_login_item(&self) {
+        let item = self.ivars().launch_at_login_item.borrow();
+        let Some(item) = item.as_ref() else {
+            return;
+        };
+
+        let status = login_item::status();
+        item.setEnabled(status != LoginItemStatus::Unavailable);
+        item.setState(match status {
+            LoginItemStatus::Enabled => NSControlStateValueOn,
+            LoginItemStatus::RequiresApproval => NSControlStateValueMixed,
+            LoginItemStatus::Unavailable
+            | LoginItemStatus::NotRegistered
+            | LoginItemStatus::NotFound => NSControlStateValueOff,
+        });
+        let title = match status {
+            LoginItemStatus::RequiresApproval => "Launch at Login…",
+            _ => "Launch at Login",
+        };
+        item.setTitle(&NSString::from_str(title));
+    }
+
+    fn show_login_item_error(error: &str) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Couldn’t Change Launch at Login"));
+        alert.setInformativeText(&NSString::from_str(error));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.runModal();
     }
 
     fn send_command(&self, command: Command) {
@@ -261,6 +317,9 @@ impl MenuBarManager {
         );
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
+        self.add_launch_at_login_item();
+
+        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
         self.add_item("Quit Paneru", Some(sel!(quitPaneru:)), None);
     }
 
@@ -393,6 +452,8 @@ impl MenuBarManager {
         }
         self.check_for_updates_item = Some(check_for_updates);
 
+        self.add_launch_at_login_item();
+
         self.add_item(
             "Quit Paneru",
             Some(sel!(quitPaneru:)),
@@ -400,6 +461,12 @@ impl MenuBarManager {
         );
         self.configured_widths = widths.to_vec();
         self.configured_shortcuts = shortcuts.clone();
+    }
+
+    fn add_launch_at_login_item(&self) -> Retained<NSMenuItem> {
+        let item = self.add_item("Launch at Login", Some(sel!(toggleLaunchAtLogin:)), None);
+        self.action_target.set_launch_at_login_item(item.clone());
+        item
     }
 
     fn add_item(

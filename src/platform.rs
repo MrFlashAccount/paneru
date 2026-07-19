@@ -32,6 +32,7 @@ pub use workspace::WorkspaceObserver;
 mod display;
 mod frame_pacer;
 pub(crate) mod input;
+pub(crate) mod login_item;
 mod mission_control;
 pub mod notify;
 mod process;
