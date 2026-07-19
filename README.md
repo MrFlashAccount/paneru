@@ -90,6 +90,12 @@ Paneru checks the signed GitHub update feed automatically in the background.
 Use **Check for Updates…** in the menu bar to check immediately. Update
 archives and the appcast are protected with Sparkle's Ed25519 signatures.
 
+On macOS 13 or later, use **Launch at Login** in the menu bar to let macOS
+start the installed `Paneru.app` when you sign in. If macOS requires manual
+approval, Paneru opens **System Settings → General → Login Items**. This native
+login item is separate from the legacy command-line service below; do not
+enable both startup methods.
+
 Because the current builds are ad-hoc signed, macOS may require Accessibility
 approval again after installing a different Paneru version. A stable Developer
 ID signature is required to preserve that approval safely across updates.
@@ -309,6 +315,10 @@ configuration guide.
 When restore is disabled, Paneru neither reads nor writes the state file.
 
 ### Running as a service
+
+This is the legacy startup method for command-line installations. Packaged app
+users on macOS 13 or later should use **Launch at Login** in the menu bar
+instead.
 
 ```shell
 $ paneru install
