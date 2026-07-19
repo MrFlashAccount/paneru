@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -101,50 +101,6 @@ pub struct SavedWindow {
     /// old enum-shaped column data remains backward compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strip_position_x: Option<i32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StateQueryKind {
-    State,
-    VirtualWorkspaces,
-    Active,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruQueryState {
-    pub version: u32,
-    pub timestamp: u64,
-    pub active: PaneruActiveState,
-    pub virtual_workspaces: Vec<PaneruVirtualWorkspaceState>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct PaneruActiveState {
-    pub display_id: Option<CGDirectDisplayID>,
-    pub native_workspace_id: Option<WorkspaceId>,
-    pub virtual_workspace_number: Option<u32>,
-    pub focused_window_id: Option<WinID>,
-    pub focused_bundle_id: Option<String>,
-    pub focused_app_name: Option<String>,
-    pub focused_window_title: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruVirtualWorkspaceState {
-    pub number: u32,
-    pub native_workspace_id: WorkspaceId,
-    pub active: bool,
-    pub windows: Vec<PaneruWindowState>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruWindowState {
-    pub window_id: WinID,
-    pub bundle_id: String,
-    pub app_name: String,
-    pub title: String,
-    pub focused: bool,
-    pub floating: bool,
 }
 
 impl From<IRect> for SavedRect {
@@ -465,125 +421,6 @@ struct SavedWorkspaceBuilder {
     display_id: Option<CGDirectDisplayID>,
     active_virtual_index: Option<u32>,
     strips: Vec<SavedStrip>,
-}
-
-impl PaneruQueryState {
-    #[allow(clippy::type_complexity)]
-    pub fn extract(
-        workspaces: &Query<(&ChildOf, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-        windows: &Windows,
-        apps: &Query<&Application>,
-    ) -> Self {
-        let focused = windows.focused();
-        let focused_entity = focused.map(|(_, entity)| entity);
-
-        let active_display = displays
-            .iter()
-            .find(|(_, _, active)| *active)
-            .map(|(display, entity, _)| (display.id(), entity));
-
-        let mut virtual_workspaces = Vec::new();
-        let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
-        let mut active = PaneruActiveState {
-            display_id: active_display.map(|(display_id, _)| display_id),
-            ..PaneruActiveState::default()
-        };
-
-        for (child, strip, active_workspace) in workspaces {
-            let row_windows = strip
-                .all_windows()
-                .iter()
-                .filter_map(|entity| {
-                    let (window, _, unmanaged) = windows.get_managed(*entity)?;
-                    if matches!(unmanaged, Some(Unmanaged::Passthrough)) {
-                        return None;
-                    }
-                    let (_, _, app_entity) = windows.find_parent(window.id())?;
-                    let app = apps.get(app_entity).ok()?;
-                    let bundle_id = app.bundle_id().unwrap_or_default().clone();
-                    let app_name = app.name().to_string();
-                    let title = window.title().unwrap_or_default();
-                    Some(PaneruWindowState {
-                        window_id: window.id(),
-                        bundle_id,
-                        app_name,
-                        title,
-                        focused: focused_entity == Some(*entity),
-                        floating: unmanaged.is_some(),
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let number = strip.virtual_index + 1;
-            workspace_max_numbers
-                .entry(strip.id())
-                .and_modify(|max| *max = (*max).max(number))
-                .or_insert(number);
-            if active_workspace {
-                active.native_workspace_id = Some(strip.id());
-                active.virtual_workspace_number = Some(number);
-            }
-
-            if active_workspace
-                && let Some(window) = row_windows.iter().find(|window| window.focused)
-            {
-                active.focused_window_id = Some(window.window_id);
-                active.focused_bundle_id = Some(window.bundle_id.clone());
-                active.focused_app_name = Some(window.app_name.clone());
-                active.focused_window_title = Some(window.title.clone());
-            }
-
-            virtual_workspaces.push(PaneruVirtualWorkspaceState {
-                number,
-                native_workspace_id: strip.id(),
-                active: active_workspace,
-                windows: row_windows,
-            });
-
-            if active_workspace
-                && let Some((display_id, display_entity)) = active_display
-                && child.parent() == display_entity
-            {
-                active.display_id = Some(display_id);
-            }
-        }
-
-        let present_numbers = virtual_workspaces
-            .iter()
-            .map(|workspace| (workspace.native_workspace_id, workspace.number))
-            .collect::<HashSet<_>>();
-        for (workspace_id, max_number) in workspace_max_numbers {
-            for number in 1..=max_number {
-                if !present_numbers.contains(&(workspace_id, number)) {
-                    virtual_workspaces.push(PaneruVirtualWorkspaceState {
-                        number,
-                        native_workspace_id: workspace_id,
-                        active: false,
-                        windows: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        virtual_workspaces
-            .sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
-
-        Self {
-            version: 1,
-            timestamp: now_timestamp(),
-            active,
-            virtual_workspaces,
-        }
-    }
-
-    pub fn to_query_json(&self, kind: StateQueryKind) -> serde_json::Result<String> {
-        match kind {
-            StateQueryKind::State => serde_json::to_string(self),
-            StateQueryKind::VirtualWorkspaces => serde_json::to_string(&self.virtual_workspaces),
-            StateQueryKind::Active => serde_json::to_string(&self.active),
-        }
-    }
 }
 
 fn now_timestamp() -> u64 {

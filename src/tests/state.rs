@@ -4,8 +4,8 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
 use crate::ecs::state::{
-    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem,
-    SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem, SavedStrip, SavedWindow,
+    SavedWorkspace,
 };
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Position};
 use crate::manager::{Application, Display};
@@ -26,21 +26,6 @@ type StateExtractionState<'w, 's> = SystemState<(
             Option<&'static ChildOf>,
             &'static LayoutStrip,
             Option<&'static Position>,
-            Has<ActiveWorkspaceMarker>,
-        ),
-    >,
-    Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
-    Windows<'w, 's>,
-    Query<'w, 's, &'static Application>,
-)>;
-
-type QueryStateExtractionState<'w, 's> = SystemState<(
-    Query<
-        'w,
-        's,
-        (
-            &'static ChildOf,
-            &'static LayoutStrip,
             Has<ActiveWorkspaceMarker>,
         ),
     >,
@@ -536,53 +521,4 @@ fn current_window(
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
     }
-}
-
-#[test]
-fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
-    use crate::tests::harness::TestHarness;
-
-    let mut harness = TestHarness::new().with_windows(1);
-
-    harness.app.update();
-
-    let world = harness.world();
-    let mut active_display_query =
-        world.query_filtered::<Entity, With<crate::ecs::ActiveDisplayMarker>>();
-    let display_entity = active_display_query
-        .single(world)
-        .expect("active display should exist");
-    world.spawn((
-        LayoutStrip::new(TEST_WORKSPACE_ID, 2),
-        ChildOf(display_entity),
-    ));
-
-    let mut system_state: QueryStateExtractionState<'_, '_> = SystemState::new(world);
-    let (workspaces, displays, windows, apps) = system_state.get(world);
-
-    let state = PaneruQueryState::extract(&workspaces, &displays, &windows, &apps);
-
-    assert_eq!(state.version, 1);
-    assert_eq!(state.active.virtual_workspace_number, Some(1));
-    assert_eq!(state.active.native_workspace_id, Some(TEST_WORKSPACE_ID));
-    assert_eq!(state.active.focused_window_id, Some(0));
-    assert_eq!(state.active.focused_bundle_id.as_deref(), Some("test"));
-    assert_eq!(state.virtual_workspaces.len(), 3);
-    assert_eq!(state.virtual_workspaces[0].number, 1);
-    assert!(state.virtual_workspaces[0].active);
-    assert_eq!(state.virtual_workspaces[0].windows.len(), 1);
-    assert_eq!(state.virtual_workspaces[0].windows[0].window_id, 0);
-    assert_eq!(state.virtual_workspaces[0].windows[0].bundle_id, "test");
-    assert!(state.virtual_workspaces[0].windows[0].focused);
-    assert_eq!(state.virtual_workspaces[1].number, 2);
-    assert!(state.virtual_workspaces[1].windows.is_empty());
-    assert_eq!(state.virtual_workspaces[2].number, 3);
-    assert!(state.virtual_workspaces[2].windows.is_empty());
-
-    let json = serde_json::to_value(&state).expect("query state should serialize");
-    assert_eq!(json["active"]["virtual_workspace_number"], 1);
-    assert_eq!(
-        json["virtual_workspaces"][0]["windows"][0]["bundle_id"],
-        "test"
-    );
 }

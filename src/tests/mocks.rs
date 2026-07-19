@@ -532,15 +532,6 @@ impl MockState {
                 .map(|a| a.bundle_id.clone())
         });
 
-        let name = self
-            .inner
-            .force_read()
-            .apps
-            .get(&pid)
-            .map(|a| a.name.clone())
-            .unwrap();
-        ma.expect_name().return_const(name);
-
         let s = self.clone();
         ma.expect_is_frontmost().returning(move || {
             s.inner

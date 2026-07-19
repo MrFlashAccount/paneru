@@ -153,7 +153,6 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `quit` | Exit Paneru. |
-| `restart` | Restart the Paneru service (`paneru restart`). |
 
 **Example:**
 ```toml
@@ -203,23 +202,6 @@ window_virtualsendnum_1 = "cmd + alt + shift - 1"
 window_virtualsendnum_2 = "cmd + alt + shift - 2"
 window_virtualsendnum_3 = "cmd + alt + shift - 3"
 ```
-
-**Example command line:**
-```shell
-# Move to the previous virtual workspace.
-$ paneru send-cmd window virtual north
-# Move the current window to the next virtual workspace.
-$ paneru send-cmd window virtualmove south
-# Move directly to virtual workspace 3.
-$ paneru send-cmd window virtualnum 3
-# Move the current window to virtual workspace 3 and follow it.
-$ paneru send-cmd window virtualmovenum 3
-# Send the current window to virtual workspace 3 and stay here.
-$ paneru send-cmd window virtualsendnum 3
-```
-
-See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-structured `paneru query` responses and `paneru subscribe` event stream.
 
 ---
 
