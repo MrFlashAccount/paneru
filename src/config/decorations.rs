@@ -4,7 +4,6 @@ use serde::{Deserialize, Deserializer, de};
 pub struct DecorationsOptions {
     pub active: Option<GeneralDecorationsOptions>,
     pub inactive: Option<GeneralDecorationsOptions>,
-    pub workspace_menu_status: Option<bool>,
     pub workspace_popup_status: Option<bool>,
 }
 

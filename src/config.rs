@@ -78,7 +78,6 @@ direction = "Reversed"
 modifier = "alt"
 
 [decorations]
-workspace_menu_status = true
 workspace_popup_status = false
 
 [bindings]
@@ -900,14 +899,6 @@ impl Config {
             .options()
             .disable_native_tabs
             .is_some_and(|disabled| disabled)
-    }
-
-    pub fn workspace_menu_status(&self) -> bool {
-        self.inner()
-            .decorations
-            .as_ref()
-            .and_then(|decorations| decorations.workspace_menu_status)
-            .is_none_or(|enabled| enabled)
     }
 
     pub fn workspace_popup_status(&self) -> bool {
