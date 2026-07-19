@@ -1,4 +1,5 @@
 use bevy::ecs::change_detection::DetectChanges;
+use bevy::ecs::entity::Entity;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Or, With};
@@ -7,15 +8,14 @@ use std::cell::RefCell;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
-};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
-    NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSSquareStatusItemLength,
-    NSStatusBar, NSStatusItem,
+    NSAlert, NSColor, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSEventModifierFlags, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
-use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString};
+use objc2_core_foundation::CGFloat;
+use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
@@ -186,82 +186,14 @@ pub struct MenuBarManager {
     manage_item: Option<Retained<NSMenuItem>>,
     configured_widths: Vec<i32>,
     configured_shortcuts: MenuShortcuts,
-    current_status: Option<(StatusIconState, String)>,
-    status_icons: Option<StatusIcons>,
+    current_label: Option<String>,
     publication: MenuPublicationGate,
     updater: Option<SparkleUpdater>,
     check_for_updates_item: Option<Retained<NSMenuItem>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StatusIconState {
-    Managed,
-    Unmanaged,
-    NoWindow,
-}
-
-struct StatusIcons {
-    managed: Retained<NSImage>,
-    unmanaged: Retained<NSImage>,
-    no_window: Retained<NSImage>,
-}
-
-impl StatusIcons {
-    fn load() -> Option<Self> {
-        Some(Self {
-            managed: load_template_image(
-                include_bytes!("../assets/icons/StatusManagedTemplate.pdf"),
-                "Selected window is managed",
-            )?,
-            unmanaged: load_template_image(
-                include_bytes!("../assets/icons/StatusUnmanagedTemplate.pdf"),
-                "Selected window is not managed",
-            )?,
-            no_window: load_template_image(
-                include_bytes!("../assets/icons/StatusNoWindowTemplate.pdf"),
-                "No manageable window selected",
-            )?,
-        })
-    }
-
-    fn image(&self, state: StatusIconState) -> &NSImage {
-        match state {
-            StatusIconState::Managed => &self.managed,
-            StatusIconState::Unmanaged => &self.unmanaged,
-            StatusIconState::NoWindow => &self.no_window,
-        }
-    }
-}
-
-fn load_template_image(bytes: &[u8], accessibility_description: &str) -> Option<Retained<NSImage>> {
-    let data = unsafe { NSData::dataWithBytes_length(bytes.as_ptr().cast(), bytes.len()) };
-    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
-    image.setTemplate(true);
-    image.setSize(NSSize::new(18.0, 18.0));
-    image.setAccessibilityDescription(Some(&NSString::from_str(accessibility_description)));
-    Some(image)
-}
-
-fn status_icon_state(
-    has_manageable_focused_window: bool,
-    focused_width_ratio: Option<f64>,
-) -> StatusIconState {
-    if focused_width_ratio.is_some() {
-        StatusIconState::Managed
-    } else if has_manageable_focused_window {
-        StatusIconState::Unmanaged
-    } else {
-        StatusIconState::NoWindow
-    }
-}
-
-fn status_tooltip(state: StatusIconState) -> &'static str {
-    match state {
-        StatusIconState::Managed => "Paneru — Selected window is managed",
-        StatusIconState::Unmanaged => "Paneru — Selected window is not managed",
-        StatusIconState::NoWindow => "Paneru — No manageable window selected",
-    }
-}
+const STATUS_ITEM_BACKGROUND_ALPHA: CGFloat = 0.18;
+const STATUS_ITEM_CORNER_RADIUS: CGFloat = 5.0;
 
 #[derive(Debug, Eq, PartialEq)]
 struct WindowMenuEnablement {
@@ -325,13 +257,9 @@ fn window_menu_enablement(
 impl MenuBarManager {
     pub fn new(mtm: MainThreadMarker, events: EventSender) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
-        let status_item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
+        let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
         let menu = NSMenu::new(mtm);
         let action_target = MenuActionTarget::new(mtm, events.clone());
-        let status_icons = StatusIcons::load();
-        if status_icons.is_none() {
-            warn!("unable to load embedded menu bar icons; falling back to a text label");
-        }
 
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*action_target)));
@@ -352,8 +280,7 @@ impl MenuBarManager {
             manage_item: None,
             configured_widths: Vec::new(),
             configured_shortcuts: MenuShortcuts::default(),
-            current_status: None,
-            status_icons,
+            current_label: None,
             publication: MenuPublicationGate::default(),
             updater: SparkleUpdater::load(mtm, events),
             check_for_updates_item: None,
@@ -363,10 +290,7 @@ impl MenuBarManager {
     pub fn new_accessibility_required(mtm: MainThreadMarker, events: EventSender) -> Self {
         let mut manager = Self::new(mtm, events);
         manager.rebuild_accessibility_menu();
-        manager.show_status(
-            StatusIconState::NoWindow,
-            "Paneru — Accessibility access required",
-        );
+        manager.show_label("Paneru !".to_owned());
         manager
     }
 
@@ -400,6 +324,8 @@ impl MenuBarManager {
 
     fn update(
         &mut self,
+        virtual_index: u32,
+        show_virtual_workspace: bool,
         preset_widths: &[f64],
         has_focused_window: bool,
         focused_width_ratio: Option<f64>,
@@ -446,8 +372,19 @@ impl MenuBarManager {
             });
         }
 
-        let state = status_icon_state(has_focused_window, focused_width_ratio);
-        self.show_status(state, status_tooltip(state));
+        let mut label = if show_virtual_workspace {
+            format_virtual_workspace_label(virtual_index)
+        } else {
+            "Paneru".to_owned()
+        };
+        if self
+            .updater
+            .as_ref()
+            .is_some_and(|updater| updater.status().available_version.is_some())
+        {
+            label.push_str(" •");
+        }
+        self.show_label(label);
         if self.publication.publish_after_update() {
             self.status_item.setVisible(true);
         }
@@ -544,29 +481,30 @@ impl MenuBarManager {
         item
     }
 
-    fn show_status(&mut self, state: StatusIconState, tooltip: &str) {
-        if self
-            .current_status
-            .as_ref()
-            .is_some_and(|current| current.0 == state && current.1 == tooltip)
-        {
+    fn show_label(&mut self, label: String) {
+        if self.current_label.as_deref() == Some(label.as_str()) {
             return;
         }
 
+        let title = NSString::from_str(&label);
+        let tooltip = NSString::from_str("Paneru window manager");
         let Some(button) = self.status_item.button(self.mtm) else {
             warn!("unable to update menu bar: status item has no button");
             return;
         };
 
-        if let Some(icons) = &self.status_icons {
-            button.setImage(Some(icons.image(state)));
-            button.setTitle(&NSString::from_str(""));
-        } else {
-            button.setImage(None);
-            button.setTitle(&NSString::from_str("Paneru"));
+        button.setWantsLayer(true);
+        if let Some(layer) = button.layer() {
+            let background = NSColor::controlAccentColor()
+                .colorWithAlphaComponent(STATUS_ITEM_BACKGROUND_ALPHA)
+                .CGColor();
+            layer.setBackgroundColor(Some(&background));
+            layer.setCornerRadius(STATUS_ITEM_CORNER_RADIUS);
+            layer.setMasksToBounds(true);
         }
-        button.setToolTip(Some(&NSString::from_str(tooltip)));
-        self.current_status = Some((state, tooltip.to_owned()));
+        button.setTitle(&title);
+        button.setToolTip(Some(&tooltip));
+        self.current_label = Some(label);
     }
 }
 
@@ -578,6 +516,7 @@ impl Drop for MenuBarManager {
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 pub fn update_menu_bar(
+    active_workspace: Query<(Entity, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     focused: Query<(&Window, &WidthRatio, Option<&Unmanaged>), With<FocusedMarker>>,
     config: Res<Config>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
@@ -585,6 +524,10 @@ pub fn update_menu_bar(
     let Some(mut menu_bar) = menu_bar else {
         return;
     };
+    let Some((_, strip)) = active_workspace.iter().next() else {
+        return;
+    };
+
     let focused_window = focused.iter().next();
     if let Some((window, _, _)) = focused_window {
         set_last_focused_window_target(window.id());
@@ -598,6 +541,8 @@ pub fn update_menu_bar(
     let preset_widths = config.preset_column_widths();
     let shortcuts = menu_shortcuts(&config, &preset_widths);
     menu_bar.update(
+        strip.virtual_index,
+        config.workspace_menu_status(),
         &preset_widths,
         can_toggle_focused,
         focused_width_ratio,
@@ -642,6 +587,10 @@ pub fn menu_bar_dirty(
         || unmanaged_removed.read().next().is_some()
         || event_dirty;
     gate.should_update(changed)
+}
+
+pub(crate) fn format_virtual_workspace_label(virtual_index: u32) -> String {
+    format!("VW {}", virtual_index + 1)
 }
 
 fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
@@ -734,8 +683,8 @@ fn native_modifier_flags(modifier_bits: u8) -> NSEventModifierFlags {
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuDirtyGate, MenuPublicationGate, StatusIconState, WindowMenuEnablement, menu_bar_dirty,
-        menu_shortcut, menu_shortcuts, normalized_width_percentages, status_icon_state,
+        MenuDirtyGate, MenuPublicationGate, WindowMenuEnablement, format_virtual_workspace_label,
+        menu_bar_dirty, menu_shortcut, menu_shortcuts, normalized_width_percentages,
         window_menu_enablement,
     };
     use crate::config::Config;
@@ -750,10 +699,9 @@ mod tests {
     use bevy::math::IVec2;
 
     #[test]
-    fn status_icon_reflects_selected_window_management() {
-        assert_eq!(status_icon_state(true, Some(1.5)), StatusIconState::Managed);
-        assert_eq!(status_icon_state(true, None), StatusIconState::Unmanaged);
-        assert_eq!(status_icon_state(false, None), StatusIconState::NoWindow);
+    fn label_is_one_based() {
+        assert_eq!(format_virtual_workspace_label(0), "VW 1");
+        assert_eq!(format_virtual_workspace_label(4), "VW 5");
     }
 
     #[test]

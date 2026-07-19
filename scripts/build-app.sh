@@ -10,7 +10,6 @@ APP_DIR="$BUILD_ROOT/Paneru.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
-RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/paneru"
 SIGN_IDENTITY="${PANERU_SIGN_IDENTITY:--}"
 CARGO_BIN="${CARGO:-}"
@@ -77,11 +76,10 @@ if [[ -z "$SPARKLE_FRAMEWORK" ]]; then
 fi
 
 /bin/rm -rf "$APP_DIR"
-/bin/mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
+/bin/mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR"
 /bin/cp "$BUILT_EXECUTABLE" "$EXECUTABLE"
 /bin/chmod 755 "$EXECUTABLE"
 /bin/cp "$ROOT/assets/Info.plist" "$CONTENTS_DIR/Info.plist"
-/bin/cp "$ROOT/assets/icons/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 /usr/bin/ditto "$SPARKLE_FRAMEWORK" "$FRAMEWORKS_DIR/Sparkle.framework"
 
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$VERSION" "$CONTENTS_DIR/Info.plist"

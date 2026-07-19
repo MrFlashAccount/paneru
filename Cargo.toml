@@ -36,7 +36,6 @@ objc2-app-kit = { version = "0.3", features = [
   "NSColor",
   "NSGraphics",
   "NSGraphicsContext",
-  "NSImage",
   "NSScreen",
   "NSView",
   "NSWindow",
@@ -55,7 +54,6 @@ objc2-quartz-core = { version = "0.3", features = [
   "objc2-core-graphics",
 ] }
 objc2-foundation = { version = "0.3", features = [
-  "NSData",
   "NSNotification",
   "NSProcessInfo",
   "NSAttributedString",

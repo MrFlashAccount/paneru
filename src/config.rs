@@ -78,6 +78,7 @@ direction = "Reversed"
 modifier = "alt"
 
 [decorations]
+workspace_menu_status = true
 workspace_popup_status = false
 
 [bindings]
@@ -901,12 +902,20 @@ impl Config {
             .is_some_and(|disabled| disabled)
     }
 
+    pub fn workspace_menu_status(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.workspace_menu_status)
+            .is_none_or(|enabled| enabled)
+    }
+
     pub fn workspace_popup_status(&self) -> bool {
         self.inner()
             .decorations
             .as_ref()
             .and_then(|decorations| decorations.workspace_popup_status)
-            .is_some_and(|enabled| enabled)
+            .is_none_or(|enabled| enabled)
     }
 
     pub fn virtual_workspace_animations(&self) -> bool {
@@ -2094,26 +2103,6 @@ fn test_config_defaults() {
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
     assert_eq!(config.snap_padding(), 32);
-}
-
-#[test]
-fn test_workspace_popup_status_defaults_to_disabled() {
-    let defaults =
-        Config::try_from("[options]\n\n[bindings]\n").expect("default config should parse");
-    assert!(!defaults.workspace_popup_status());
-
-    let enabled = Config::try_from(
-        r"
-[options]
-
-[decorations]
-workspace_popup_status = true
-
-[bindings]
-",
-    )
-    .expect("workspace popup config should parse");
-    assert!(enabled.workspace_popup_status());
 }
 
 #[test]

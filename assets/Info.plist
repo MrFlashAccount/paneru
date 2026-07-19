@@ -8,8 +8,6 @@
     <string>Paneru</string>
     <key>CFBundleExecutable</key>
     <string>paneru</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.github.mrflashaccount.paneru</string>
     <key>CFBundleInfoDictionaryVersion</key>
