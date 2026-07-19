@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -19,7 +20,6 @@ use super::{
 use crate::ecs::observation::ObserverDetachRetry;
 use crate::events::{Event, EventReceiver};
 use crate::manager::{Display, Window};
-use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 
 pub(crate) const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -178,7 +178,6 @@ pub(super) struct RuntimeWork<'w, 's> {
     initializing: Option<Res<'w, Initializing>>,
     restore: Option<Res<'w, crate::ecs::restore::SessionRestore>>,
     persistence: Option<Res<'w, crate::ecs::persistence::PersistenceState>>,
-    menu_bar: Option<NonSend<'w, MenuBarManager>>,
 }
 
 fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity {
@@ -234,10 +233,6 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
         .persistence
         .as_deref()
         .and_then(crate::ecs::persistence::PersistenceState::next_deadline);
-    let updater_deadline = work
-        .menu_bar
-        .as_deref()
-        .and_then(MenuBarManager::updater_deadline);
     let scrolling_deadline = work
         .scrolling
         .iter()
@@ -274,7 +269,6 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
             verification_deadline,
             restore_deadline,
             persistence_deadline,
-            updater_deadline,
             scrolling_deadline,
             immediate_deferred,
         ]),
@@ -369,7 +363,35 @@ fn drain_event_channel(receiver: &EventReceiver) -> (Vec<Event>, bool) {
         }
     }
     received_events.extend(pending_mouse);
-    (received_events, should_exit)
+    (
+        coalesce_window_geometry_events(received_events),
+        should_exit,
+    )
+}
+
+/// Keeps only the final geometry notification for each window and event kind.
+///
+/// Superseded events leave tombstones instead of moving their replacements
+/// forward, so every surviving event retains its original FIFO position
+/// relative to unrelated events and the other geometry kind.
+fn coalesce_window_geometry_events(events: Vec<Event>) -> Vec<Event> {
+    let mut latest_moved = BTreeMap::new();
+    let mut latest_resized = BTreeMap::new();
+    let mut coalesced = Vec::with_capacity(events.len());
+    for event in events {
+        let previous_position = match &event {
+            Event::WindowMoved { window_id } => latest_moved.insert(*window_id, coalesced.len()),
+            Event::WindowResized { window_id } => {
+                latest_resized.insert(*window_id, coalesced.len())
+            }
+            _ => None,
+        };
+        if let Some(previous_position) = previous_position {
+            coalesced[previous_position] = None;
+        }
+        coalesced.push(Some(event));
+    }
+    coalesced.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -380,13 +402,30 @@ mod tests {
     };
     use crate::ecs::{ActiveWorkspaceMarker, RefreshWindowSizes, Scrolling, SendMessageTrigger};
     use crate::events::{Event, EventReceiver, EventSender};
+    use crate::platform::Modifiers;
     use bevy::app::{App, First, PostUpdate, PreUpdate, Update};
     use bevy::ecs::message::{MessageReader, MessageWriter, Messages};
     use bevy::ecs::resource::Resource;
     use bevy::ecs::schedule::IntoScheduleConfigs;
     use bevy::ecs::system::{Commands, Local, NonSend, Res, ResMut};
     use bevy::time::{Real, Time, TimeSystems, Virtual};
+    use objc2_core_foundation::CGPoint;
     use std::time::{Duration, Instant};
+
+    fn mouse_moved(x: f64) -> Event {
+        Event::MouseMoved {
+            point: CGPoint::new(x, 0.0),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn drain(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
+        let (sender, receiver) = EventSender::new();
+        for event in events {
+            sender.send(event).unwrap();
+        }
+        super::drain_event_channel(&receiver).0
+    }
 
     #[test]
     fn idle_runtime_has_no_periodic_deadline() {
@@ -461,6 +500,42 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::UpdaterStatusChanged))
         );
+    }
+
+    #[test]
+    fn duplicate_window_geometry_events_keep_each_final_fifo_position() {
+        let events = drain([
+            Event::WindowMoved { window_id: 7 },
+            Event::WindowResized { window_id: 7 },
+            Event::WindowMoved { window_id: 8 },
+            Event::UpdaterStatusChanged,
+            Event::WindowMoved { window_id: 7 },
+            Event::WindowResized { window_id: 7 },
+        ]);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], Event::WindowMoved { window_id: 8 }));
+        assert!(matches!(&events[1], Event::UpdaterStatusChanged));
+        assert!(matches!(&events[2], Event::WindowMoved { window_id: 7 }));
+        assert!(matches!(&events[3], Event::WindowResized { window_id: 7 }));
+    }
+
+    #[test]
+    fn window_geometry_coalescing_preserves_mouse_move_batching() {
+        let events = drain([
+            mouse_moved(1.0),
+            Event::WindowMoved { window_id: 7 },
+            mouse_moved(2.0),
+            Event::WindowMoved { window_id: 7 },
+            mouse_moved(3.0),
+            mouse_moved(4.0),
+            Event::WindowResized { window_id: 7 },
+        ]);
+        assert_eq!(events.len(), 5);
+        assert!(matches!(&events[0], Event::MouseMoved { point, .. } if point.x == 1.0));
+        assert!(matches!(&events[1], Event::MouseMoved { point, .. } if point.x == 2.0));
+        assert!(matches!(&events[2], Event::WindowMoved { window_id: 7 }));
+        assert!(matches!(&events[3], Event::MouseMoved { point, .. } if point.x == 4.0));
+        assert!(matches!(&events[4], Event::WindowResized { window_id: 7 }));
     }
 
     #[test]

@@ -32,6 +32,13 @@ pub(super) struct NotifyHandler {
 pub(super) type PinnedNotifyHandler =
     ScopeGuard<Pin<Box<NotifyHandler>>, Box<dyn FnOnce(Pin<Box<NotifyHandler>>)>>;
 
+const SUBSCRIBED_CGS_EVENTS: [KnownCGSEvent; 4] = [
+    KnownCGSEvent::SpaceCreated,
+    KnownCGSEvent::SpaceCurrentChanged,
+    KnownCGSEvent::SpaceDestroyed,
+    KnownCGSEvent::SpaceWindowDestroyed,
+];
+
 impl NotifyHandler {
     pub(super) fn new(events: EventSender) -> Self {
         Self {
@@ -46,14 +53,7 @@ impl NotifyHandler {
         let cid = self.conn;
         let mut pinned = Box::pin(self);
         let this = unsafe { NonNull::new_unchecked(pinned.as_mut().get_unchecked_mut()) }.as_ptr();
-        let events = [
-            KnownCGSEvent::SpaceCreated,
-            KnownCGSEvent::SpaceCurrentChanged,
-            KnownCGSEvent::SpaceDestroyed,
-            KnownCGSEvent::SpaceWindowDestroyed,
-            KnownCGSEvent::WindowTitleChanged,
-        ];
-        for event in events {
+        for event in SUBSCRIBED_CGS_EVENTS {
             unsafe {
                 SLSRegisterConnectionNotifyProc(cid, Self::callback, event.into(), this.cast())
             }
@@ -122,14 +122,6 @@ impl NotifyHandler {
                 }
             }
 
-            KnownCGSEvent::WindowTitleChanged => {
-                let bytes = (!data.is_null() && len > 0)
-                    .then(|| unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) });
-                if let Some(event) = bytes.and_then(window_title_event_from_bytes) {
-                    _ = self.events.send(event);
-                }
-            }
-
             KnownCGSEvent::SpaceWindowCreated
             | KnownCGSEvent::WindowClosed
             | KnownCGSEvent::WindowMoved
@@ -152,12 +144,6 @@ impl NotifyHandler {
             }
         }
     }
-}
-
-pub(crate) fn window_title_event_from_bytes(bytes: &[u8]) -> Option<Event> {
-    (bytes.len() >= std::mem::size_of::<WinID>()).then(|| Event::WindowTitleChanged {
-        window_id: unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<WinID>()) },
-    })
 }
 
 fn from_bytes<T>(data: *const c_void, len: usize) -> Option<T> {
@@ -275,5 +261,15 @@ impl std::fmt::Display for CGSEventType {
             CGSEventType::Known(k) => write!(f, "{k}"),
             CGSEventType::Unknown(v) => write!(f, "Unknown({v})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KnownCGSEvent, SUBSCRIBED_CGS_EVENTS};
+
+    #[test]
+    fn does_not_subscribe_to_system_wide_window_title_changes() {
+        assert!(!SUBSCRIBED_CGS_EVENTS.contains(&KnownCGSEvent::WindowTitleChanged));
     }
 }
