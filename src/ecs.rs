@@ -550,13 +550,22 @@ impl Default for VerifyWindowPosition {
 }
 
 impl VerifyWindowPosition {
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    pub fn after_commit() -> Self {
+        Self {
+            remaining: 3,
+            next_attempt: Instant::now() + Self::RETRY_DELAY,
+        }
+    }
+
     pub fn due(&self, now: Instant) -> bool {
         now >= self.next_attempt
     }
 
     pub fn tick(&mut self) -> bool {
         self.remaining = self.remaining.saturating_sub(1);
-        self.next_attempt = Instant::now() + Duration::from_millis(50);
+        self.next_attempt = Instant::now() + Self::RETRY_DELAY;
         self.remaining == 0
     }
 
