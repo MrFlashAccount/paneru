@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="./assets/icons/AppIcon.svg" width="112" height="112" alt="Paneru app icon">
+  <img src="./assets/icons/AppIcon.svg" width="212" height="212" alt="Paneru app icon">
 </p>
 
-# Paneru
+<h1 align="center">
+  Paneru
+</h1>
 
 **Build a workspace wider than your MacBook.**
 
