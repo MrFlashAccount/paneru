@@ -540,6 +540,13 @@ pub struct VerifyWindowPosition {
     next_attempt: Instant,
 }
 
+/// The last position reported by AX rather than requested by Paneru.
+///
+/// This transient marker lets the commit system preserve user drags without writing the observed
+/// position back to AX or starting a verification cycle for it.
+#[derive(Clone, Component, Copy)]
+pub struct AxObservedPosition(pub Origin);
+
 impl Default for VerifyWindowPosition {
     fn default() -> Self {
         Self {

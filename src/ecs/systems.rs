@@ -13,8 +13,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    ActiveDisplayMarker, AxObservedPosition, BProcess, ExistingMarker, FreshMarker,
+    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    VerifyWindowPosition,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -688,6 +689,7 @@ pub(super) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: Query<
         (
+            Entity,
             &mut Window,
             &mut Position,
             &Bounds,
@@ -696,15 +698,16 @@ pub(super) fn window_moved_update_frame(
         ),
         Without<LayoutStrip>,
     >,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged, verification)) = windows
+        let Some((entity, mut window, mut position, bounds, unmanaged, verification)) = windows
             .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+            .find(|window| window.1.id() == *window_id)
         else {
             continue;
         };
@@ -724,6 +727,9 @@ pub(super) fn window_moved_update_frame(
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.min != new_frame.min {
             position.0 = new_frame.min;
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(AxObservedPosition(new_frame.min));
+            }
         }
     }
 }
@@ -916,13 +922,28 @@ pub(super) fn commit_window_position(
             Option<&WindowDisposition>,
             Option<&Unmanaged>,
             Option<&RepositionMarker>,
+            Option<&AxObservedPosition>,
         ),
         Changed<Position>,
     >,
     mut commands: Commands,
 ) {
-    for (entity, mut window, position, disposition, unmanaged, repositioning) in &mut moved_windows
+    for (entity, mut window, position, disposition, unmanaged, repositioning, observed) in
+        &mut moved_windows
     {
+        if let Some(observed) = observed {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands
+                    .try_remove::<AxObservedPosition>()
+                    .try_remove::<VerifyWindowPosition>();
+            }
+            // The current position still matches the AX event, so this is external movement
+            // (not a layout target that superseded it later in the same update). Preserve it
+            // without echoing it back through AX and starting a verifier.
+            if observed.0 == position.0 {
+                continue;
+            }
+        }
         if !disposition
             .copied()
             .unwrap_or(WindowDisposition::Managed)
@@ -1293,7 +1314,7 @@ pub(crate) fn detect_tabbed_windows(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use bevy::app::{App, PostUpdate, Update};
@@ -1301,10 +1322,77 @@ mod tests {
     use bevy::prelude::*;
 
     use super::{commit_window_position, verify_window_position, window_moved_update_frame};
-    use crate::ecs::{Bounds, Position, RepositionMarker, VerifyWindowPosition, WindowDisposition};
+    use crate::ecs::{
+        AxObservedPosition, Bounds, Position, RepositionMarker, Unmanaged, VerifyWindowPosition,
+        WindowDisposition,
+    };
     use crate::events::Event;
     use crate::manager::{MockWindowApi, Origin, Size, Window};
     use crate::platform::AxMainThread;
+
+    #[test]
+    fn ax_observed_user_drag_is_not_repositioned_or_verified() {
+        for (disposition, unmanaged) in [
+            (WindowDisposition::Managed, None),
+            (WindowDisposition::Floating, Some(Unmanaged::Floating)),
+        ] {
+            let actual_x = Arc::new(AtomicI32::new(0));
+            let reposition_attempts = Arc::new(AtomicUsize::new(0));
+            let mut mock = MockWindowApi::new();
+            mock.expect_id().return_const(8);
+            mock.expect_update_frame().returning({
+                let actual_x = actual_x.clone();
+                move || {
+                    let origin = Origin::new(actual_x.load(Ordering::Relaxed), 0);
+                    Ok(IRect::from_corners(origin, origin + Size::new(400, 700)))
+                }
+            });
+            mock.expect_reposition().returning({
+                let reposition_attempts = reposition_attempts.clone();
+                move |_| {
+                    reposition_attempts.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            let mut app = App::new();
+            app.insert_non_send_resource(AxMainThread::for_tests())
+                .init_resource::<Messages<Event>>()
+                .add_systems(Update, window_moved_update_frame)
+                .add_systems(
+                    PostUpdate,
+                    (commit_window_position, verify_window_position).chain(),
+                );
+            let entity = app
+                .world_mut()
+                .spawn((
+                    Window::new(Box::new(mock)),
+                    Position(Origin::ZERO),
+                    Bounds(Size::new(400, 700)),
+                    disposition,
+                ))
+                .id();
+            if let Some(unmanaged) = unmanaged {
+                app.world_mut().entity_mut(entity).insert(unmanaged);
+            }
+            app.world_mut().clear_trackers();
+
+            for x in [120, 240] {
+                actual_x.store(x, Ordering::Relaxed);
+                app.world_mut()
+                    .write_message::<Event>(Event::WindowMoved { window_id: 8 });
+                app.update();
+
+                assert_eq!(app.world().get::<Position>(entity).unwrap().0.x, x);
+                assert_eq!(reposition_attempts.load(Ordering::Relaxed), 0);
+                assert!(!app.world().entity(entity).contains::<AxObservedPosition>());
+                assert!(
+                    !app.world()
+                        .entity(entity)
+                        .contains::<VerifyWindowPosition>()
+                );
+            }
+        }
+    }
 
     #[test]
     fn rejected_ax_position_stops_retrying_and_accepts_actual_frame() {
