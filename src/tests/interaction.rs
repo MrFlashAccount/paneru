@@ -284,6 +284,40 @@ fn targeted_toggle_changes_only_that_window_and_restores_its_frame() {
 }
 
 #[test]
+fn first_resize_after_manage_is_applied() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10_000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Manage(Some(0))),
+        },
+        Event::Command {
+            command: Command::Window(Operation::SetWidth(1.5)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_windows(1)
+        .on_iteration(3, |world, _state| {
+            assert_disposition(world, 0, WindowDisposition::Managed, None);
+            assert_window_size!(world, 0, 1_536, 748);
+        })
+        .run(commands);
+}
+
+#[test]
 fn minimize_restore_preserves_each_base_disposition() {
     let mut harness = TestHarness::new()
         .with_default_window_disposition(WindowDisposition::Passthrough)
