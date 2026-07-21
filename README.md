@@ -63,6 +63,7 @@ The fresh-install configuration provides these menu actions and shortcuts:
 | Toggle the focused window in or out of the strip | `⌃⌥⌘M` |
 | Set width to 50%, 75%, 100%, 150%, or 200% | `⌃⌥⌘1`–`⌃⌥⌘5` |
 | Center the focused managed window | `⌃⌥⌘C` |
+| Move the focused window left or right | `⌃⌥⌘←` / `⌃⌥⌘→` |
 | Pan through the strip | `⌥` + scroll |
 | Quit Paneru | `⌃⌥⌘Q` |
 
@@ -70,11 +71,12 @@ Menu commands apply to the window that was focused immediately before you opened
 
 The menu bar icon reflects the selected window's state: managed, unmanaged, or no manageable window.
 
-Paneru saves managed layout state by default. At startup, it restores window order, widths—including oversized ratios—and strip position for matching windows that the current configuration marks as managed. Use `manage = true` window rules for durable ownership: a one-off **Toggle Managed** choice applies only to the current window instance and does not automatically opt a relaunched window back in. Missing saved windows are ignored rather than blocking startup.
+Paneru saves managed layout state by default. At startup, it restores window order, widths—including oversized ratios—and strip position for matching windows. A one-off **Toggle Managed** choice is restored from saved strip membership when Paneru itself restarts; explicit `manage = false` and `floating = true` window rules still take precedence. Missing saved windows are ignored rather than blocking startup.
 
 Native macOS tab groups remain usable. Paneru infers a new tab when a same-app window shares the existing window's frame; set `disable_native_tabs = true` if that heuristic groups unrelated windows.
 
 The default `Option` + scroll path does not take over macOS's three-finger Space-switching gesture.
+Ordinary cursor movement is not observed by default; `focus_follows_mouse = true` explicitly enables the global mouse-move listener.
 
 ## Configure Paneru
 

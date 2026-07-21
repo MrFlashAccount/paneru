@@ -29,8 +29,9 @@ use crate::ecs::runtime::SyntheticEventPending;
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DefaultWindowDisposition, DockPosition, Initializing,
-    LayoutPosition, Position, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowDisposition, WindowProperties,
+    LayoutPosition, Position, ResizeMarker, RestoreWindowState, RestoredWindowMarker, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowDisposition,
+    WindowProperties,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, WindowPadding};
@@ -1043,6 +1044,7 @@ pub(super) fn apply_window_positions(
     windows: Windows,
     mut apps: Query<(Entity, &mut Application, Has<ApplicationObserved>)>,
     mut dispositions: Query<&mut WindowDisposition>,
+    restored_windows: Query<(), With<RestoredWindowMarker>>,
     config: Res<Config>,
     default_disposition: Res<DefaultWindowDisposition>,
     initializing: Option<Res<Initializing>>,
@@ -1067,7 +1069,27 @@ pub(super) fn apply_window_positions(
         };
 
         let properties = WindowProperties::new(&app, window, &config);
-        let disposition = properties.disposition(default_disposition.0);
+        let restore_match = crate::ecs::restore::matches_startup_restore_state(
+            window,
+            &app,
+            restore.as_deref(),
+            restoration.as_deref(),
+            &config,
+        );
+        // Fallback identity matches are resolved by the restore planner, which
+        // marks consumed entities Managed before this Added<Window> system can
+        // run. Preserve that result even though it is not a hard-key match.
+        let planner_restored = restored_windows.contains(entity);
+        // Saved strip membership is the durable record of an explicit runtime
+        // Manage action. Restore it unless a current static rule explicitly
+        // opts the window out or makes it floating.
+        let disposition = properties.explicit_disposition().unwrap_or_else(|| {
+            if restore_match || planner_restored {
+                WindowDisposition::Managed
+            } else {
+                default_disposition.0
+            }
+        });
         if let Ok(mut stored_disposition) = dispositions.get_mut(entity) {
             *stored_disposition = disposition;
         } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1078,16 +1100,11 @@ pub(super) fn apply_window_positions(
         {
             entity_commands.try_insert(unmanaged);
         }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<RestoredWindowMarker>();
+        }
 
-        if disposition == WindowDisposition::Managed
-            && crate::ecs::restore::matches_startup_restore_state(
-                window,
-                &app,
-                restore.as_deref(),
-                restoration.as_deref(),
-                &config,
-            )
-        {
+        if disposition == WindowDisposition::Managed && (restore_match || planner_restored) {
             ensure_application_observer(
                 app_entity,
                 &mut app,

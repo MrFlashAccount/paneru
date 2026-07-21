@@ -618,7 +618,6 @@ mod tests {
         Config::try_from(
             r#"
 [options]
-focus_follows_mouse = false
 mouse_follows_focus = false
 
 [swipe.scroll]
@@ -650,6 +649,10 @@ fingers_count = 3
     fn manual_use_case_avoids_move_drag_and_gesture_callbacks() {
         let config = manual_config();
         let policy = InputEventMaskPolicy::from_config(&config);
+        assert!(
+            !config.focus_follows_mouse(),
+            "omitting focus_follows_mouse must keep global MouseMoved disabled"
+        );
         assert!(!policy.mouse_move);
         assert!(!policy.mouse_drag);
         assert!(!policy.gesture);

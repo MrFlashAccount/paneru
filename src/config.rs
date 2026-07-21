@@ -62,6 +62,7 @@ const DEFAULT_CONFIGURATION: &str = r#"# Paneru configuration
 [options]
 preset_column_widths = [0.5, 0.75, 1.0, 1.5, 2.0]
 window_resize_cycle = false
+focus_follows_mouse = false
 
 [swipe]
 sensitivity = 0.20
@@ -87,6 +88,8 @@ window_width_100 = "ctrl+alt+cmd-3"
 window_width_150 = "ctrl+alt+cmd-4"
 window_width_200 = "ctrl+alt+cmd-5"
 window_center = "ctrl+alt+cmd-c"
+window_swap_west = "ctrl+alt+cmd-leftarrow"
+window_swap_east = "ctrl+alt+cmd-rightarrow"
 window_manage = "ctrl+alt+cmd-m"
 quit = "ctrl+alt+cmd-q"
 "#;
@@ -868,11 +871,13 @@ impl Config {
         self.options().horizontal_mouse_warp
     }
 
-    /// Returns `true` if focus should follow the mouse based on the current configuration.
-    /// If the configuration option is not set, it defaults to `true`.
+    /// Returns `true` only when focus-follows-mouse is explicitly enabled.
+    /// Keeping the default disabled also avoids installing a global `MouseMoved`
+    /// event tap that would wake the entire ECS schedule for every cursor event.
     pub fn focus_follows_mouse(&self) -> bool {
-        // Default is enabled.
-        self.options().focus_follows_mouse.is_none_or(|ffm| ffm)
+        self.options()
+            .focus_follows_mouse
+            .is_some_and(|enabled| enabled)
     }
 
     /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
@@ -2085,6 +2090,7 @@ fn test_parse_hex_color_malformed_hex() {
 #[allow(clippy::float_cmp)]
 fn test_config_defaults() {
     let config = Config::default();
+    assert!(!config.focus_follows_mouse());
     assert_eq!(config.dim_inactive_opacity(), 0.0);
     assert_eq!(config.dim_inactive_color(), (0.0, 0.0, 0.0));
     assert!(!config.border_active_window());

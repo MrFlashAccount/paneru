@@ -19,7 +19,7 @@ use crate::ecs::state::{
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, RestoreWindowState,
-    SpawnCommandsExt, Unmanaged,
+    RestoredWindowMarker, SpawnCommandsExt, Unmanaged, WindowDisposition, WindowProperties,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -478,7 +478,7 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&windows, &apps, restoration);
+    let current = current_window_identities(&windows, &apps, restoration, &config);
     let plan = RestorePlanner::new(restoration).plan(&current);
 
     if plan.consumed_entities.is_empty() {
@@ -523,7 +523,12 @@ pub(super) fn restore_window_state(
 
     for entity in &plan.consumed_entities {
         if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-            entity_commands.try_remove::<Unmanaged>();
+            // A window consumed into a restored strip must satisfy the same
+            // ownership invariant as a freshly managed window. Without this,
+            // a stale passthrough disposition can reappear on deminimize/show.
+            entity_commands
+                .try_insert((WindowDisposition::Managed, RestoredWindowMarker))
+                .try_remove::<Unmanaged>();
         }
     }
 
@@ -644,11 +649,20 @@ fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
     restoration: &PaneruState,
+    config: &Config,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
-        .managed_iter()
-        .filter_map(|(window, entity, child)| {
-            let app = apps.get(child.parent()).ok()?;
+        .iter()
+        .filter_map(|(window, entity)| {
+            let (_, _, parent) = windows.find_parent(window.id())?;
+            let app = apps.get(parent).ok()?;
+            let explicit = WindowProperties::new(app, window, config).explicit_disposition();
+            if matches!(
+                explicit,
+                Some(WindowDisposition::Passthrough | WindowDisposition::Floating)
+            ) {
+                return None;
+            }
             Some(CurrentWindowIdentity {
                 entity,
                 window_id: window.id(),

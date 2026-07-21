@@ -408,16 +408,19 @@ fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn find_orphaned_workspaces(
     _main_thread: NonSend<AxMainThread>,
-    orphans: Populated<
-        (
-            &LayoutStrip,
-            Entity,
-            &Timeout,
-            &mut OrphanReconcileDeadline,
-            Option<&ChildOf>,
-        ),
-        With<Timeout>,
-    >,
+    mut strips: ParamSet<(
+        Populated<
+            (
+                &LayoutStrip,
+                Entity,
+                &Timeout,
+                &mut OrphanReconcileDeadline,
+                Option<&ChildOf>,
+            ),
+            With<Timeout>,
+        >,
+        Query<&mut LayoutStrip, (With<ActiveWorkspaceMarker>, Without<Timeout>)>,
+    )>,
     displays: Populated<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -425,69 +428,98 @@ fn find_orphaned_workspaces(
     let present = window_manager.present_displays();
 
     let now = std::time::Instant::now();
-    for (orphan, orphan_entity, timeout, mut reconcile, child) in orphans {
-        if orphan.len() == 0 {
-            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-                cmd.try_despawn();
-            }
-            debug!("despawning empty orphan workspace {}", orphan.id());
-            continue;
-        }
-        if child.is_some() {
-            // Was reparented, remove timer.
-            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-                cmd.try_remove::<Timeout>();
-                cmd.try_remove::<OrphanReconcileDeadline>();
-                cmd.insert(RefreshWindowSizes::default());
-            }
-            debug!(
-                "layout strip {} was re-parented, removing timeout.",
-                orphan.id()
-            );
-            continue;
-        }
-
-        if timeout.due(now) {
-            // Rescue windows from orphaned strips before despawning by floating them.
-            debug!("Rescue windows from timed out orphan {}.", orphan.id());
-            for lost_window in orphan.all_windows() {
-                if let Ok(mut cmd) = commands.get_entity(lost_window) {
-                    cmd.try_insert((WindowDisposition::Floating, Unmanaged::Floating));
+    let mut rescues = Vec::new();
+    {
+        let mut orphans = strips.p0();
+        for (orphan, orphan_entity, timeout, mut reconcile, child) in &mut orphans {
+            if orphan.len() == 0 {
+                if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
+                    cmd.try_despawn();
                 }
+                debug!("despawning empty orphan workspace {}", orphan.id());
+                continue;
             }
-            continue;
-        }
-
-        if !reconcile.due(now) {
-            continue;
-        }
-        reconcile.schedule_next(now);
-
-        // Find which display now owns this space ID.
-        let target = present.iter().find_map(|(present_display, spaces)| {
-            if spaces.iter().any(|&id| id == orphan.id()) {
-                displays
-                    .iter()
-                    .find(|(d, _)| d.id() == present_display.id())
-            } else {
-                None
+            if child.is_some() {
+                // Was reparented, remove timer.
+                if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
+                    cmd.try_remove::<Timeout>();
+                    cmd.try_remove::<OrphanReconcileDeadline>();
+                    cmd.insert(RefreshWindowSizes::default());
+                }
+                debug!(
+                    "layout strip {} was re-parented, removing timeout.",
+                    orphan.id()
+                );
+                continue;
             }
-        });
-        let Some((target_display, target_entity)) = target else {
-            continue; // No display owns this space yet; wait for next tick.
-        };
 
-        debug!(
-            "Re-parenting orphaned strip {} to display {}",
-            orphan.id(),
-            target_display.id(),
-        );
+            if timeout.due(now) {
+                if !reconcile.due(now) {
+                    continue;
+                }
+                reconcile.schedule_next(now);
+                // A display can disappear transiently during wake or display
+                // reconfiguration. Preserve managed ownership while moving the
+                // windows into the currently active strip; permanently changing
+                // disposition here made Managed Mode appear to drop at random.
+                rescues.push((orphan_entity, orphan.id(), orphan.all_windows()));
+                continue;
+            }
 
+            if !reconcile.due(now) {
+                continue;
+            }
+            reconcile.schedule_next(now);
+
+            // Find which display now owns this space ID.
+            let target = present.iter().find_map(|(present_display, spaces)| {
+                if spaces.iter().any(|&id| id == orphan.id()) {
+                    displays
+                        .iter()
+                        .find(|(d, _)| d.id() == present_display.id())
+                } else {
+                    None
+                }
+            });
+            let Some((target_display, target_entity)) = target else {
+                continue; // No display owns this space yet; wait for next tick.
+            };
+
+            debug!(
+                "Re-parenting orphaned strip {} to display {}",
+                orphan.id(),
+                target_display.id(),
+            );
+
+            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
+                cmd.try_remove::<Timeout>()
+                    .try_remove::<OrphanReconcileDeadline>()
+                    .insert(ChildOf(target_entity))
+                    .insert(RefreshWindowSizes::default());
+            }
+        }
+    }
+
+    if rescues.is_empty() {
+        return;
+    }
+
+    let mut active_strips = strips.p1();
+    let Ok(mut active_strip) = active_strips.single_mut() else {
+        warn!("Unable to rescue orphan windows: no unique active workspace");
+        return;
+    };
+    for (orphan_entity, orphan_id, lost_windows) in rescues {
+        debug!("Rescuing windows from timed out orphan {orphan_id}.");
+        for lost_window in lost_windows {
+            active_strip.append(lost_window);
+            if let Ok(mut cmd) = commands.get_entity(lost_window) {
+                cmd.try_insert(WindowDisposition::Managed)
+                    .try_remove::<Unmanaged>();
+            }
+        }
         if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-            cmd.try_remove::<Timeout>()
-                .try_remove::<OrphanReconcileDeadline>()
-                .insert(ChildOf(target_entity))
-                .insert(RefreshWindowSizes::default());
+            cmd.try_despawn();
         }
     }
 }
@@ -1212,7 +1244,7 @@ mod main_thread_tests {
     use crate::ecs::runtime::OrphanReconcileDeadline;
     use crate::ecs::{
         ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, RefreshWindowSizes, RepositionMarker,
-        Scrolling, SelectedVirtualMarker, Timeout,
+        Scrolling, SelectedVirtualMarker, Timeout, Unmanaged, WindowDisposition,
     };
     use crate::manager::{
         Display, MockWindowApi, MockWindowManagerApi, Origin, Size, Window, WindowManager,
@@ -1305,6 +1337,15 @@ mod main_thread_tests {
         ));
     }
 
+    fn spawn_expired_orphan_with_managed_window(mut commands: Commands) {
+        let window = commands.spawn(WindowDisposition::Managed).id();
+        let mut orphan = LayoutStrip::new(99, 0);
+        orphan.append(window);
+        let timeout = Timeout::new(Duration::ZERO, None, &mut commands);
+        commands.spawn((orphan, timeout, OrphanReconcileDeadline::immediate()));
+        commands.spawn((LayoutStrip::new(1, 0), ActiveWorkspaceMarker));
+    }
+
     #[test]
     fn orphan_reconciliation_runs_cg_query_on_main_thread() {
         let expected_thread = std::thread::current().id();
@@ -1325,5 +1366,37 @@ mod main_thread_tests {
             .spawn(Display::new(1, IRect::new(0, 0, 1_000, 800), 0));
 
         app.update();
+    }
+
+    #[test]
+    fn timed_out_orphan_preserves_managed_ownership() {
+        let mut manager = MockWindowManagerApi::new();
+        manager
+            .expect_present_displays()
+            .times(1)
+            .returning(Vec::new);
+        let mut app = App::new();
+        app.insert_non_send_resource(AxMainThread::for_tests())
+            .insert_resource(WindowManager(Box::new(manager)))
+            .add_systems(Startup, spawn_expired_orphan_with_managed_window)
+            .add_systems(Update, find_orphaned_workspaces);
+        app.world_mut()
+            .spawn(Display::new(1, IRect::new(0, 0, 1_000, 800), 0));
+
+        app.update();
+
+        let world = app.world_mut();
+        let mut windows = world.query_filtered::<
+            (Entity, &WindowDisposition, Option<&Unmanaged>),
+            Without<LayoutStrip>,
+        >();
+        let (window, disposition, unmanaged) = windows.single(world).unwrap();
+        assert_eq!(*disposition, WindowDisposition::Managed);
+        assert!(unmanaged.is_none());
+
+        let mut strips = world.query::<&LayoutStrip>();
+        let strips = strips.iter(world).collect::<Vec<_>>();
+        assert_eq!(strips.len(), 1, "the timed-out orphan should be despawned");
+        assert!(strips[0].contains(window));
     }
 }

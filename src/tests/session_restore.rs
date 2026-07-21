@@ -608,10 +608,11 @@ fn test_startup_restore_respects_floating_config_for_matched_window() {
 }
 
 #[test]
-fn test_startup_restore_does_not_capture_default_passthrough_window() {
-    let mut harness = TestHarness::new()
-        .with_default_window_disposition(WindowDisposition::Passthrough)
-        .with_windows(1);
+fn test_startup_restore_respects_explicit_passthrough_config_for_matched_window() {
+    let mut params = WindowParams::new(".*", Some("test".to_string()));
+    params.manage = Some(false);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
     harness
         .app
         .world_mut()
@@ -636,6 +637,96 @@ fn test_startup_restore_does_not_capture_default_passthrough_window() {
     );
     let mut strips = world.query::<&LayoutStrip>();
     assert!(!strips.iter(world).any(|strip| strip.contains(entity)));
+}
+
+#[test]
+fn test_startup_restore_restores_saved_managed_window_over_passthrough_default() {
+    let mut harness = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_windows(1);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let world = harness.world();
+    let entity = crate::tests::harness::find_window_entity(0, world);
+    assert_eq!(
+        world.entity(entity).get::<WindowDisposition>().copied(),
+        Some(WindowDisposition::Managed)
+    );
+    assert_eq!(world.entity(entity).get::<Unmanaged>().copied(), None);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(strips.iter(world).any(|strip| strip.contains(entity)));
+
+    harness.world().write_message(Event::ApplicationHidden {
+        pid: TEST_PROCESS_ID,
+    });
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    let entity = crate::tests::harness::find_window_entity(0, harness.world());
+    assert_eq!(
+        harness
+            .world()
+            .entity(entity)
+            .get::<WindowDisposition>()
+            .copied(),
+        Some(WindowDisposition::Managed)
+    );
+    assert_eq!(
+        harness.world().entity(entity).get::<Unmanaged>().copied(),
+        Some(Unmanaged::Hidden)
+    );
+
+    harness.world().write_message(Event::ApplicationVisible {
+        pid: TEST_PROCESS_ID,
+    });
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    assert_eq!(world.entity(entity).get::<Unmanaged>().copied(), None);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(strips.iter(world).any(|strip| strip.contains(entity)));
+}
+
+#[test]
+fn test_startup_restore_fallback_restores_saved_managed_window_over_passthrough_default() {
+    let mut saved = saved_window(99);
+    saved.title = "ChatGPT".to_string();
+    saved.identifier = "testid".to_string();
+    let mut harness = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_window(0, |window| window.title = "ChatGPT".to_string());
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let world = harness.world();
+    let entity = crate::tests::harness::find_window_entity(0, world);
+    assert_eq!(
+        world.entity(entity).get::<WindowDisposition>().copied(),
+        Some(WindowDisposition::Managed)
+    );
+    assert_eq!(world.entity(entity).get::<Unmanaged>().copied(), None);
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(strips.iter(world).any(|strip| strip.contains(entity)));
 }
 
 #[test]

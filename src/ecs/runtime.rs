@@ -60,6 +60,11 @@ impl Default for OrphanReconcileDeadline {
 }
 
 impl OrphanReconcileDeadline {
+    #[cfg(test)]
+    pub(crate) fn immediate() -> Self {
+        Self(Instant::now())
+    }
+
     pub(crate) fn due(&self, now: Instant) -> bool {
         now >= self.0
     }

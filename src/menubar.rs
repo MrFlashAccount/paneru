@@ -24,7 +24,7 @@ use crate::commands::{
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged, WidthRatio};
+use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged, WidthRatio, WindowDisposition};
 use crate::events::{Event, EventSender};
 use crate::manager::{Window, request_ax_privilege};
 use crate::platform::Modifiers;
@@ -648,7 +648,11 @@ pub fn menu_bar_dirty(
         (),
         (
             With<FocusedMarker>,
-            Or<(Added<FocusedMarker>, Changed<Unmanaged>)>,
+            Or<(
+                Added<FocusedMarker>,
+                Changed<Unmanaged>,
+                Changed<WindowDisposition>,
+            )>,
         ),
     >,
     mut focus_removed: RemovedComponents<FocusedMarker>,
@@ -728,6 +732,8 @@ fn menu_shortcut(key: &str, modifiers: Modifiers) -> Option<MenuShortcut> {
         "space" => " ",
         "delete" => "\u{8}",
         "escape" => "\u{1b}",
+        "leftarrow" => "\u{f702}",
+        "rightarrow" => "\u{f703}",
         key if key.chars().count() == 1 => key,
         _ => return None,
     };
@@ -764,7 +770,7 @@ mod tests {
         window_menu_enablement,
     };
     use crate::config::Config;
-    use crate::ecs::{Bounds, FocusedMarker};
+    use crate::ecs::{Bounds, FocusedMarker, WindowDisposition};
     use crate::events::Event;
     use crate::platform::Modifiers;
     use bevy::app::{App, Update};
@@ -818,8 +824,8 @@ mod tests {
 [bindings]
 window_width_150 = "ctrl+alt+cmd-4"
 window_center = "ctrl+alt+cmd-c"
-window_swap_west = "ctrl+alt+cmd-leftbracket"
-window_swap_east = "ctrl+alt+cmd-rightbracket"
+window_swap_west = "ctrl+alt+cmd-leftarrow"
+window_swap_east = "ctrl+alt+cmd-rightarrow"
 "#,
         )
         .expect("bindings should parse");
@@ -845,14 +851,14 @@ window_swap_east = "ctrl+alt+cmd-rightbracket"
                 .move_left
                 .as_ref()
                 .map(|shortcut| shortcut.key.as_str()),
-            Some("[")
+            Some("\u{f702}")
         );
         assert_eq!(
             shortcuts
                 .move_right
                 .as_ref()
                 .map(|shortcut| shortcut.key.as_str()),
-            Some("]")
+            Some("\u{f703}")
         );
     }
 
@@ -905,7 +911,11 @@ window_swap_east = "ctrl+alt+cmd-rightbracket"
             .add_systems(Update, count_menu_update.run_if(menu_bar_dirty));
         let window = app
             .world_mut()
-            .spawn((FocusedMarker, Bounds(IVec2::new(100, 100))))
+            .spawn((
+                FocusedMarker,
+                Bounds(IVec2::new(100, 100)),
+                WindowDisposition::Passthrough,
+            ))
             .id();
         app.update();
         assert_eq!(app.world().resource::<MenuUpdateCount>().0, 1);
@@ -919,10 +929,17 @@ window_swap_east = "ctrl+alt+cmd-rightbracket"
         app.update();
         assert_eq!(app.world().resource::<MenuUpdateCount>().0, 1);
 
+        *app.world_mut()
+            .entity_mut(window)
+            .get_mut::<WindowDisposition>()
+            .unwrap() = WindowDisposition::Managed;
+        app.update();
+        assert_eq!(app.world().resource::<MenuUpdateCount>().0, 2);
+
         app.world_mut()
             .resource_mut::<Messages<Event>>()
             .write(Event::UpdaterStatusChanged);
         app.update();
-        assert_eq!(app.world().resource::<MenuUpdateCount>().0, 2);
+        assert_eq!(app.world().resource::<MenuUpdateCount>().0, 3);
     }
 }
