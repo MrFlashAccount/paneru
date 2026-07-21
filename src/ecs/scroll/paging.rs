@@ -299,6 +299,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn release_returns_or_advances_exactly_one_stop() {
         let paging = gesture();
         assert_eq!(snap_target(-700.0, 1000.0, paging, 32), -600.0);

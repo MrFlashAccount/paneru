@@ -311,6 +311,24 @@ impl PlatformCallbacks {
                         true,
                     );
                 }
+            } else if frame_display_id.is_some()
+                && let Some(timeout) = timeout
+            {
+                // Timer fallback for macOS 11-13 or a display-link setup
+                // failure. Other run-loop sources may wake this loop, but they
+                // must not turn an active motion session into unpaced ECS work.
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    CFRunLoop::run_in_mode(
+                        unsafe { kCFRunLoopDefaultMode },
+                        remaining.as_secs_f64(),
+                        true,
+                    );
+                }
             } else {
                 let seconds = timeout.map_or(f64::MAX, |duration| duration.as_secs_f64());
                 CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);

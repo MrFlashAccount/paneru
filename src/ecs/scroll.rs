@@ -403,7 +403,15 @@ fn finish_touchpad_gesture(
     }
 }
 
-pub(super) fn scrolling_needs_frame(scroll: &Scrolling) -> bool {
+pub(super) fn scrolling_needs_frame(scroll: &Scrolling, now: Instant) -> bool {
+    // A raw gesture with a lost terminal event may retain its last non-zero
+    // velocity. Stop display-frame work after a short input lull while keeping
+    // the session alive until the conservative lifecycle watchdog fires.
+    if scroll.gesture_active
+        && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD
+    {
+        return false;
+    }
     scroll.target_position.is_some()
         || scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON
         || (!scroll.gesture_active && (scroll.is_user_swiping || scroll.snap_pending))
@@ -428,6 +436,10 @@ fn expire_stale_gesture(scroll: &mut Scrolling, now: Instant) -> bool {
     {
         scroll.gesture_active = false;
         scroll.is_user_swiping = false;
+        scroll.velocity = 0.0;
+        scroll.target_position = None;
+        scroll.snap_pending = false;
+        scroll.paging_gesture = None;
         true
     } else {
         false
@@ -461,7 +473,7 @@ pub(super) fn swiping_timeout(
         {
             entity_commands.try_remove::<Scrolling>();
         }
-        if outcome.emit_mouse_moved
+        if outcome.should_emit_mouse_moved(config.focus_follows_mouse())
             && let Some(point) = window_manager.cursor_position()
         {
             commands.trigger(SendMessageTrigger(Event::MouseMoved {
@@ -476,6 +488,12 @@ pub(super) fn swiping_timeout(
 struct SwipeTimeoutOutcome {
     emit_mouse_moved: bool,
     remove: bool,
+}
+
+impl SwipeTimeoutOutcome {
+    fn should_emit_mouse_moved(self, focus_follows_mouse: bool) -> bool {
+        self.emit_mouse_moved && focus_follows_mouse
+    }
 }
 
 fn update_swipe_timeout(
@@ -921,6 +939,9 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
 mod tests;
 
 #[cfg(test)]
+mod settlement_tests;
+
+#[cfg(test)]
 mod performance_tests {
     use std::time::Instant;
 
@@ -961,7 +982,16 @@ mod performance_tests {
             ..Default::default()
         };
 
-        assert!(!scrolling_needs_frame(&scrolling));
+        assert!(!scrolling_needs_frame(&scrolling, last_event));
+        scrolling.velocity = 2.0;
+        assert!(scrolling_needs_frame(
+            &scrolling,
+            last_event + std::time::Duration::from_millis(49)
+        ));
+        assert!(!scrolling_needs_frame(
+            &scrolling,
+            last_event + std::time::Duration::from_millis(50)
+        ));
         assert!(!expire_stale_gesture(
             &mut scrolling,
             last_event + STALE_GESTURE_TIMEOUT.saturating_sub(std::time::Duration::from_millis(1))
@@ -974,7 +1004,14 @@ mod performance_tests {
         ));
         assert!(!scrolling.gesture_active);
         assert!(!scrolling.is_user_swiping);
-        assert!(scrolling_needs_frame(&scrolling));
+        assert!(scrolling.velocity.abs() < f64::EPSILON);
+        assert!(scrolling.target_position.is_none());
+        assert!(!scrolling.snap_pending);
+        assert!(scrolling.paging_gesture.is_none());
+        assert!(!scrolling_needs_frame(
+            &scrolling,
+            last_event + STALE_GESTURE_TIMEOUT
+        ));
     }
 
     #[test]
@@ -1043,6 +1080,8 @@ mod performance_tests {
         assert!(!wide_result.remove);
         assert!(narrow_result.emit_mouse_moved);
         assert!(wide_result.emit_mouse_moved);
+        assert!(!narrow_result.should_emit_mouse_moved(false));
+        assert!(narrow_result.should_emit_mouse_moved(true));
         assert!(
             !update_swipe_timeout(&mut narrow, true, 0.016, 100.0).emit_mouse_moved,
             "synthetic mouse move is emitted only on the swiping transition"

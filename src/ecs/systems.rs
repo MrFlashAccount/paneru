@@ -19,7 +19,7 @@ use super::{
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, StripTranslatedFrame};
 use crate::ecs::params::Windows;
 use crate::ecs::runtime::FreshPollDeadline;
 use crate::ecs::width_ratio::width_ratio_for_owner;
@@ -35,6 +35,11 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{AxMainThread, WinID};
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
+
+mod scroll_verification;
+pub(super) use scroll_verification::{
+    PendingScrollVerification, commit_window_position, finalize_scroll_verifications,
+};
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
 ///
@@ -517,7 +522,12 @@ pub(super) fn retry_front_switch(
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(
+        &mut Position,
+        Entity,
+        &RepositionMarker,
+        Option<&mut StripTranslatedFrame>,
+    )>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -528,9 +538,8 @@ pub(super) fn animate_entities(
     let rate = config.animation_speed();
     let t = (1.0 - (-rate * time.delta_secs_f64()).exp()).clamp(0.0, 1.0) as f32;
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
+    animate.into_iter().for_each(
+        |(mut position, entity, RepositionMarker(origin), translated)| {
             let target = origin.as_vec2();
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
@@ -549,10 +558,14 @@ pub(super) fn animate_entities(
                 position.0,
             );
             position.0 = new_pos;
+            if let Some(mut translated) = translated {
+                translated.position = new_pos;
+            }
             if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
             }
-        });
+        },
+    );
 }
 
 /// Animates window resizing.
@@ -695,6 +708,7 @@ pub(super) fn window_moved_update_frame(
             &Bounds,
             Option<&Unmanaged>,
             Option<&VerifyWindowPosition>,
+            Option<&PendingScrollVerification>,
         ),
         Without<LayoutStrip>,
     >,
@@ -705,7 +719,15 @@ pub(super) fn window_moved_update_frame(
             continue;
         };
 
-        let Some((entity, mut window, mut position, bounds, unmanaged, verification)) = windows
+        let Some((
+            entity,
+            mut window,
+            mut position,
+            bounds,
+            unmanaged,
+            verification,
+            pending_scroll_verification,
+        )) = windows
             .iter_mut()
             .find(|window| window.1.id() == *window_id)
         else {
@@ -717,7 +739,7 @@ pub(super) fn window_moved_update_frame(
         // AX emits a WindowMoved notification for our own reposition request. Do not feed an
         // intermediate or OS-clamped frame back into the layout while the bounded verification
         // loop is deciding whether the request succeeded.
-        if verification.is_some() {
+        if verification.is_some() || pending_scroll_verification.is_some() {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -908,60 +930,6 @@ pub(super) fn update_overlays(
         focused_abs_cg,
         border_params.as_ref(),
     );
-}
-
-#[allow(clippy::type_complexity)]
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_position(
-    _main_thread: NonSend<AxMainThread>,
-    mut moved_windows: Populated<
-        (
-            Entity,
-            &mut Window,
-            &Position,
-            Option<&WindowDisposition>,
-            Option<&Unmanaged>,
-            Option<&RepositionMarker>,
-            Option<&AxObservedPosition>,
-        ),
-        Changed<Position>,
-    >,
-    mut commands: Commands,
-) {
-    for (entity, mut window, position, disposition, unmanaged, repositioning, observed) in
-        &mut moved_windows
-    {
-        if let Some(observed) = observed {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands
-                    .try_remove::<AxObservedPosition>()
-                    .try_remove::<VerifyWindowPosition>();
-            }
-            // The current position still matches the AX event, so this is external movement
-            // (not a layout target that superseded it later in the same update). Preserve it
-            // without echoing it back through AX and starting a verifier.
-            if observed.0 == position.0 {
-                continue;
-            }
-        }
-        if !disposition
-            .copied()
-            .unwrap_or(WindowDisposition::Managed)
-            .owns_geometry(unmanaged)
-        {
-            continue;
-        }
-        window.reposition(position.0);
-        // During an animation the marker remains until the final frame. Chained systems apply
-        // its removal before this system runs, so only a completed/direct move starts the
-        // acknowledgement window. Direct scrolling may refresh this component every frame; the
-        // final position is verified once scrolling stops.
-        if repositioning.is_none()
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_insert(VerifyWindowPosition::after_commit());
-        }
-    }
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]

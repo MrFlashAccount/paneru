@@ -6,9 +6,9 @@ use objc2_core_foundation::{
 use objc2_core_graphics::CGDirectDisplayID;
 use std::ffi::c_void;
 use std::ptr::{from_ref, null_mut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 
 use crate::commands::Command;
 use crate::config::Config;
@@ -176,6 +176,15 @@ struct EventWake {
     generation: AtomicU64,
     source: AtomicPtr<CFRunLoopSource>,
     active_signals: AtomicUsize,
+    geometry_wakes: Mutex<GeometryWakeState>,
+    #[cfg(test)]
+    signal_count: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct GeometryWakeState {
+    deferrals: usize,
+    skipped_wake: bool,
 }
 
 impl Default for EventWake {
@@ -184,6 +193,34 @@ impl Default for EventWake {
             generation: AtomicU64::new(0),
             source: AtomicPtr::new(null_mut()),
             active_signals: AtomicUsize::new(0),
+            geometry_wakes: Mutex::new(GeometryWakeState::default()),
+            #[cfg(test)]
+            signal_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl EventWake {
+    fn signal(&self) {
+        #[cfg(test)]
+        self.signal_count.fetch_add(1, Ordering::Relaxed);
+        self.active_signals.fetch_add(1, Ordering::AcqRel);
+        let source = self.source.load(Ordering::Acquire);
+        if !source.is_null() {
+            // Main-thread sends must signal too: AppKit callbacks can run while
+            // PlatformCallbacks is draining queued NSEvents immediately before
+            // entering CFRunLoop::run_in_mode. Without a latched source, that
+            // subsequent run could sleep despite the newly queued ECS event.
+            // The source callback itself is empty and channel draining coalesces
+            // events, so it adds at most one wake turn, not persistent frame work.
+            // SAFETY: `EventWakeSource` owns the source until it first clears
+            // this pointer with Release ordering. Core Foundation permits
+            // signalling a run-loop source from arbitrary threads.
+            unsafe { &*source }.signal();
+        }
+        self.active_signals.fetch_sub(1, Ordering::Release);
+        if let Some(main_loop) = CFRunLoop::main() {
+            main_loop.wake_up();
         }
     }
 }
@@ -207,6 +244,69 @@ impl EventReceiver {
 
     pub(crate) fn generation(&self) -> u64 {
         self.wake.generation.load(Ordering::Acquire)
+    }
+
+    /// Suppresses only geometry wake signals while a display-frame wake is
+    /// already guaranteed. Events remain queued and generation-tracked.
+    pub(crate) fn defer_geometry_wakes(&self) -> GeometryWakeDeferral {
+        self.wake
+            .geometry_wakes
+            .lock()
+            .expect("geometry wake state poisoned")
+            .deferrals += 1;
+        GeometryWakeDeferral {
+            wake: Arc::clone(&self.wake),
+            released: false,
+        }
+    }
+}
+
+pub(crate) struct GeometryWakeDeferral {
+    wake: Arc<EventWake>,
+    released: bool,
+}
+
+impl GeometryWakeDeferral {
+    /// Drains once more and releases deferral while geometry senders are
+    /// excluded. A sender therefore lands either in this drain or after wake
+    /// signalling has been restored; it cannot enqueue into the handoff gap.
+    pub(crate) fn release_after<R>(mut self, drain: impl FnOnce() -> R) -> R {
+        let mut state = self
+            .wake
+            .geometry_wakes
+            .lock()
+            .expect("geometry wake state poisoned");
+        let output = drain();
+        state.deferrals -= 1;
+        if state.deferrals == 0 {
+            state.skipped_wake = false;
+        }
+        self.released = true;
+        output
+    }
+}
+
+impl Drop for GeometryWakeDeferral {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let should_signal = {
+            let mut state = self
+                .wake
+                .geometry_wakes
+                .lock()
+                .expect("geometry wake state poisoned");
+            state.deferrals -= 1;
+            let should_signal = state.deferrals == 0 && state.skipped_wake;
+            if state.deferrals == 0 {
+                state.skipped_wake = false;
+            }
+            should_signal
+        };
+        if should_signal {
+            self.wake.signal();
+        }
     }
 }
 
@@ -285,26 +385,26 @@ impl EventSender {
     ///
     /// `Ok(())` if the event is sent successfully, otherwise `Err(Error)` if the receiver has disconnected.
     pub fn send(&self, event: Event) -> Result<()> {
-        self.tx.send(event)?;
-        self.wake.generation.fetch_add(1, Ordering::Release);
-        self.wake.active_signals.fetch_add(1, Ordering::AcqRel);
-        let source = self.wake.source.load(Ordering::Acquire);
-        if !source.is_null() {
-            // Main-thread sends must signal too: AppKit callbacks can run while
-            // PlatformCallbacks is draining queued NSEvents immediately before
-            // entering CFRunLoop::run_in_mode. Without a latched source, that
-            // subsequent run could sleep despite the newly queued ECS event.
-            // The source callback itself is empty and channel draining coalesces
-            // events, so it adds at most one wake turn, not persistent frame work.
-            // SAFETY: `EventWakeSource` owns the source until it first clears
-            // this pointer with Release ordering. Core Foundation permits
-            // signalling a run-loop source from arbitrary threads.
-            unsafe { &*source }.signal();
+        if matches!(
+            event,
+            Event::WindowMoved { .. } | Event::WindowResized { .. }
+        ) {
+            let mut state = self
+                .wake
+                .geometry_wakes
+                .lock()
+                .expect("geometry wake state poisoned");
+            self.tx.send(event)?;
+            self.wake.generation.fetch_add(1, Ordering::Release);
+            if state.deferrals != 0 {
+                state.skipped_wake = true;
+                return Ok(());
+            }
+        } else {
+            self.tx.send(event)?;
+            self.wake.generation.fetch_add(1, Ordering::Release);
         }
-        self.wake.active_signals.fetch_sub(1, Ordering::Release);
-        if let Some(main_loop) = CFRunLoop::main() {
-            main_loop.wake_up();
-        }
+        self.wake.signal();
         Ok(())
     }
 }
@@ -312,6 +412,7 @@ impl EventSender {
 #[cfg(test)]
 mod tests {
     use super::{Event, EventSender};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -340,5 +441,63 @@ mod tests {
             receiver.try_recv(),
             Ok(Event::ApplicationDeactivated)
         ));
+    }
+
+    #[test]
+    fn geometry_wake_deferral_keeps_events_and_restores_idle_wakes() {
+        let (sender, receiver) = EventSender::new();
+        {
+            let _deferral = receiver.defer_geometry_wakes();
+            sender.send(Event::WindowMoved { window_id: 7 }).unwrap();
+            assert_eq!(receiver.wake.signal_count.load(Ordering::Acquire), 0);
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::WindowMoved { window_id: 7 })
+        ));
+        assert_eq!(receiver.wake.signal_count.load(Ordering::Acquire), 1);
+        sender.send(Event::WindowMoved { window_id: 8 }).unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::WindowMoved { window_id: 8 })
+        ));
+        assert_eq!(receiver.wake.signal_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn geometry_sender_cannot_fall_into_guard_release_handoff_gap() {
+        let (sender, receiver) = EventSender::new();
+        let deferral = receiver.defer_geometry_wakes();
+        let start = Arc::new(Barrier::new(2));
+        let sender_started = Arc::new(AtomicBool::new(false));
+        let worker = thread::spawn({
+            let start = Arc::clone(&start);
+            let sender_started = Arc::clone(&sender_started);
+            move || {
+                start.wait();
+                sender_started.store(true, Ordering::Release);
+                sender.send(Event::WindowMoved { window_id: 9 }).unwrap();
+            }
+        });
+
+        let drained = deferral.release_after(|| {
+            start.wait();
+            while !sender_started.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            receiver.try_recv()
+        });
+        assert!(matches!(drained, Err(std::sync::mpsc::TryRecvError::Empty)));
+
+        worker.join().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::WindowMoved { window_id: 9 })
+        ));
+        assert_eq!(
+            receiver.wake.signal_count.load(Ordering::Acquire),
+            1,
+            "post-drain geometry enqueue must restore the idle wake"
+        );
     }
 }
