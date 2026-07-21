@@ -12,6 +12,7 @@ use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::null_mut;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -36,6 +37,78 @@ use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 /// re-enabled after the last one completes (safe under `par_iter_mut`).
 static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct EnhancedUiLease {
+    pid: Pid,
+    app: CFRetained<AXUIWrapper>,
+}
+
+impl Drop for EnhancedUiLease {
+    fn drop(&mut self) {
+        let mut counts = ENHANCED_UI_REFCOUNT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(count) = counts.get_mut(&self.pid) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.pid);
+            let attr = CFString::from_static_str("AXEnhancedUserInterface");
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    self.app.as_ptr(),
+                    attr.as_ref(),
+                    kCFBooleanTrue.unwrap(),
+                );
+            }
+        }
+    }
+}
+
+thread_local! {
+    static REPOSITION_BATCHES: RefCell<Vec<HashMap<Pid, Option<EnhancedUiLease>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Bounds the Enhanced UI workaround to one ECS position-commit batch. Each
+/// application is inspected/toggled once and every lease is restored by Drop.
+struct WindowRepositionBatch;
+
+impl WindowRepositionBatch {
+    fn new() -> Self {
+        REPOSITION_BATCHES.with(|batches| batches.borrow_mut().push(HashMap::new()));
+        Self
+    }
+
+    fn handles(window: &WindowOS) -> bool {
+        let Ok(pid) = window.pid() else {
+            return false;
+        };
+        REPOSITION_BATCHES.with(|batches| {
+            let mut batches = batches.borrow_mut();
+            let Some(batch) = batches.last_mut() else {
+                return false;
+            };
+            batch
+                .entry(pid)
+                .or_insert_with(|| window.acquire_enhanced_ui());
+            true
+        })
+    }
+
+    #[cfg(test)]
+    fn active() -> bool {
+        REPOSITION_BATCHES.with(|batches| !batches.borrow().is_empty())
+    }
+}
+
+impl Drop for WindowRepositionBatch {
+    fn drop(&mut self) {
+        let leases = REPOSITION_BATCHES.with(|batches| batches.borrow_mut().pop());
+        drop(leases);
+    }
+}
 
 /// macOS may partially apply an AX width increase when the requested right edge
 /// would be far outside the display. Moving the partial result left by the
@@ -101,6 +174,12 @@ pub struct Window(Box<dyn WindowApi>);
 impl Window {
     pub fn new(window: Box<dyn WindowApi>) -> Self {
         Window(window)
+    }
+
+    /// Begins one bounded AX reposition batch; the opaque guard restores all
+    /// Enhanced UI leases when the caller's commit scope exits.
+    pub(crate) fn reposition_batch() -> impl Drop {
+        WindowRepositionBatch::new()
     }
 }
 
@@ -269,66 +348,29 @@ impl WindowOS {
             .clone()
     }
 
-    /// Disables `AXEnhancedUserInterface` on this window's app if it is currently enabled.
-    ///
-    /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
-    /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
-    ///
-    /// This avoids animated move/resize that breaks window management for apps like Chrome,
-    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
-    fn disable_enhanced_ui(&self) {
-        let Ok(pid) = self.pid() else { return };
+    /// Disables Enhanced UI once and returns an RAII lease that restores it.
+    fn acquire_enhanced_ui(&self) -> Option<EnhancedUiLease> {
+        let Ok(pid) = self.pid() else { return None };
+        let app = self.app_reference()?;
         let mut counts = ENHANCED_UI_REFCOUNT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(count) = counts.get_mut(&pid) {
             *count += 1;
-            return;
-        }
-        let Some(app_element) = self.app_reference() else {
-            return;
-        };
-        let attr = CFString::from_static_str("AXEnhancedUserInterface");
-        let enabled = app_element
-            .get_attribute::<CFBoolean>(&attr)
-            .is_ok_and(|v| CFBoolean::value(&v));
-        if enabled {
+        } else {
+            let attr = CFString::from_static_str("AXEnhancedUserInterface");
+            if !app
+                .get_attribute::<CFBoolean>(&attr)
+                .is_ok_and(|value| CFBoolean::value(&value))
+            {
+                return None;
+            }
             unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanFalse.unwrap(),
-                );
+                AXUIElementSetAttributeValue(app.as_ptr(), attr.as_ref(), kCFBooleanFalse.unwrap());
             }
             counts.insert(pid, 1);
         }
-    }
-
-    /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
-    /// caller has finished. Pairs with [`disable_enhanced_ui`].
-    fn reenable_enhanced_ui(&self) {
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(count) = counts.get_mut(&pid) else {
-            return;
-        };
-        *count -= 1;
-        if *count > 0 {
-            return;
-        }
-        counts.remove(&pid);
-        if let Some(app_element) = self.app_reference() {
-            let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanTrue.unwrap(),
-                );
-            }
-        }
+        Some(EnhancedUiLease { pid, app })
     }
 
     fn set_ax_position(&mut self, origin: Origin) {
@@ -491,9 +533,10 @@ impl WindowApi for WindowOS {
             trace!("already in position.");
             return;
         }
-        self.disable_enhanced_ui();
+        let _enhanced_ui = (!WindowRepositionBatch::handles(self))
+            .then(|| self.acquire_enhanced_ui())
+            .flatten();
         self.set_ax_position(origin);
-        self.reenable_enhanced_ui();
     }
 
     #[instrument(level = Level::TRACE)]
@@ -504,7 +547,7 @@ impl WindowApi for WindowOS {
         }
         let previous_frame = self.frame;
         let target_origin = previous_frame.min;
-        self.disable_enhanced_ui();
+        let _enhanced_ui = self.acquire_enhanced_ui();
         self.set_ax_size(size);
 
         let mut previous_observed_frame = previous_frame;
@@ -541,7 +584,6 @@ impl WindowApi for WindowOS {
             }
             self.set_ax_position(target_origin);
         }
-        self.reenable_enhanced_ui();
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -759,5 +801,22 @@ mod tests {
         let previous = IRect::new(0, 40, 800, 640);
         let completed = IRect::new(0, 40, 4112, 640);
         assert_eq!(resize_staging_origin(previous, completed, 4112), None);
+    }
+
+    #[test]
+    fn reposition_batch_cleans_up_on_normal_and_unwind_exit() {
+        assert!(!WindowRepositionBatch::active());
+        {
+            let _batch = WindowRepositionBatch::new();
+            assert!(WindowRepositionBatch::active());
+        }
+        assert!(!WindowRepositionBatch::active());
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _batch = WindowRepositionBatch::new();
+            panic!("cancel reposition batch");
+        });
+        assert!(unwind.is_err());
+        assert!(!WindowRepositionBatch::active());
     }
 }

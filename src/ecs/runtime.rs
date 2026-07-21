@@ -261,7 +261,7 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
         }) || work
             .scrolling
             .iter()
-            .any(super::scroll::scrolling_needs_frame)
+            .any(|scrolling| super::scroll::scrolling_needs_frame(scrolling, now))
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -302,10 +302,20 @@ pub(super) fn pump_events(
         .then(|| work.active_display.iter().next().map(Display::id))
         .flatten();
     let synthetic_pending = synthetic_events.take();
-    let (received_events, should_exit, did_wait) =
+    let geometry_wake_deferral = activity
+        .frame_work
+        .then(|| incoming_events.defer_geometry_wakes());
+    let (mut received_events, mut should_exit, did_wait) =
         pump_receiver(&incoming_events, activity, now, synthetic_pending, |wait| {
             platform.pump_cocoa_event_loop(wait, frame_display_id);
         });
+    if let Some(deferral) = geometry_wake_deferral {
+        let (handoff_events, exit_during_handoff) =
+            deferral.release_after(|| drain_event_channel(&incoming_events));
+        received_events.extend(handoff_events);
+        received_events = coalesce_window_geometry_events(received_events);
+        should_exit |= exit_during_handoff;
+    }
     if should_resync_real_time_after_wait(activity, did_wait)
         && let Some(real_time) = real_time.as_mut()
     {
@@ -334,15 +344,21 @@ fn pump_receiver(
 ) -> (Vec<Event>, bool, bool) {
     let generation_before_drain = receiver.generation();
     let (mut received_events, mut should_exit) = drain_event_channel(receiver);
-    let should_wait = !synthetic_pending
-        && received_events.is_empty()
-        && !should_exit
-        && receiver.generation() == generation_before_drain;
+    // Once motion is active, every ECS turn that can commit geometry must pass
+    // through the display-frame wait. Queued input and AX echoes are retained
+    // across that wait instead of bypassing the pacer and amplifying commits.
+    // Idle input still skips the wait so a new gesture starts promptly.
+    let should_wait = !should_exit
+        && (activity.frame_work
+            || (!synthetic_pending
+                && received_events.is_empty()
+                && receiver.generation() == generation_before_drain));
     if should_wait {
         pump(activity.wait(now));
         let (after_wait, exit_after_wait) = drain_event_channel(receiver);
-        received_events = after_wait;
-        should_exit = exit_after_wait;
+        received_events.extend(after_wait);
+        received_events = coalesce_window_geometry_events(received_events);
+        should_exit |= exit_after_wait;
     }
     (received_events, should_exit, should_wait)
 }
@@ -508,6 +524,58 @@ mod tests {
     }
 
     #[test]
+    fn queued_frame_work_still_waits_and_preserves_events_from_both_sides() {
+        let (sender, receiver) = EventSender::new();
+        sender.send(Event::ApplicationActivated).unwrap();
+        let now = Instant::now();
+        let activity = RuntimeActivity {
+            frame_work: true,
+            nearest_deadline: None,
+        };
+        let mut observed_wait = None;
+
+        let (events, should_exit, did_wait) =
+            pump_receiver(&receiver, activity, now, false, |wait| {
+                observed_wait = wait;
+                sender.send(Event::ApplicationDeactivated).unwrap();
+            });
+
+        assert_eq!(observed_wait, Some(ACTIVE_FRAME_INTERVAL));
+        assert!(did_wait);
+        assert!(!should_exit);
+        assert!(matches!(events.first(), Some(Event::ApplicationActivated)));
+        assert!(matches!(events.get(1), Some(Event::ApplicationDeactivated)));
+    }
+
+    #[test]
+    fn geometry_events_coalesce_across_the_active_frame_wait() {
+        let (sender, receiver) = EventSender::new();
+        sender.send(Event::WindowMoved { window_id: 7 }).unwrap();
+        let activity = RuntimeActivity {
+            frame_work: true,
+            nearest_deadline: None,
+        };
+
+        let (events, should_exit, did_wait) =
+            pump_receiver(&receiver, activity, Instant::now(), false, |_| {
+                sender.send(Event::WindowMoved { window_id: 7 }).unwrap();
+                sender.send(Event::WindowMoved { window_id: 8 }).unwrap();
+            });
+
+        assert!(did_wait);
+        assert!(!should_exit);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(Event::WindowMoved { window_id: 7 })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(Event::WindowMoved { window_id: 8 })
+        ));
+    }
+
+    #[test]
     fn duplicate_window_geometry_events_keep_each_final_fifo_position() {
         let events = drain([
             Event::WindowMoved { window_id: 7 },
@@ -536,10 +604,16 @@ mod tests {
             Event::WindowResized { window_id: 7 },
         ]);
         assert_eq!(events.len(), 5);
-        assert!(matches!(&events[0], Event::MouseMoved { point, .. } if point.x == 1.0));
-        assert!(matches!(&events[1], Event::MouseMoved { point, .. } if point.x == 2.0));
+        assert!(
+            matches!(&events[0], Event::MouseMoved { point, .. } if (point.x - 1.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            matches!(&events[1], Event::MouseMoved { point, .. } if (point.x - 2.0).abs() < f64::EPSILON)
+        );
         assert!(matches!(&events[2], Event::WindowMoved { window_id: 7 }));
-        assert!(matches!(&events[3], Event::MouseMoved { point, .. } if point.x == 4.0));
+        assert!(
+            matches!(&events[3], Event::MouseMoved { point, .. } if (point.x - 4.0).abs() < f64::EPSILON)
+        );
         assert!(matches!(&events[4], Event::WindowResized { window_id: 7 }));
     }
 
