@@ -9,13 +9,10 @@ use bevy::math::IRect;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
-    kCFBooleanFalse, kCFBooleanTrue,
+    CFArray, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use stdext::function_name;
@@ -23,92 +20,19 @@ use tracing::{Level, debug, instrument, trace, warn};
 
 use super::skylight::{
     _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
-    AXUIElementPerformAction, AXUIElementSetAttributeValue, SLPSPostEventRecordTo,
-    SLSWindowIteratorAdvance,
+    AXUIElementPerformAction, SLPSPostEventRecordTo, SLSWindowIteratorAdvance,
 };
 use crate::config::Config;
 use crate::errors::{Error, Result};
-use crate::manager::{Origin, Size, irect_from};
+use crate::manager::{Origin, Size, irect_from, origin_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, macos_major_version};
-use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
+use crate::util::{AXUIAttributes, AXUIWrapper, MacResult, set_ax_attribute};
 
-/// Per-PID ref-count for the `AXEnhancedUserInterface` workaround. Tracks how many
-/// concurrent window operations are in-flight for each app so the attribute is only
-/// re-enabled after the last one completes (safe under `par_iter_mut`).
-static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+mod enhanced_ui;
 
-struct EnhancedUiLease {
-    pid: Pid,
-    app: CFRetained<AXUIWrapper>,
-}
-
-impl Drop for EnhancedUiLease {
-    fn drop(&mut self) {
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(count) = counts.get_mut(&self.pid) else {
-            return;
-        };
-        *count -= 1;
-        if *count == 0 {
-            counts.remove(&self.pid);
-            let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.app.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanTrue.unwrap(),
-                );
-            }
-        }
-    }
-}
-
-thread_local! {
-    static REPOSITION_BATCHES: RefCell<Vec<HashMap<Pid, Option<EnhancedUiLease>>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// Bounds the Enhanced UI workaround to one ECS position-commit batch. Each
-/// application is inspected/toggled once and every lease is restored by Drop.
-struct WindowRepositionBatch;
-
-impl WindowRepositionBatch {
-    fn new() -> Self {
-        REPOSITION_BATCHES.with(|batches| batches.borrow_mut().push(HashMap::new()));
-        Self
-    }
-
-    fn handles(window: &WindowOS) -> bool {
-        let Ok(pid) = window.pid() else {
-            return false;
-        };
-        REPOSITION_BATCHES.with(|batches| {
-            let mut batches = batches.borrow_mut();
-            let Some(batch) = batches.last_mut() else {
-                return false;
-            };
-            batch
-                .entry(pid)
-                .or_insert_with(|| window.acquire_enhanced_ui());
-            true
-        })
-    }
-
-    #[cfg(test)]
-    fn active() -> bool {
-        REPOSITION_BATCHES.with(|batches| !batches.borrow().is_empty())
-    }
-}
-
-impl Drop for WindowRepositionBatch {
-    fn drop(&mut self) {
-        let leases = REPOSITION_BATCHES.with(|batches| batches.borrow_mut().pop());
-        drop(leases);
-    }
-}
+use enhanced_ui::WindowRepositionBatch;
+#[cfg(test)]
+use enhanced_ui::retain_batch_lease;
 
 /// macOS may partially apply an AX width increase when the requested right edge
 /// would be far outside the display. Moving the partial result left by the
@@ -127,6 +51,35 @@ fn resize_staging_origin(
             .min
             .with_x(actual_frame.min.x - (target_width - actual_width))
     })
+}
+
+/// Applies one AX position-write result to the local cache and bounds failure
+/// diagnostics to the first error in each consecutive failure streak.
+fn complete_ax_position_write(
+    window_id: WinID,
+    origin: Origin,
+    frame: &mut IRect,
+    failure_reported: &mut bool,
+    result: Result<()>,
+) {
+    match result {
+        Ok(()) => {
+            *failure_reported = false;
+            let size = frame.size();
+            frame.min = origin;
+            frame.max = origin + size;
+        }
+        Err(err) if !*failure_reported => {
+            *failure_reported = true;
+            warn!(
+                window_id,
+                ?origin,
+                error = %err,
+                "unable to set AX window position; suppressing repeats until a successful write"
+            );
+        }
+        Err(_) => {}
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +102,12 @@ pub trait WindowApi: Send + Sync {
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
+    /// Reads only the AX position attribute and refreshes the cached origin.
+    /// Used to correlate an outstanding Paneru-authored position write without
+    /// paying for a full position-plus-size frame read on every notification.
+    fn update_position(&mut self) -> Result<Origin> {
+        self.update_frame().map(|frame| frame.min)
+    }
     fn update_frame(&mut self) -> Result<IRect>;
     fn focus_without_raise(
         &self,
@@ -222,6 +181,9 @@ pub struct WindowOS {
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
+    /// Suppresses repeated warnings for one consecutive AX position-write
+    /// failure streak. A successful write rearms diagnostics.
+    ax_position_failure_reported: bool,
 }
 
 impl WindowOS {
@@ -267,6 +229,7 @@ impl WindowOS {
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
             app_reference: OnceLock::new(),
+            ax_position_failure_reported: false,
         };
 
         let forced = window.is_forced_manage(config, bundle_id);
@@ -348,31 +311,6 @@ impl WindowOS {
             .clone()
     }
 
-    /// Disables Enhanced UI once and returns an RAII lease that restores it.
-    fn acquire_enhanced_ui(&self) -> Option<EnhancedUiLease> {
-        let Ok(pid) = self.pid() else { return None };
-        let app = self.app_reference()?;
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&pid) {
-            *count += 1;
-        } else {
-            let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            if !app
-                .get_attribute::<CFBoolean>(&attr)
-                .is_ok_and(|value| CFBoolean::value(&value))
-            {
-                return None;
-            }
-            unsafe {
-                AXUIElementSetAttributeValue(app.as_ptr(), attr.as_ref(), kCFBooleanFalse.unwrap());
-            }
-            counts.insert(pid, 1);
-        }
-        Some(EnhancedUiLease { pid, app })
-    }
-
     fn set_ax_position(&mut self, origin: Origin) {
         let mut point = CGPoint::new(
             f64::from(origin.x + self.horizontal_padding),
@@ -384,18 +322,20 @@ impl WindowOS {
                 NonNull::from(&mut point).as_ptr().cast(),
             )
         };
-        if let Ok(position) = AXUIWrapper::retain(position_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                    position.as_ref(),
-                )
-            };
-            let size = self.frame.size();
-            self.frame.min = origin;
-            self.frame.max = origin + size;
-        }
+        let write_result = AXUIWrapper::retain(position_ref).and_then(|position| {
+            set_ax_attribute(
+                &self.ax_element,
+                CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                position.as_ref(),
+            )
+        });
+        complete_ax_position_write(
+            self.id,
+            origin,
+            &mut self.frame,
+            &mut self.ax_position_failure_reported,
+            write_result,
+        );
     }
 
     fn set_ax_size(&mut self, size: Size) {
@@ -411,14 +351,14 @@ impl WindowOS {
                 NonNull::from(&mut cgsize).as_ptr().cast(),
             )
         };
-        if let Ok(size_value) = AXUIWrapper::retain(size_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                    size_value.as_ref(),
-                )
-            };
+        if let Ok(size_value) = AXUIWrapper::retain(size_ref)
+            && set_ax_attribute(
+                &self.ax_element,
+                CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                size_value.as_ref(),
+            )
+            .is_ok()
+        {
             self.frame.max = self.frame.min + size;
         }
     }
@@ -646,6 +586,33 @@ impl WindowApi for WindowOS {
         Ok(self.frame)
     }
 
+    fn update_position(&mut self) -> Result<Origin> {
+        let position = unsafe {
+            let mut position_ref: *mut CFType = null_mut();
+            AXUIElementCopyAttributeValue(
+                self.ax_element.as_ptr(),
+                CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                &mut position_ref,
+            )
+            .to_result(function_name!())?;
+            AXUIWrapper::retain(position_ref)?
+        };
+        let mut point = CGPoint::default();
+        unsafe {
+            AXValueGetValue(
+                position.as_ptr(),
+                kAXValueTypeCGPoint,
+                NonNull::from(&mut point).as_ptr().cast(),
+            );
+        }
+        let position =
+            origin_from(point) - Origin::new(self.horizontal_padding, self.vertical_padding);
+        let size = self.frame.size();
+        self.frame.min = position;
+        self.frame.max = position + size;
+        Ok(position)
+    }
+
     /// Focuses the window without raising it. This involves sending specific events to the process.
     ///
     /// # Arguments
@@ -773,50 +740,4 @@ impl WindowApi for WindowOS {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stages_partially_applied_width_growth() {
-        let previous = IRect::new(-400, 40, 400, 640);
-        let actual = IRect::new(-400, 40, 2416, 640);
-
-        assert_eq!(
-            resize_staging_origin(previous, actual, 4112),
-            Some(Origin::new(-1696, 40))
-        );
-
-        let nearly_complete = IRect::new(-2056, 40, 2016, 640);
-        assert_eq!(
-            resize_staging_origin(actual, nearly_complete, 4112),
-            Some(Origin::new(-2096, 40))
-        );
-    }
-
-    #[test]
-    fn does_not_stage_fixed_size_or_completed_resizes() {
-        let fixed = IRect::new(0, 40, 230, 448);
-        assert_eq!(resize_staging_origin(fixed, fixed, 4112), None);
-
-        let previous = IRect::new(0, 40, 800, 640);
-        let completed = IRect::new(0, 40, 4112, 640);
-        assert_eq!(resize_staging_origin(previous, completed, 4112), None);
-    }
-
-    #[test]
-    fn reposition_batch_cleans_up_on_normal_and_unwind_exit() {
-        assert!(!WindowRepositionBatch::active());
-        {
-            let _batch = WindowRepositionBatch::new();
-            assert!(WindowRepositionBatch::active());
-        }
-        assert!(!WindowRepositionBatch::active());
-
-        let unwind = std::panic::catch_unwind(|| {
-            let _batch = WindowRepositionBatch::new();
-            panic!("cancel reposition batch");
-        });
-        assert!(unwind.is_err());
-        assert!(!WindowRepositionBatch::active());
-    }
-}
+mod tests;

@@ -7,7 +7,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::NSScreen;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFRunLoop, CFRunLoopMode,
-    CFRunLoopSource, CFString, CFType, Type, kCFTypeArrayCallBacks,
+    CFRunLoopSource, CFString, CFType, Type, kCFBooleanFalse, kCFBooleanTrue,
+    kCFTypeArrayCallBacks,
 };
 use objc2_core_graphics::{CGDirectDisplayID, CGError};
 use objc2_foundation::{NSNumber, NSString, NSUserDefaults, ns_string};
@@ -21,7 +22,7 @@ use tracing::debug;
 
 use crate::{
     errors::{Error, Result},
-    manager::{AXUIElementCopyAttributeValue, ax_window_id},
+    manager::{AXUIElementCopyAttributeValue, AXUIElementSetAttributeValue, ax_window_id},
     platform::{OSStatus, WinID},
 };
 
@@ -206,6 +207,35 @@ impl AXUIAttributes for CFRetained<AXUIWrapper> {
     }
 }
 
+/// Sets one AX attribute while retained Core Foundation owners keep every FFI
+/// argument alive for the duration of the call.
+pub fn set_ax_attribute(
+    element: &CFRetained<AXUIWrapper>,
+    name: &CFString,
+    value: &CFType,
+) -> Result<()> {
+    unsafe { AXUIElementSetAttributeValue(element.as_ptr(), name, value) }
+        .to_result("setting AX attribute")
+}
+
+/// Sets a boolean AX attribute while keeping the unsafe extern-static access
+/// and FFI call inside one audited boundary.
+pub fn set_ax_boolean_attribute(
+    element: &CFRetained<AXUIWrapper>,
+    name: &CFString,
+    enabled: bool,
+) -> Result<()> {
+    let result = unsafe {
+        let value = if enabled {
+            kCFBooleanTrue.unwrap()
+        } else {
+            kCFBooleanFalse.unwrap()
+        };
+        AXUIElementSetAttributeValue(element.as_ptr(), name, value)
+    };
+    result.to_result("setting boolean AX attribute")
+}
+
 /// Creates a new `CFArray` from a slice of values and a specified `CFNumberType`.
 ///
 /// # Type Parameters
@@ -349,10 +379,16 @@ where
     F: Fn(Retained<NSScreen>) -> R,
 {
     screens.iter().find_map(|screen| {
-        let dict = screen.deviceDescription();
-        let numbers = unsafe { dict.cast_unchecked::<NSString, NSNumber>() };
-        let id = numbers.objectForKey(ns_string!("NSScreenNumber"));
-        id.is_some_and(|id| id.as_u32() == display_id)
+        screen_display_id(&screen)
+            .is_some_and(|screen_display_id| screen_display_id == display_id)
             .then(|| getter(screen))
     })
+}
+
+pub fn screen_display_id(screen: &NSScreen) -> Option<CGDirectDisplayID> {
+    let dict = screen.deviceDescription();
+    let numbers = unsafe { dict.cast_unchecked::<NSString, NSNumber>() };
+    numbers
+        .objectForKey(ns_string!("NSScreenNumber"))
+        .map(|id| id.as_u32())
 }

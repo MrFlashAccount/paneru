@@ -13,9 +13,8 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, AxObservedPosition, BProcess, ExistingMarker, FreshMarker,
-    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
-    VerifyWindowPosition,
+    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
+    RetryFrontSwitch, SpawnWindowTrigger, Timeout,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -37,8 +36,11 @@ use crate::platform::{AxMainThread, WinID};
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 
 mod scroll_verification;
-pub(super) use scroll_verification::{
-    PendingScrollVerification, commit_window_position, finalize_scroll_verifications,
+#[cfg(test)]
+pub(crate) use scroll_verification::{AxPositionWrite, PendingScrollVerification};
+pub(crate) use scroll_verification::{
+    cancel_strip_geometry_ownership, cancel_window_geometry_ownership, commit_window_position,
+    finalize_scroll_verifications, verify_window_position, window_moved_update_frame,
 };
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -695,67 +697,6 @@ pub(super) fn window_resized_update_frame(
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn window_moved_update_frame(
-    _main_thread: NonSend<AxMainThread>,
-    mut messages: MessageReader<Event>,
-    mut windows: Query<
-        (
-            Entity,
-            &mut Window,
-            &mut Position,
-            &Bounds,
-            Option<&Unmanaged>,
-            Option<&VerifyWindowPosition>,
-            Option<&PendingScrollVerification>,
-        ),
-        Without<LayoutStrip>,
-    >,
-    mut commands: Commands,
-) {
-    for event in messages.read() {
-        let Event::WindowMoved { window_id } = event else {
-            continue;
-        };
-
-        let Some((
-            entity,
-            mut window,
-            mut position,
-            bounds,
-            unmanaged,
-            verification,
-            pending_scroll_verification,
-        )) = windows
-            .iter_mut()
-            .find(|window| window.1.id() == *window_id)
-        else {
-            continue;
-        };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
-        }
-        // AX emits a WindowMoved notification for our own reposition request. Do not feed an
-        // intermediate or OS-clamped frame back into the layout while the bounded verification
-        // loop is deciding whether the request succeeded.
-        if verification.is_some() || pending_scroll_verification.is_some() {
-            continue;
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
-
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.min != new_frame.min {
-            position.0 = new_frame.min;
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert(AxObservedPosition(new_frame.min));
-            }
-        }
-    }
-}
-
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<EventReceiver>>,
@@ -934,73 +875,6 @@ pub(super) fn update_overlays(
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn verify_window_position(
-    _main_thread: NonSend<AxMainThread>,
-    mut windows: Populated<(
-        Entity,
-        &mut Window,
-        &mut Position,
-        &mut VerifyWindowPosition,
-        Option<&WindowDisposition>,
-        Option<&Unmanaged>,
-    )>,
-    mut commands: Commands,
-) {
-    let now = std::time::Instant::now();
-    for (entity, mut window, mut position, mut verification, disposition, unmanaged) in &mut windows
-    {
-        if !disposition
-            .copied()
-            .unwrap_or(WindowDisposition::Managed)
-            .owns_geometry(unmanaged)
-        {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<VerifyWindowPosition>();
-            }
-            continue;
-        }
-        if !verification.due(now) {
-            continue;
-        }
-        let expected = position.0;
-        match window.update_frame() {
-            Ok(frame) if frame.min == expected => {
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<VerifyWindowPosition>();
-                }
-            }
-            Ok(frame) if verification.tick() => {
-                warn!(
-                    window_id = window.id(),
-                    ?expected,
-                    actual = ?frame.min,
-                    "window rejected the requested position; accepting the AX frame"
-                );
-                position.bypass_change_detection().0 = frame.min;
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<VerifyWindowPosition>();
-                }
-            }
-            Ok(_) => window.reposition(expected),
-            Err(err) => {
-                warn!(
-                    window_id = window.id(),
-                    "unable to verify window position: {err}"
-                );
-                if verification.tick() {
-                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                        entity_commands.try_remove::<VerifyWindowPosition>();
-                    }
-                } else {
-                    window.reposition(expected);
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
-#[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     _main_thread: NonSend<AxMainThread>,
     mut resized_windows: Populated<
@@ -1045,19 +919,21 @@ pub(super) fn commit_window_size(
 /// Restores user-visible window state before Paneru shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
 /// managed window on the display its frame center falls in.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(super) fn cleanup_on_exit(
     _main_thread: NonSend<AxMainThread>,
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(&mut Window, Option<&Unmanaged>)>,
+    mut all_windows: Query<(Entity, &mut Window, Option<&Unmanaged>)>,
+    strips: Query<(Entity, &LayoutStrip)>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut commands: Commands,
 ) {
     for _ in exit_events.read() {
         let ids = all_windows
             .iter()
-            .filter_map(|(window, unmanaged)| {
+            .filter_map(|(_, window, unmanaged)| {
                 (!matches!(unmanaged, Some(Unmanaged::Passthrough))).then_some(window.id())
             })
             .collect::<Vec<_>>();
@@ -1068,12 +944,26 @@ pub(super) fn cleanup_on_exit(
             overlay_mgr.remove_all();
         }
 
+        // AppExit cleanup performs direct AX writes. Cancel every deferred ECS
+        // owner first so PostUpdate cannot replay a verifier or animation over
+        // the centered frame in this or a later turn.
+        for (entity, _, _) in &mut all_windows {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                cancel_window_geometry_ownership(&mut entity_commands);
+            }
+        }
+        for (entity, _) in &strips {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                cancel_strip_geometry_ownership(&mut entity_commands);
+            }
+        }
+
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
         if display_bounds.is_empty() {
             return;
         }
 
-        for (mut window, unmanaged) in &mut all_windows {
+        for (_, mut window, unmanaged) in &mut all_windows {
             if !matches!(unmanaged, None | Some(Unmanaged::Floating)) {
                 continue;
             }
@@ -1394,8 +1284,8 @@ mod tests {
             ))
             .id();
 
-        // The initial AX write is rejected, but its notification must not feed the actual frame
-        // back into layout while the bounded verifier owns the request.
+        // The initial AX write is rejected. With no move notification, the bounded verifier
+        // remains responsible for retries and eventual acceptance of the actual frame.
         app.update();
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert!(
@@ -1403,11 +1293,6 @@ mod tests {
                 .entity(entity)
                 .contains::<VerifyWindowPosition>()
         );
-        app.world_mut()
-            .write_message::<Event>(Event::WindowMoved { window_id: 7 });
-        app.update();
-        assert_eq!(app.world().get::<Position>(entity).unwrap().0.x, -100);
-
         // Force each retry deadline without making the unit test sleep. Two retries follow the
         // original commit; the third failed verification accepts the OS frame without another
         // AX write.
