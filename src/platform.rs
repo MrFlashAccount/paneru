@@ -311,6 +311,9 @@ impl PlatformCallbacks {
             self.dispatch_pending_cocoa_events();
             let display_link_armed =
                 frame_display_id.is_some_and(|display_id| self.frame_pacer.arm(display_id));
+            if !display_link_armed {
+                self.frame_pacer.pause();
+            }
             // A display link normally wakes the run loop at the next vertical
             // refresh. The safety timeout prevents a sleeping/disconnected
             // display from stalling an in-flight animation indefinitely.
@@ -328,6 +331,7 @@ impl PlatformCallbacks {
                         true,
                     );
                 }
+                self.frame_pacer.consume_frame();
             } else if frame_work && let Some(timeout) = timeout {
                 // Timer fallback for macOS 11-13 or a display-link setup
                 // failure. Other run-loop sources may wake this loop, but they
@@ -343,9 +347,6 @@ impl PlatformCallbacks {
             } else {
                 let seconds = timeout.map_or(f64::MAX, |duration| duration.as_secs_f64());
                 CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);
-            }
-            if display_link_armed {
-                self.frame_pacer.pause();
             }
             self.dispatch_pending_cocoa_events();
 

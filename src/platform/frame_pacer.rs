@@ -14,7 +14,7 @@ use crate::util::{read_screen_property, screen_display_id};
 
 #[derive(Debug)]
 struct DisplayLinkTargetIvars {
-    fired: Cell<bool>,
+    generation: Cell<u64>,
 }
 
 define_class!(
@@ -30,7 +30,9 @@ define_class!(
     impl DisplayLinkTarget {
         #[unsafe(method(displayLinkDidFire:))]
         fn display_link_did_fire(&self, _: &CADisplayLink) {
-            self.ivars().fired.set(true);
+            self.ivars()
+                .generation
+                .set(self.ivars().generation.get().wrapping_add(1));
         }
     }
 );
@@ -38,7 +40,7 @@ define_class!(
 impl DisplayLinkTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(DisplayLinkTargetIvars {
-            fired: Cell::new(false),
+            generation: Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -49,7 +51,30 @@ pub(super) struct DisplayFramePacer {
     target: Retained<DisplayLinkTarget>,
     display_id: Option<CGDirectDisplayID>,
     link: Option<Retained<CADisplayLink>>,
+    tick_cursor: FrameTickCursor,
+    running: bool,
     refresh_rates: DisplayRefreshRateCache,
+}
+
+#[derive(Default)]
+struct FrameTickCursor {
+    consumed: u64,
+}
+
+impl FrameTickCursor {
+    fn pending(&self, produced: u64) -> bool {
+        produced != self.consumed
+    }
+
+    fn consume(&mut self, produced: u64) -> bool {
+        let pending = self.pending(produced);
+        self.consumed = produced;
+        pending
+    }
+
+    fn discard(&mut self, produced: u64) {
+        self.consumed = produced;
+    }
 }
 
 #[derive(Default)]
@@ -102,6 +127,8 @@ impl DisplayFramePacer {
             target: DisplayLinkTarget::new(mtm),
             display_id: None,
             link: None,
+            tick_cursor: FrameTickCursor::default(),
+            running: false,
             refresh_rates: DisplayRefreshRateCache::default(),
         }
     }
@@ -118,8 +145,12 @@ impl DisplayFramePacer {
         let Some(link) = self.link.as_ref() else {
             return false;
         };
-        self.target.ivars().fired.set(false);
-        link.setPaused(false);
+        if !self.running {
+            self.tick_cursor
+                .discard(self.target.ivars().generation.get());
+            link.setPaused(false);
+            self.running = true;
+        }
         true
     }
 
@@ -142,19 +173,31 @@ impl DisplayFramePacer {
     }
 
     pub(super) fn frame_fired(&self) -> bool {
-        self.target.ivars().fired.get()
+        self.tick_cursor
+            .pending(self.target.ivars().generation.get())
     }
 
-    pub(super) fn pause(&self) {
+    pub(super) fn consume_frame(&mut self) -> bool {
+        self.tick_cursor
+            .consume(self.target.ivars().generation.get())
+    }
+
+    pub(super) fn pause(&mut self) {
         if let Some(link) = self.link.as_ref() {
             link.setPaused(true);
         }
+        self.running = false;
+        self.tick_cursor
+            .discard(self.target.ivars().generation.get());
     }
 
     fn configure(&mut self, display_id: CGDirectDisplayID) {
         if let Some(link) = self.link.take() {
             link.invalidate();
         }
+        self.running = false;
+        self.tick_cursor
+            .discard(self.target.ivars().generation.get());
         self.display_id = Some(display_id);
 
         let screens = NSScreen::screens(self.mtm);
@@ -195,7 +238,7 @@ impl Drop for DisplayFramePacer {
 
 #[cfg(test)]
 mod tests {
-    use super::DisplayRefreshRateCache;
+    use super::{DisplayRefreshRateCache, FrameTickCursor};
     use std::cell::Cell;
 
     #[test]
@@ -239,5 +282,17 @@ mod tests {
             Some(41)
         );
         assert_eq!(cache.fastest(|_| {}, |_| {}), None);
+    }
+
+    #[test]
+    fn tick_that_arrived_during_frame_work_is_consumed_without_another_wait() {
+        let mut cursor = FrameTickCursor::default();
+
+        cursor.discard(7);
+        assert!(!cursor.pending(7));
+
+        assert!(cursor.pending(8));
+        assert!(cursor.consume(8));
+        assert!(!cursor.pending(8));
     }
 }
