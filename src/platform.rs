@@ -286,23 +286,6 @@ impl PlatformCallbacks {
         timeout: Option<Duration>,
         frame_display_id: Option<objc2_core_graphics::CGDirectDisplayID>,
     ) {
-        self.pump_cocoa_event_loop_with_mode(timeout, frame_display_id.is_some(), frame_display_id);
-    }
-
-    pub(crate) fn pump_cocoa_event_loop_frame(
-        &mut self,
-        timeout: Option<Duration>,
-        frame_display_id: Option<objc2_core_graphics::CGDirectDisplayID>,
-    ) {
-        self.pump_cocoa_event_loop_with_mode(timeout, true, frame_display_id);
-    }
-
-    fn pump_cocoa_event_loop_with_mode(
-        &mut self,
-        timeout: Option<Duration>,
-        frame_work: bool,
-        frame_display_id: Option<objc2_core_graphics::CGDirectDisplayID>,
-    ) {
         autoreleasepool(|_| {
             // Drain already queued AppKit events before sleeping. Channel
             // events are drained by ECS first; their custom run-loop source is
@@ -311,9 +294,6 @@ impl PlatformCallbacks {
             self.dispatch_pending_cocoa_events();
             let display_link_armed =
                 frame_display_id.is_some_and(|display_id| self.frame_pacer.arm(display_id));
-            if !display_link_armed {
-                self.frame_pacer.pause();
-            }
             // A display link normally wakes the run loop at the next vertical
             // refresh. The safety timeout prevents a sleeping/disconnected
             // display from stalling an in-flight animation indefinitely.
@@ -331,39 +311,18 @@ impl PlatformCallbacks {
                         true,
                     );
                 }
-                self.frame_pacer.consume_frame();
-            } else if frame_work && let Some(timeout) = timeout {
-                // Timer fallback for macOS 11-13 or a display-link setup
-                // failure. Other run-loop sources may wake this loop, but they
-                // must not turn an active motion session into unpaced ECS work.
-                let deadline = Instant::now() + timeout;
-                run_until_deadline(deadline, Instant::now, |remaining| {
-                    CFRunLoop::run_in_mode(
-                        unsafe { kCFRunLoopDefaultMode },
-                        remaining.as_secs_f64(),
-                        true,
-                    );
-                });
             } else {
                 let seconds = timeout.map_or(f64::MAX, |duration| duration.as_secs_f64());
                 CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);
+            }
+            if display_link_armed {
+                self.frame_pacer.pause();
             }
             self.dispatch_pending_cocoa_events();
 
             // Housekeeping for UI/Notifications
             self.cocoa_app.updateWindows();
         });
-    }
-
-    pub(crate) fn fastest_frame_display(
-        &mut self,
-        visit_candidates: impl FnOnce(&mut dyn FnMut(objc2_core_graphics::CGDirectDisplayID)),
-    ) -> Option<objc2_core_graphics::CGDirectDisplayID> {
-        self.frame_pacer.fastest_display_id(visit_candidates)
-    }
-
-    pub(crate) fn invalidate_frame_display_cache(&mut self) {
-        self.frame_pacer.invalidate_refresh_rates();
     }
 
     fn dispatch_pending_cocoa_events(&self) {
@@ -382,20 +341,6 @@ impl PlatformCallbacks {
                 self.cocoa_app.sendEvent(&event);
             }
         });
-    }
-}
-
-fn run_until_deadline(
-    deadline: Instant,
-    mut now: impl FnMut() -> Instant,
-    mut run_once: impl FnMut(Duration),
-) {
-    loop {
-        let remaining = deadline.saturating_duration_since(now());
-        if remaining.is_zero() {
-            break;
-        }
-        run_once(remaining);
     }
 }
 
@@ -446,37 +391,7 @@ pub fn macos_major_version() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Modifiers, run_until_deadline};
-    use std::collections::VecDeque;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn timer_frame_fallback_ignores_early_run_loop_wakes() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(10);
-        let mut times = VecDeque::from([
-            start,
-            start + Duration::from_millis(2),
-            start + Duration::from_millis(7),
-            deadline,
-        ]);
-        let mut waits = Vec::new();
-
-        run_until_deadline(
-            deadline,
-            || times.pop_front().expect("test clock must reach deadline"),
-            |remaining| waits.push(remaining),
-        );
-
-        assert_eq!(
-            waits,
-            [
-                Duration::from_millis(10),
-                Duration::from_millis(8),
-                Duration::from_millis(3),
-            ]
-        );
-    }
+    use super::Modifiers;
 
     #[test]
     fn macos_major_version_returns_valid() {

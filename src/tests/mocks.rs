@@ -85,7 +85,6 @@ struct MockStateInner {
     active_display_id: u32,
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
-    reposition_writes: HashMap<WinID, usize>,
 }
 
 #[derive(Clone)]
@@ -104,7 +103,6 @@ impl MockState {
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
-                reposition_writes: HashMap::new(),
             })),
         }
     }
@@ -227,19 +225,6 @@ impl MockState {
     pub fn drain_events(&self) -> Vec<Event> {
         let mut inner = self.inner.force_write();
         inner.event_queue.drain(..).collect()
-    }
-
-    pub(crate) fn reposition_writes(&self, id: WinID) -> usize {
-        self.inner
-            .force_read()
-            .reposition_writes
-            .get(&id)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn reset_reposition_writes(&self, id: WinID) {
-        self.inner.force_write().reposition_writes.insert(id, 0);
     }
 
     // --- State Mutation Methods ---
@@ -393,7 +378,6 @@ impl MockState {
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
-            *inner.reposition_writes.entry(id).or_default() += 1;
             if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
                 w.frame.min = origin;
@@ -423,16 +407,6 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.minimized)
-        });
-
-        let s = self.clone();
-        mw.expect_update_position().returning(move || {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.frame.min)
-                .ok_or(Error::InvalidWindow)
         });
 
         let s = self.clone();
@@ -684,7 +658,6 @@ impl MockState {
 
         wm.expect_get_associated_windows().return_const(vec![]);
         wm.expect_find_window_at_point().return_const(Ok(0));
-        wm.expect_dim_windows().return_const(());
 
         wm
     }

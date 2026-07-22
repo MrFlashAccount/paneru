@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -10,11 +9,11 @@ use objc2_quartz_core::CADisplayLink;
 use tracing::{debug, warn};
 
 use crate::platform::macos_major_version;
-use crate::util::{read_screen_property, screen_display_id};
+use crate::util::read_screen_property;
 
 #[derive(Debug)]
 struct DisplayLinkTargetIvars {
-    generation: Cell<u64>,
+    fired: Cell<bool>,
 }
 
 define_class!(
@@ -30,9 +29,7 @@ define_class!(
     impl DisplayLinkTarget {
         #[unsafe(method(displayLinkDidFire:))]
         fn display_link_did_fire(&self, _: &CADisplayLink) {
-            self.ivars()
-                .generation
-                .set(self.ivars().generation.get().wrapping_add(1));
+            self.ivars().fired.set(true);
         }
     }
 );
@@ -40,7 +37,7 @@ define_class!(
 impl DisplayLinkTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(DisplayLinkTargetIvars {
-            generation: Cell::new(0),
+            fired: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -51,73 +48,6 @@ pub(super) struct DisplayFramePacer {
     target: Retained<DisplayLinkTarget>,
     display_id: Option<CGDirectDisplayID>,
     link: Option<Retained<CADisplayLink>>,
-    tick_cursor: FrameTickCursor,
-    running: bool,
-    refresh_rates: DisplayRefreshRateCache,
-}
-
-#[derive(Default)]
-struct FrameTickCursor {
-    consumed: u64,
-}
-
-impl FrameTickCursor {
-    fn pending(&self, produced: u64) -> bool {
-        produced != self.consumed
-    }
-
-    fn consume(&mut self, produced: u64) -> bool {
-        let pending = self.pending(produced);
-        self.consumed = produced;
-        pending
-    }
-
-    fn discard(&mut self, produced: u64) {
-        self.consumed = produced;
-    }
-}
-
-#[derive(Default)]
-struct DisplayRefreshRateCache {
-    rates: HashMap<CGDirectDisplayID, isize>,
-    valid: bool,
-}
-
-impl DisplayRefreshRateCache {
-    fn ensure_with(&mut self, enumerate: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID, isize))) {
-        if self.valid {
-            return;
-        }
-        self.rates.clear();
-        enumerate(&mut |display_id, refresh_rate| {
-            self.rates.insert(display_id, refresh_rate);
-        });
-        self.valid = true;
-    }
-
-    fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
-    fn fastest(
-        &self,
-        visit_candidates: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID)),
-        mut on_lookup: impl FnMut(CGDirectDisplayID),
-    ) -> Option<CGDirectDisplayID> {
-        let mut best = None::<(CGDirectDisplayID, isize)>;
-        visit_candidates(&mut |display_id| {
-            on_lookup(display_id);
-            let Some(refresh_rate) = self.rates.get(&display_id).copied() else {
-                return;
-            };
-            if best.is_none_or(|(best_id, best_rate)| {
-                refresh_rate > best_rate || (refresh_rate == best_rate && display_id < best_id)
-            }) {
-                best = Some((display_id, refresh_rate));
-            }
-        });
-        best.map(|(display_id, _)| display_id)
-    }
 }
 
 impl DisplayFramePacer {
@@ -127,9 +57,6 @@ impl DisplayFramePacer {
             target: DisplayLinkTarget::new(mtm),
             display_id: None,
             link: None,
-            tick_cursor: FrameTickCursor::default(),
-            running: false,
-            refresh_rates: DisplayRefreshRateCache::default(),
         }
     }
 
@@ -145,59 +72,25 @@ impl DisplayFramePacer {
         let Some(link) = self.link.as_ref() else {
             return false;
         };
-        if !self.running {
-            self.tick_cursor
-                .discard(self.target.ivars().generation.get());
-            link.setPaused(false);
-            self.running = true;
-        }
+        self.target.ivars().fired.set(false);
+        link.setPaused(false);
         true
     }
 
-    pub(super) fn fastest_display_id(
-        &mut self,
-        visit_candidates: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID)),
-    ) -> Option<CGDirectDisplayID> {
-        self.refresh_rates.ensure_with(|add| {
-            for screen in NSScreen::screens(self.mtm) {
-                if let Some(display_id) = screen_display_id(&screen) {
-                    add(display_id, screen.maximumFramesPerSecond());
-                }
-            }
-        });
-        self.refresh_rates.fastest(visit_candidates, |_| {})
-    }
-
-    pub(super) fn invalidate_refresh_rates(&mut self) {
-        self.refresh_rates.invalidate();
-    }
-
     pub(super) fn frame_fired(&self) -> bool {
-        self.tick_cursor
-            .pending(self.target.ivars().generation.get())
+        self.target.ivars().fired.get()
     }
 
-    pub(super) fn consume_frame(&mut self) -> bool {
-        self.tick_cursor
-            .consume(self.target.ivars().generation.get())
-    }
-
-    pub(super) fn pause(&mut self) {
+    pub(super) fn pause(&self) {
         if let Some(link) = self.link.as_ref() {
             link.setPaused(true);
         }
-        self.running = false;
-        self.tick_cursor
-            .discard(self.target.ivars().generation.get());
     }
 
     fn configure(&mut self, display_id: CGDirectDisplayID) {
         if let Some(link) = self.link.take() {
             link.invalidate();
         }
-        self.running = false;
-        self.tick_cursor
-            .discard(self.target.ivars().generation.get());
         self.display_id = Some(display_id);
 
         let screens = NSScreen::screens(self.mtm);
@@ -233,66 +126,5 @@ impl Drop for DisplayFramePacer {
         if let Some(link) = self.link.take() {
             link.invalidate();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DisplayRefreshRateCache, FrameTickCursor};
-    use std::cell::Cell;
-
-    #[test]
-    fn cache_enumerates_once_deduplicates_candidates_and_refreshes_after_invalidation() {
-        let enumerations = Cell::new(0);
-        let lookups = Cell::new(0);
-        let mut cache = DisplayRefreshRateCache::default();
-        let ensure = |cache: &mut DisplayRefreshRateCache, rates: &[(u32, isize)]| {
-            cache.ensure_with(|add| {
-                enumerations.set(enumerations.get() + 1);
-                for (display_id, refresh_rate) in rates {
-                    add(*display_id, *refresh_rate);
-                }
-            });
-        };
-
-        ensure(&mut cache, &[(41, 60), (17, 120)]);
-        let selected = cache.fastest(
-            |consider| {
-                consider(41);
-                consider(17);
-            },
-            |_| lookups.set(lookups.get() + 1),
-        );
-        assert_eq!(selected, Some(17));
-        ensure(&mut cache, &[(41, 75), (17, 60)]);
-        assert_eq!(enumerations.get(), 1);
-        assert_eq!(lookups.get(), 2);
-
-        cache.invalidate();
-        ensure(&mut cache, &[(41, 75), (17, 60)]);
-        assert_eq!(enumerations.get(), 2);
-        assert_eq!(
-            cache.fastest(
-                |consider| {
-                    consider(41);
-                    consider(17);
-                },
-                |_| {},
-            ),
-            Some(41)
-        );
-        assert_eq!(cache.fastest(|_| {}, |_| {}), None);
-    }
-
-    #[test]
-    fn tick_that_arrived_during_frame_work_is_consumed_without_another_wait() {
-        let mut cursor = FrameTickCursor::default();
-
-        cursor.discard(7);
-        assert!(!cursor.pending(7));
-
-        assert!(cursor.pending(8));
-        assert!(cursor.consume(8));
-        assert!(!cursor.pending(8));
     }
 }

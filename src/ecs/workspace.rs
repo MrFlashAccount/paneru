@@ -25,8 +25,7 @@ use crate::ecs::runtime::OrphanReconcileDeadline;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, NativeFullscreenMarker, Position,
     RefreshWindowSizes, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt,
-    Timeout, Unmanaged, WindowDisposition, cancel_strip_geometry_ownership,
-    cancel_window_geometry_ownership,
+    Timeout, Unmanaged, WindowDisposition,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -177,12 +176,6 @@ fn workspace_change_handler(
             workspace_id: old_strip.id(),
             index: original_index,
         };
-        if let Ok(mut window_commands) = commands.get_entity(fullscreen_window) {
-            cancel_window_geometry_ownership(&mut window_commands);
-        }
-        if let Ok(mut strip_commands) = commands.get_entity(old_strip_entity) {
-            cancel_strip_geometry_ownership(&mut strip_commands);
-        }
         old_strip.remove(fullscreen_window);
 
         let fullscreen_strip = LayoutStrip::fullscreen(workspace_id, fullscreen_window);
@@ -348,9 +341,6 @@ fn workspace_destroyed_handler(
                 index
             );
             if let Some(mut strip) = strip {
-                if let Ok(mut window_commands) = commands.get_entity(window) {
-                    cancel_window_geometry_ownership(&mut window_commands);
-                }
                 strip.insert_at(index, window);
                 commands.reshuffle_around(window);
             }

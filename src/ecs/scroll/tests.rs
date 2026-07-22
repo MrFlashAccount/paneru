@@ -359,7 +359,7 @@ fn physical_up_and_momentum_start_in_same_update_leave_momentum_active() {
 
 fn assert_original_oversized_paging_session(world: &mut bevy::prelude::World) {
     let (paging, position, target_position, _, _) = paging_snapshot(world);
-    assert!((paging.start_stop + 1024.0).abs() < f64::EPSILON);
+    assert_eq!(paging.start_stop, -1024.0);
     assert_eq!(paging.previous_stop, Some(0.0));
     assert_eq!(
         paging.next_stop,

@@ -18,10 +18,11 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, NativeFullscreenMarker, Position, PreManagedFrame, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged, WindowDisposition,
-    cancel_window_geometry_ownership,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker,
+    FocusedMarker, FullWidthMarker, NativeFullscreenMarker, Position, PreManagedFrame,
+    RepositionMarker, ReshuffleAroundMarker, ResizeMarker, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged, VerifyWindowPosition,
+    WindowDisposition,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -964,9 +965,13 @@ fn manage_window(
                 bounds.bypass_change_detection().0 = frame.size();
             }
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                cancel_window_geometry_ownership(&mut entity_commands);
                 entity_commands
                     .try_insert(Unmanaged::Passthrough)
+                    .try_remove::<EnsureVisibleMarker>()
+                    .try_remove::<ReshuffleAroundMarker>()
+                    .try_remove::<RepositionMarker>()
+                    .try_remove::<ResizeMarker>()
+                    .try_remove::<VerifyWindowPosition>()
                     .try_remove::<FullWidthMarker>();
             }
             debug!("window {} ({entity}) is now passthrough", window.id());

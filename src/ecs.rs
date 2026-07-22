@@ -52,10 +52,6 @@ mod triggers;
 mod width_ratio;
 pub mod workspace;
 
-#[cfg(test)]
-pub(crate) use systems::{AxPositionWrite, PendingScrollVerification};
-pub(crate) use systems::{cancel_strip_geometry_ownership, cancel_window_geometry_ownership};
-
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -136,10 +132,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
             systems::retry_front_switch,
-            systems::window_resized_update_frame.run_if(not_swiping),
-            // Move acknowledgements establish whether AX state is Paneru-authored or external.
-            // They must keep consuming notifications while swipe layout work is active.
-            systems::window_moved_update_frame,
+            (
+                systems::window_resized_update_frame,
+                systems::window_moved_update_frame,
+            )
+                .chain()
+                .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
         ),
@@ -150,7 +148,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             (
                 systems::animate_entities,
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
-                systems::finalize_scroll_verifications.run_if(not(resource_exists::<Initializing>)),
                 systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
