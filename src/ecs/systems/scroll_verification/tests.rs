@@ -119,6 +119,27 @@ fn duplicate_self_echo_reads_position_once_and_never_writes_back() {
 }
 
 #[test]
+fn acknowledged_latest_survives_authored_history_overflow_as_applied_anchor() {
+    let oldest = Origin::new(-100, 0);
+    let acknowledged = Origin::new(-200, 0);
+    let mut authored = AxPositionWrite::new(oldest);
+
+    authored.record(acknowledged);
+    assert!(authored.acknowledge_latest());
+
+    for x in 1..=AUTHORED_POSITION_HISTORY_CAPACITY + 1 {
+        authored.record(Origin::new(-300 - i32::try_from(x).unwrap() * 10, 0));
+    }
+
+    assert!(
+        !authored.positions[..usize::from(authored.len)].contains(&acknowledged),
+        "the ring must actually overflow the acknowledged coordinate"
+    );
+    assert_eq!(authored.applied_anchor, Some(acknowledged));
+    assert!(authored.contains(acknowledged));
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn overflowed_authored_history_retains_rejected_physical_anchor_until_verification() {
     let position_reads = Arc::new(AtomicUsize::new(0));

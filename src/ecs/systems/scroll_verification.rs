@@ -87,6 +87,7 @@ impl AxPositionWrite {
     }
 
     fn acknowledge_latest(&mut self) -> bool {
+        self.remember_applied(self.latest);
         !std::mem::replace(&mut self.latest_acknowledged, true)
     }
 }
