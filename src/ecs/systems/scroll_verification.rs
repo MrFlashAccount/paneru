@@ -130,6 +130,18 @@ fn reposition_and_ack(
     }
 }
 
+fn strip_motion_active(
+    entity: Entity,
+    strips: &Query<(Entity, &LayoutStrip, Option<&Scrolling>)>,
+    now: std::time::Instant,
+) -> bool {
+    strips.iter().any(|(_, strip, scrolling)| {
+        strip.contains(entity)
+            && scrolling
+                .is_some_and(|scrolling| crate::ecs::scroll::scrolling_needs_frame(scrolling, now))
+    })
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_moved_update_frame(
@@ -148,9 +160,10 @@ pub(crate) fn window_moved_update_frame(
         ),
         Without<LayoutStrip>,
     >,
-    strips: Query<(Entity, &LayoutStrip)>,
+    strips: Query<(Entity, &LayoutStrip, Option<&Scrolling>)>,
     mut commands: Commands,
 ) {
+    let now = std::time::Instant::now();
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
@@ -175,6 +188,7 @@ pub(crate) fn window_moved_update_frame(
             continue;
         }
 
+        let scroll_motion_active = strip_motion_active(entity, &strips, now);
         let authored_move_pending = authored_position.is_some();
         let observed_position = if let Some(mut authored_position) = authored_position {
             let observed_position = match window.update_position() {
@@ -208,6 +222,15 @@ pub(crate) fn window_moved_update_frame(
                 );
                 continue;
             }
+            if scroll_motion_active {
+                trace!(
+                    window_id,
+                    ?observed_position,
+                    latest = ?authored_position.latest,
+                    "deferring unmatched AX position until active scroll motion settles"
+                );
+                continue;
+            }
             observed_position
         } else {
             let Ok(new_frame) = window.update_frame() else {
@@ -231,7 +254,7 @@ pub(crate) fn window_moved_update_frame(
         }
         if authored_move_pending || pending_scroll_verification.is_some() || verification.is_some()
         {
-            for (strip_entity, strip) in &strips {
+            for (strip_entity, strip, _) in &strips {
                 if strip.contains(entity)
                     && let Ok(mut strip_commands) = commands.get_entity(strip_entity)
                 {

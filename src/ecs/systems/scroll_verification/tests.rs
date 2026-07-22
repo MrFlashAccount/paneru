@@ -140,6 +140,66 @@ fn acknowledged_latest_survives_authored_history_overflow_as_applied_anchor() {
 }
 
 #[test]
+fn ax_lag_during_active_scroll_does_not_cancel_the_gesture() {
+    let reposition_writes = Arc::new(AtomicUsize::new(0));
+    let target = Origin::new(-800, 0);
+    let lagged = Origin::new(-430, 0);
+    let mut mock = MockWindowApi::new();
+    mock.expect_id().return_const(14);
+    mock.expect_update_position().returning(move || Ok(lagged));
+    mock.expect_reposition().returning({
+        let reposition_writes = Arc::clone(&reposition_writes);
+        move |_| {
+            reposition_writes.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let mut app = verification_app();
+    let window = app
+        .world_mut()
+        .spawn((
+            Window::new(Box::new(mock)),
+            Position(target),
+            Bounds(Size::new(400, 700)),
+            WindowDisposition::Managed,
+            PendingScrollVerification,
+            AxPositionWrite::new(target),
+        ))
+        .id();
+    let mut layout = LayoutStrip::default();
+    layout.append(window);
+    let strip = app
+        .world_mut()
+        .spawn((
+            layout,
+            Scrolling {
+                gesture_active: true,
+                is_user_swiping: true,
+                target_position: Some(f64::from(target.x)),
+                ..Default::default()
+            },
+        ))
+        .id();
+    app.update();
+    reposition_writes.store(0, Ordering::Relaxed);
+    app.world_mut().clear_trackers();
+
+    app.world_mut()
+        .write_message::<PaneruEvent>(PaneruEvent::WindowMoved { window_id: 14 });
+    app.update();
+
+    assert_eq!(app.world().get::<Position>(window).unwrap().0, target);
+    assert!(app.world().entity(window).contains::<AxPositionWrite>());
+    assert!(
+        app.world()
+            .entity(window)
+            .contains::<PendingScrollVerification>()
+    );
+    assert!(app.world().entity(strip).contains::<Scrolling>());
+    assert_eq!(reposition_writes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn overflowed_authored_history_retains_rejected_physical_anchor_until_verification() {
     let position_reads = Arc::new(AtomicUsize::new(0));
