@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use bevy::app::AppExit;
 use bevy::ecs::component::Component;
+use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageWriter;
 use bevy::ecs::query::{With, Without};
@@ -17,10 +16,17 @@ use super::{
     Initializing, RefreshWindowSizes, RepositionMarker, ResizeMarker, RetryFrontSwitch, Scrolling,
     Timeout, Unmanaged, VerifyWindowPosition, WindowDisposition,
 };
+use crate::ecs::layout::LayoutStrip;
 use crate::ecs::observation::ObserverDetachRetry;
-use crate::events::{Event, EventReceiver};
+use crate::events::{Event, EventReceiver, TurnBatch};
 use crate::manager::{Display, Window};
 use crate::platform::PlatformCallbacks;
+
+mod frame_display;
+#[cfg(test)]
+mod hot_path_tests;
+
+use frame_display::visit_relevant_frame_displays;
 
 pub(crate) const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const FRESH_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -141,25 +147,12 @@ impl RuntimeActivity {
 
 #[derive(SystemParam)]
 pub(super) struct RuntimeWork<'w, 's> {
-    repositioning: Query<
-        'w,
-        's,
-        (
-            Option<&'static WindowDisposition>,
-            Option<&'static Unmanaged>,
-        ),
-        With<RepositionMarker>,
-    >,
-    resizing: Query<
-        'w,
-        's,
-        (
-            Option<&'static WindowDisposition>,
-            Option<&'static Unmanaged>,
-        ),
-        With<ResizeMarker>,
-    >,
-    scrolling: Query<'w, 's, &'static Scrolling>,
+    repositioning: Query<'w, 's, GeometryWorkItem, With<RepositionMarker>>,
+    resizing: Query<'w, 's, GeometryWorkItem, With<ResizeMarker>>,
+    scrolling: Query<'w, 's, (Entity, &'static Scrolling)>,
+    parents: Query<'w, 's, &'static ChildOf>,
+    layout_strips: Query<'w, 's, (&'static LayoutStrip, &'static ChildOf)>,
+    displays: Query<'w, 's, (Entity, &'static Display)>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     timeouts: Query<'w, 's, &'static Timeout>,
     fresh_polls: Query<'w, 's, &'static FreshPollDeadline, With<FreshMarker>>,
@@ -184,6 +177,12 @@ pub(super) struct RuntimeWork<'w, 's> {
     restore: Option<Res<'w, crate::ecs::restore::SessionRestore>>,
     persistence: Option<Res<'w, crate::ecs::persistence::PersistenceState>>,
 }
+
+type GeometryWorkItem = (
+    Entity,
+    Option<&'static WindowDisposition>,
+    Option<&'static Unmanaged>,
+);
 
 fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity {
     let timeout_deadline = work.timeouts.iter().map(Timeout::next_deadline).min();
@@ -241,27 +240,32 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
     let scrolling_deadline = work
         .scrolling
         .iter()
-        .filter_map(super::scroll::scrolling_deadline)
+        .filter_map(|(_, scrolling)| super::scroll::scrolling_deadline(scrolling))
         .min();
     let immediate_deferred = work
         .initializing
         .is_some()
         .then_some(now + ACTIVE_FRAME_INTERVAL);
     RuntimeActivity {
-        frame_work: work.repositioning.iter().any(|(disposition, unmanaged)| {
-            disposition
-                .copied()
-                .unwrap_or(WindowDisposition::Managed)
-                .owns_geometry(unmanaged)
-        }) || work.resizing.iter().any(|(disposition, unmanaged)| {
-            disposition
-                .copied()
-                .unwrap_or(WindowDisposition::Managed)
-                .owns_geometry(unmanaged)
-        }) || work
-            .scrolling
+        frame_work: work
+            .repositioning
             .iter()
-            .any(|scrolling| super::scroll::scrolling_needs_frame(scrolling, now))
+            .any(|(_, disposition, unmanaged)| {
+                disposition
+                    .copied()
+                    .unwrap_or(WindowDisposition::Managed)
+                    .owns_geometry(unmanaged)
+            })
+            || work.resizing.iter().any(|(_, disposition, unmanaged)| {
+                disposition
+                    .copied()
+                    .unwrap_or(WindowDisposition::Managed)
+                    .owns_geometry(unmanaged)
+            })
+            || work
+                .scrolling
+                .iter()
+                .any(|(_, scrolling)| super::scroll::scrolling_needs_frame(scrolling, now))
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -299,22 +303,28 @@ pub(super) fn pump_events(
     let activity = runtime_activity(&work, now);
     let frame_display_id = activity
         .frame_work
-        .then(|| work.active_display.iter().next().map(Display::id))
+        .then(|| {
+            platform
+                .fastest_frame_display(|consider| {
+                    visit_relevant_frame_displays(&work, now, consider);
+                })
+                .or_else(|| work.active_display.iter().next().map(Display::id))
+        })
         .flatten();
     let synthetic_pending = synthetic_events.take();
     let geometry_wake_deferral = activity
         .frame_work
         .then(|| incoming_events.defer_geometry_wakes());
-    let (mut received_events, mut should_exit, did_wait) =
-        pump_receiver(&incoming_events, activity, now, synthetic_pending, |wait| {
-            platform.pump_cocoa_event_loop(wait, frame_display_id);
+    let (mut accumulated_events, did_wait) =
+        pump_receiver_into(&incoming_events, activity, now, synthetic_pending, |wait| {
+            platform.pump_cocoa_event_loop_frame(wait, frame_display_id);
         });
     if let Some(deferral) = geometry_wake_deferral {
-        let (handoff_events, exit_during_handoff) =
-            deferral.release_after(|| drain_event_channel(&incoming_events));
-        received_events.extend(handoff_events);
-        received_events = coalesce_window_geometry_events(received_events);
-        should_exit |= exit_during_handoff;
+        deferral.release_after(|| accumulated_events.drain(&incoming_events));
+    }
+    let (received_events, should_exit) = accumulated_events.finish();
+    if received_events.iter().any(invalidates_frame_display_cache) {
+        platform.invalidate_frame_display_cache();
     }
     if should_resync_real_time_after_wait(activity, did_wait)
         && let Some(real_time) = real_time.as_mut()
@@ -327,6 +337,18 @@ pub(super) fn pump_events(
     messages.write_batch(received_events);
 }
 
+fn invalidates_frame_display_cache(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::SystemWoke { .. }
+            | Event::DisplayAdded { .. }
+            | Event::DisplayRemoved { .. }
+            | Event::DisplayMoved { .. }
+            | Event::DisplayResized { .. }
+            | Event::DisplayConfigured { .. }
+    )
+}
+
 fn should_resync_real_time_after_wait(activity: RuntimeActivity, did_wait: bool) -> bool {
     // Long idle/deadline waits must not become one giant animation delta.
     // Active frame pacing is different: its actual elapsed time must reach
@@ -335,84 +357,43 @@ fn should_resync_real_time_after_wait(activity: RuntimeActivity, did_wait: bool)
     did_wait && !activity.frame_work
 }
 
-fn pump_receiver(
+fn pump_receiver_into(
     receiver: &EventReceiver,
     activity: RuntimeActivity,
     now: Instant,
     synthetic_pending: bool,
     mut pump: impl FnMut(Option<Duration>),
-) -> (Vec<Event>, bool, bool) {
+) -> (TurnBatch, bool) {
     let generation_before_drain = receiver.generation();
-    let (mut received_events, mut should_exit) = drain_event_channel(receiver);
+    let mut events = TurnBatch::default();
+    events.drain(receiver);
     // Once motion is active, every ECS turn that can commit geometry must pass
     // through the display-frame wait. Queued input and AX echoes are retained
     // across that wait instead of bypassing the pacer and amplifying commits.
     // Idle input still skips the wait so a new gesture starts promptly.
-    let should_wait = !should_exit
+    let should_wait = !events.should_exit()
         && (activity.frame_work
             || (!synthetic_pending
-                && received_events.is_empty()
+                && events.is_empty()
                 && receiver.generation() == generation_before_drain));
     if should_wait {
         pump(activity.wait(now));
-        let (after_wait, exit_after_wait) = drain_event_channel(receiver);
-        received_events.extend(after_wait);
-        received_events = coalesce_window_geometry_events(received_events);
-        should_exit |= exit_after_wait;
+        events.drain(receiver);
     }
-    (received_events, should_exit, should_wait)
+    (events, should_wait)
 }
 
-fn drain_event_channel(receiver: &EventReceiver) -> (Vec<Event>, bool) {
-    let mut received_events = Vec::new();
-    let mut pending_mouse = None;
-    let mut should_exit = false;
-    loop {
-        match receiver.try_recv() {
-            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
-                should_exit = true;
-                break;
-            }
-            Ok(event) if matches!(event, Event::MouseMoved { .. }) => {
-                pending_mouse = Some(event);
-            }
-            Ok(event) => {
-                received_events.extend(pending_mouse.take());
-                received_events.push(event);
-            }
-            Err(TryRecvError::Empty) => break,
-        }
-    }
-    received_events.extend(pending_mouse);
-    (
-        coalesce_window_geometry_events(received_events),
-        should_exit,
-    )
-}
-
-/// Keeps only the final geometry notification for each window and event kind.
-///
-/// Superseded events leave tombstones instead of moving their replacements
-/// forward, so every surviving event retains its original FIFO position
-/// relative to unrelated events and the other geometry kind.
-fn coalesce_window_geometry_events(events: Vec<Event>) -> Vec<Event> {
-    let mut latest_moved = BTreeMap::new();
-    let mut latest_resized = BTreeMap::new();
-    let mut coalesced = Vec::with_capacity(events.len());
-    for event in events {
-        let previous_position = match &event {
-            Event::WindowMoved { window_id } => latest_moved.insert(*window_id, coalesced.len()),
-            Event::WindowResized { window_id } => {
-                latest_resized.insert(*window_id, coalesced.len())
-            }
-            _ => None,
-        };
-        if let Some(previous_position) = previous_position {
-            coalesced[previous_position] = None;
-        }
-        coalesced.push(Some(event));
-    }
-    coalesced.into_iter().flatten().collect()
+#[cfg(test)]
+pub(crate) fn pump_receiver(
+    receiver: &EventReceiver,
+    activity: RuntimeActivity,
+    now: Instant,
+    synthetic_pending: bool,
+    pump: impl FnMut(Option<Duration>),
+) -> (Vec<Event>, bool, bool) {
+    let (events, did_wait) = pump_receiver_into(receiver, activity, now, synthetic_pending, pump);
+    let (events, should_exit) = events.finish();
+    (events, should_exit, did_wait)
 }
 
 #[cfg(test)]
@@ -423,30 +404,13 @@ mod tests {
     };
     use crate::ecs::{ActiveWorkspaceMarker, RefreshWindowSizes, Scrolling, SendMessageTrigger};
     use crate::events::{Event, EventReceiver, EventSender};
-    use crate::platform::Modifiers;
     use bevy::app::{App, First, PostUpdate, PreUpdate, Update};
     use bevy::ecs::message::{MessageReader, MessageWriter, Messages};
     use bevy::ecs::resource::Resource;
     use bevy::ecs::schedule::IntoScheduleConfigs;
     use bevy::ecs::system::{Commands, Local, NonSend, Res, ResMut};
     use bevy::time::{Real, Time, TimeSystems, Virtual};
-    use objc2_core_foundation::CGPoint;
     use std::time::{Duration, Instant};
-
-    fn mouse_moved(x: f64) -> Event {
-        Event::MouseMoved {
-            point: CGPoint::new(x, 0.0),
-            modifiers: Modifiers::empty(),
-        }
-    }
-
-    fn drain(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
-        let (sender, receiver) = EventSender::new();
-        for event in events {
-            sender.send(event).unwrap();
-        }
-        super::drain_event_channel(&receiver).0
-    }
 
     #[test]
     fn idle_runtime_has_no_periodic_deadline() {
@@ -573,48 +537,6 @@ mod tests {
             events.get(1),
             Some(Event::WindowMoved { window_id: 8 })
         ));
-    }
-
-    #[test]
-    fn duplicate_window_geometry_events_keep_each_final_fifo_position() {
-        let events = drain([
-            Event::WindowMoved { window_id: 7 },
-            Event::WindowResized { window_id: 7 },
-            Event::WindowMoved { window_id: 8 },
-            Event::UpdaterStatusChanged,
-            Event::WindowMoved { window_id: 7 },
-            Event::WindowResized { window_id: 7 },
-        ]);
-        assert_eq!(events.len(), 4);
-        assert!(matches!(&events[0], Event::WindowMoved { window_id: 8 }));
-        assert!(matches!(&events[1], Event::UpdaterStatusChanged));
-        assert!(matches!(&events[2], Event::WindowMoved { window_id: 7 }));
-        assert!(matches!(&events[3], Event::WindowResized { window_id: 7 }));
-    }
-
-    #[test]
-    fn window_geometry_coalescing_preserves_mouse_move_batching() {
-        let events = drain([
-            mouse_moved(1.0),
-            Event::WindowMoved { window_id: 7 },
-            mouse_moved(2.0),
-            Event::WindowMoved { window_id: 7 },
-            mouse_moved(3.0),
-            mouse_moved(4.0),
-            Event::WindowResized { window_id: 7 },
-        ]);
-        assert_eq!(events.len(), 5);
-        assert!(
-            matches!(&events[0], Event::MouseMoved { point, .. } if (point.x - 1.0).abs() < f64::EPSILON)
-        );
-        assert!(
-            matches!(&events[1], Event::MouseMoved { point, .. } if (point.x - 2.0).abs() < f64::EPSILON)
-        );
-        assert!(matches!(&events[2], Event::WindowMoved { window_id: 7 }));
-        assert!(
-            matches!(&events[3], Event::MouseMoved { point, .. } if (point.x - 4.0).abs() < f64::EPSILON)
-        );
-        assert!(matches!(&events[4], Event::WindowResized { window_id: 7 }));
     }
 
     #[test]

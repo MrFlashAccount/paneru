@@ -31,7 +31,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DefaultWindowDisposition, DockPosition, Initializing,
     LayoutPosition, Position, ResizeMarker, RestoreWindowState, RestoredWindowMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowDisposition,
-    WindowProperties,
+    WindowProperties, cancel_strip_geometry_ownership, cancel_window_geometry_ownership,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, WindowPadding};
@@ -488,7 +488,7 @@ pub(super) fn window_unmanaged_trigger(
     main_thread: NonSend<AxMainThread>,
     windows: Windows,
     mut apps: Query<(Entity, &mut Application, Has<ApplicationObserved>)>,
-    workspaces: Query<&mut LayoutStrip>,
+    mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
@@ -502,11 +502,21 @@ pub(super) fn window_unmanaged_trigger(
     let Some((_, _, Some(unmanaged))) = windows.get_managed(entity) else {
         return;
     };
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        cancel_window_geometry_ownership(&mut entity_commands);
+    }
+    for (strip_entity, strip) in &workspaces {
+        if strip.contains(entity)
+            && let Ok(mut strip_commands) = commands.get_entity(strip_entity)
+        {
+            cancel_strip_geometry_ownership(&mut strip_commands);
+        }
+    }
     if !matches!(unmanaged, Unmanaged::Floating | Unmanaged::Passthrough) {
         return;
     }
 
-    workspaces.into_iter().for_each(|mut strip| {
+    workspaces.iter_mut().for_each(|(_, mut strip)| {
         if strip.contains(entity) {
             strip.remove(entity);
         }

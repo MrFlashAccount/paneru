@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -9,7 +10,7 @@ use objc2_quartz_core::CADisplayLink;
 use tracing::{debug, warn};
 
 use crate::platform::macos_major_version;
-use crate::util::read_screen_property;
+use crate::util::{read_screen_property, screen_display_id};
 
 #[derive(Debug)]
 struct DisplayLinkTargetIvars {
@@ -48,6 +49,50 @@ pub(super) struct DisplayFramePacer {
     target: Retained<DisplayLinkTarget>,
     display_id: Option<CGDirectDisplayID>,
     link: Option<Retained<CADisplayLink>>,
+    refresh_rates: DisplayRefreshRateCache,
+}
+
+#[derive(Default)]
+struct DisplayRefreshRateCache {
+    rates: HashMap<CGDirectDisplayID, isize>,
+    valid: bool,
+}
+
+impl DisplayRefreshRateCache {
+    fn ensure_with(&mut self, enumerate: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID, isize))) {
+        if self.valid {
+            return;
+        }
+        self.rates.clear();
+        enumerate(&mut |display_id, refresh_rate| {
+            self.rates.insert(display_id, refresh_rate);
+        });
+        self.valid = true;
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn fastest(
+        &self,
+        visit_candidates: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID)),
+        mut on_lookup: impl FnMut(CGDirectDisplayID),
+    ) -> Option<CGDirectDisplayID> {
+        let mut best = None::<(CGDirectDisplayID, isize)>;
+        visit_candidates(&mut |display_id| {
+            on_lookup(display_id);
+            let Some(refresh_rate) = self.rates.get(&display_id).copied() else {
+                return;
+            };
+            if best.is_none_or(|(best_id, best_rate)| {
+                refresh_rate > best_rate || (refresh_rate == best_rate && display_id < best_id)
+            }) {
+                best = Some((display_id, refresh_rate));
+            }
+        });
+        best.map(|(display_id, _)| display_id)
+    }
 }
 
 impl DisplayFramePacer {
@@ -57,6 +102,7 @@ impl DisplayFramePacer {
             target: DisplayLinkTarget::new(mtm),
             display_id: None,
             link: None,
+            refresh_rates: DisplayRefreshRateCache::default(),
         }
     }
 
@@ -75,6 +121,24 @@ impl DisplayFramePacer {
         self.target.ivars().fired.set(false);
         link.setPaused(false);
         true
+    }
+
+    pub(super) fn fastest_display_id(
+        &mut self,
+        visit_candidates: impl FnOnce(&mut dyn FnMut(CGDirectDisplayID)),
+    ) -> Option<CGDirectDisplayID> {
+        self.refresh_rates.ensure_with(|add| {
+            for screen in NSScreen::screens(self.mtm) {
+                if let Some(display_id) = screen_display_id(&screen) {
+                    add(display_id, screen.maximumFramesPerSecond());
+                }
+            }
+        });
+        self.refresh_rates.fastest(visit_candidates, |_| {})
+    }
+
+    pub(super) fn invalidate_refresh_rates(&mut self) {
+        self.refresh_rates.invalidate();
     }
 
     pub(super) fn frame_fired(&self) -> bool {
@@ -126,5 +190,54 @@ impl Drop for DisplayFramePacer {
         if let Some(link) = self.link.take() {
             link.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayRefreshRateCache;
+    use std::cell::Cell;
+
+    #[test]
+    fn cache_enumerates_once_deduplicates_candidates_and_refreshes_after_invalidation() {
+        let enumerations = Cell::new(0);
+        let lookups = Cell::new(0);
+        let mut cache = DisplayRefreshRateCache::default();
+        let ensure = |cache: &mut DisplayRefreshRateCache, rates: &[(u32, isize)]| {
+            cache.ensure_with(|add| {
+                enumerations.set(enumerations.get() + 1);
+                for (display_id, refresh_rate) in rates {
+                    add(*display_id, *refresh_rate);
+                }
+            });
+        };
+
+        ensure(&mut cache, &[(41, 60), (17, 120)]);
+        let selected = cache.fastest(
+            |consider| {
+                consider(41);
+                consider(17);
+            },
+            |_| lookups.set(lookups.get() + 1),
+        );
+        assert_eq!(selected, Some(17));
+        ensure(&mut cache, &[(41, 75), (17, 60)]);
+        assert_eq!(enumerations.get(), 1);
+        assert_eq!(lookups.get(), 2);
+
+        cache.invalidate();
+        ensure(&mut cache, &[(41, 75), (17, 60)]);
+        assert_eq!(enumerations.get(), 2);
+        assert_eq!(
+            cache.fastest(
+                |consider| {
+                    consider(41);
+                    consider(17);
+                },
+                |_| {},
+            ),
+            Some(41)
+        );
+        assert_eq!(cache.fastest(|_| {}, |_| {}), None);
     }
 }

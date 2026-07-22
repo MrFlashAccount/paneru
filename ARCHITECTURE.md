@@ -18,7 +18,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 ### Event Ingestion (macOS -> ECS)
 1.  **Platform Layer:** `src/platform/` uses `objc2` and AppKit to interface with macOS. It runs a native event loop or hooks into OS notifications.
 2.  **Event Channel:** macOS events (mouse moves, window creations, space changes) are sent via a thread-safe `mpsc` channel.
-3.  **Pump System:** The `pump_events` system (in `src/ecs/runtime.rs`) drains the channel before sleeping, then waits on a latched `CFRunLoopSource` until a native event or the nearest pending-work deadline. Producers signal that source after publishing, so queue-before-sleep races do not require a free-running idle tick.
+3.  **Pump System:** The `pump_events` system (in `src/ecs/runtime.rs`) owns only drain/wait/handoff orchestration around a latched `CFRunLoopSource`. The opaque `events::TurnBatch` ingestion boundary owns mouse batching, receiver-disconnection shutdown, and one-turn geometry coalescing across the pre-wait, post-wait, and geometry-wake-deferral handoff drains while preserving surviving FIFO order. Producers signal the source after publishing, and deferred geometry wakes are released only after the handoff drain, so queue-before-sleep and release-gap races do not require a free-running idle tick.
 4.  **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domains such as session restore in `src/ecs/restore.rs`) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
 
 ### State Synchronization (ECS -> macOS)
@@ -27,6 +27,15 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 3.  **FFI Calls:** These systems call methods on the `Window` trait object (implemented by `WindowOS` in `src/manager/windows.rs`), which performs the actual accessibility API calls to move or resize the physical macOS window.
 
 **Note:** All AppKit/Accessibility calls must happen on the **Main Thread**. Paneru ensures this by using `NonSend` resources and executing critical synchronization systems on the main thread.
+
+### Motion pacing and AX position correlation
+
+- Active reposition, resize, and scroll work is mapped to its owning `Display`. The platform pacer selects the fastest relevant display from a cached display-ID-to-refresh-rate map. Native display configuration events invalidate that cache; the next motion turn enumerates `NSScreen` once. If metadata or a display link is unavailable, the timer fallback waits to the frame deadline despite unrelated early run-loop wakes.
+- `LayoutPosition` remains logical strip geometry. `Position` is the physical target, and `StripTranslatedFrame` temporarily records Paneru's own physical strip translation so layout reconciliation does not feed it back as a logical change.
+- Every Paneru AX position write records a bounded recent history plus the oldest and last physically observed authored anchors. A latest-coordinate notification acknowledges the current target without discarding history; an older authored coordinate is an out-of-order self echo even in a later ECS turn. A coordinate outside that bounded authored set is external and cancels incompatible scrolling and pending/final verification. A user move to an identical outstanding coordinate is inherently indistinguishable until the bounded verifier reconciles it.
+- Scroll writes set `PendingScrollVerification`. After scrolling and strip motion settle, it becomes one `VerifyWindowPosition` lifecycle with bounded retries. Authored ownership terminates only on verified success, retry exhaustion accepting the physical AX frame, explicit external mismatch, geometry-ownership loss, AppExit cleanup, or entity despawn.
+- AppExit, unmanage/passthrough, and native-fullscreen transitions cancel window and owning-strip geometry components before direct AX restoration or later `PostUpdate` systems can run.
+- `WindowOS` owns the per-PID `AXEnhancedUserInterface` workaround. One reposition batch acquires at most one lease per PID, caches failed acquisition for that batch, and restores leases on normal, error, and unwind exits. AX position-write failures leave the cached frame unchanged and warn once per consecutive failure streak.
 
 ## 3. Crate & Module Map
 

@@ -16,6 +16,10 @@ use crate::errors::Result;
 use crate::platform::{Modifiers, ProcessSerialNumber, WinID, WorkspaceId, WorkspaceObserver};
 use crate::util::AXUIWrapper;
 
+mod turn_batch;
+
+pub(crate) use turn_batch::TurnBatch;
+
 /// `Event` represents various system-level and application-specific occurrences that the window manager reacts to.
 /// These events drive the core logic of the window manager, from window creation to display changes.
 #[allow(dead_code)]
