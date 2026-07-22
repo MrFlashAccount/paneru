@@ -190,6 +190,18 @@ pub(crate) fn window_moved_update_frame(
 
         let scroll_motion_active = strip_motion_active(entity, &strips, now);
         let authored_move_pending = authored_position.is_some();
+        if scroll_motion_active && authored_move_pending {
+            // AX move notifications are self-generated while Paneru owns an
+            // active scroll. Reading the position here is synchronous IPC on
+            // the main thread and competes directly with the next frame. The
+            // bounded settlement verifier below reads and reconciles the final
+            // native position once motion stops.
+            trace!(
+                window_id,
+                "deferring AX position read until active scroll motion settles"
+            );
+            continue;
+        }
         let observed_position = if let Some(mut authored_position) = authored_position {
             let observed_position = match window.update_position() {
                 Ok(position) => position,
@@ -219,15 +231,6 @@ pub(crate) fn window_moved_update_frame(
                     ?observed_position,
                     latest = ?authored_position.latest,
                     "ignoring out-of-order AX acknowledgement for an older authored position"
-                );
-                continue;
-            }
-            if scroll_motion_active {
-                trace!(
-                    window_id,
-                    ?observed_position,
-                    latest = ?authored_position.latest,
-                    "deferring unmatched AX position until active scroll motion settles"
                 );
                 continue;
             }

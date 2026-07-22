@@ -141,12 +141,19 @@ fn acknowledged_latest_survives_authored_history_overflow_as_applied_anchor() {
 
 #[test]
 fn ax_lag_during_active_scroll_does_not_cancel_the_gesture() {
+    let position_reads = Arc::new(AtomicUsize::new(0));
     let reposition_writes = Arc::new(AtomicUsize::new(0));
     let target = Origin::new(-800, 0);
     let lagged = Origin::new(-430, 0);
     let mut mock = MockWindowApi::new();
     mock.expect_id().return_const(14);
-    mock.expect_update_position().returning(move || Ok(lagged));
+    mock.expect_update_position().returning({
+        let position_reads = Arc::clone(&position_reads);
+        move || {
+            position_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(lagged)
+        }
+    });
     mock.expect_reposition().returning({
         let reposition_writes = Arc::clone(&reposition_writes);
         move |_| {
@@ -196,6 +203,7 @@ fn ax_lag_during_active_scroll_does_not_cancel_the_gesture() {
             .contains::<PendingScrollVerification>()
     );
     assert!(app.world().entity(strip).contains::<Scrolling>());
+    assert_eq!(position_reads.load(Ordering::Relaxed), 0);
     assert_eq!(reposition_writes.load(Ordering::Relaxed), 0);
 }
 
