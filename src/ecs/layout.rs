@@ -1139,6 +1139,7 @@ fn position_layout_strips(
 
 #[derive(Clone, Copy)]
 struct StripWindowContext {
+    authored_strip_position: Origin,
     strip_position: Origin,
     swiping: bool,
     display_entity: Entity,
@@ -1148,6 +1149,7 @@ struct StripWindowContext {
 fn insert_strip_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     strip: &LayoutStrip,
+    authored_strip_position: Origin,
     strip_position: Origin,
     swiping: bool,
     display_entity: Entity,
@@ -1156,6 +1158,7 @@ fn insert_strip_window_contexts(
         insert_column_window_contexts(
             contexts,
             column,
+            authored_strip_position,
             strip_position,
             swiping,
             display_entity,
@@ -1167,6 +1170,7 @@ fn insert_strip_window_contexts(
 fn insert_column_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     column: &Column,
+    authored_strip_position: Origin,
     strip_position: Origin,
     swiping: bool,
     display_entity: Entity,
@@ -1177,6 +1181,7 @@ fn insert_column_window_contexts(
             contexts.insert(
                 *entity,
                 StripWindowContext {
+                    authored_strip_position,
                     strip_position,
                     swiping,
                     display_entity,
@@ -1189,6 +1194,7 @@ fn insert_column_window_contexts(
                 insert_stack_item_window_contexts(
                     contexts,
                     item,
+                    authored_strip_position,
                     strip_position,
                     swiping,
                     display_entity,
@@ -1201,6 +1207,7 @@ fn insert_column_window_contexts(
                 contexts.insert(
                     *entity,
                     StripWindowContext {
+                        authored_strip_position,
                         strip_position,
                         swiping,
                         display_entity,
@@ -1215,6 +1222,7 @@ fn insert_column_window_contexts(
 fn insert_stack_item_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     item: &StackItem,
+    authored_strip_position: Origin,
     strip_position: Origin,
     swiping: bool,
     display_entity: Entity,
@@ -1225,6 +1233,7 @@ fn insert_stack_item_window_contexts(
             contexts.insert(
                 *entity,
                 StripWindowContext {
+                    authored_strip_position,
                     strip_position,
                     swiping,
                     display_entity,
@@ -1237,6 +1246,7 @@ fn insert_stack_item_window_contexts(
                 contexts.insert(
                     *entity,
                     StripWindowContext {
+                        authored_strip_position,
                         strip_position,
                         swiping,
                         display_entity,
@@ -1245,6 +1255,29 @@ fn insert_stack_item_window_contexts(
                 );
             }
         }
+    }
+}
+
+fn preserve_authored_offscreen_sliver(
+    mut frame: IRect,
+    authored_frame: IRect,
+    viewport: IRect,
+    h_pad: i32,
+    sliver_width: i32,
+    pad_left: i32,
+    pad_right: i32,
+) -> (IRect, bool) {
+    let width = frame.width();
+    if authored_frame.max.x <= viewport.min.x + h_pad {
+        frame.min.x = viewport.min.x - width + sliver_width - pad_left + h_pad;
+        frame.max.x = frame.min.x + width;
+        (frame, true)
+    } else if authored_frame.min.x >= viewport.max.x - h_pad {
+        frame.min.x = viewport.max.x - sliver_width + pad_right - h_pad;
+        frame.max.x = frame.min.x + width;
+        (frame, true)
+    } else {
+        (frame, false)
     }
 }
 
@@ -1274,13 +1307,18 @@ fn position_layout_windows(
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
-    for (layout_strip, Position(strip_position), overscroll, swiping, child_of) in &workspaces {
-        let strip_position = overscroll.copied().map_or(*strip_position, |visual| {
-            visual.effective_position(*strip_position)
-        });
+    for (layout_strip, Position(authored_strip_position), overscroll, swiping, child_of) in
+        &workspaces
+    {
+        let strip_position = overscroll
+            .copied()
+            .map_or(*authored_strip_position, |visual| {
+                visual.effective_position(*authored_strip_position)
+            });
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
+            *authored_strip_position,
             strip_position,
             swiping || overscroll.is_some(),
             child_of.parent(),
@@ -1304,27 +1342,26 @@ fn position_layout_windows(
         // h_pad to the virtual x, so subtract it here so the OS window
         // lands exactly sliver_width pixels from the screen edge.
         let h_pad = window.horizontal_padding();
+        let mut authored_frame =
+            IRect::from_corners(layout_position.0, layout_position.0 + bounds.0);
+        authored_frame.min += context.authored_strip_position;
+        authored_frame.max += context.authored_strip_position;
         let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + bounds.0);
-        let width = frame.width();
         frame.min += context.strip_position;
         frame.max += context.strip_position;
 
-        let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + h_pad {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge.  The +h_pad accounts for the gap that
-            // reposition() adds, which can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - h_pad {
-            // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
-            offscreen = true;
-        }
-        frame.max.x = frame.min.x + width;
+        // Transient overscroll must not reclassify a fully hidden neighbor as
+        // visible. Otherwise it jumps from the pinned sliver position into the
+        // viewport by roughly the overscroll distance.
+        let (mut frame, offscreen) = preserve_authored_offscreen_sliver(
+            frame,
+            authored_frame,
+            viewport,
+            h_pad,
+            offscreen_sliver_width,
+            pad_left,
+            pad_right,
+        );
 
         // During swipe, keep full height. The vertical sliver inset only
         // applies to horizontally off-screen windows, so they expose just
@@ -1406,6 +1443,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transient_overscroll_keeps_authored_offscreen_neighbor_on_its_sliver() {
+        let viewport = IRect::new(0, 20, 1000, 800);
+        let authored = IRect::new(1000, 20, 1400, 800);
+        let transiently_shifted = IRect::new(956, 20, 1356, 800);
+
+        let (frame, offscreen) = preserve_authored_offscreen_sliver(
+            transiently_shifted,
+            authored,
+            viewport,
+            0,
+            30,
+            0,
+            0,
+        );
+
+        assert!(offscreen);
+        assert_eq!(frame.min.x, 970);
+        assert_eq!(
+            frame.max.x, 1370,
+            "overscroll must not pull an offscreen neighbor into the viewport"
+        );
+    }
+
     fn setup_world_and_strip() -> (World, LayoutStrip, Vec<Entity>) {
         let mut world = World::new();
         let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
@@ -1443,7 +1504,14 @@ mod tests {
         let strip_position = Origin::new(10, 20);
         let mut contexts = EntityHashMap::default();
 
-        insert_strip_window_contexts(&mut contexts, &strip, strip_position, true, display_entity);
+        insert_strip_window_contexts(
+            &mut contexts,
+            &strip,
+            strip_position,
+            strip_position,
+            true,
+            display_entity,
+        );
 
         let stacked_leader = contexts.get(&entities[0]).unwrap();
         let stacked_follower = contexts.get(&entities[1]).unwrap();

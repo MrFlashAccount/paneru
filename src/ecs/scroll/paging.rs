@@ -100,12 +100,13 @@ fn update_edge_overscroll(
 ) {
     let at_application_edge = overflow > 0.0 && paging.previous_stop.is_none()
         || overflow < 0.0 && paging.next_stop.is_none();
-    if overflow == 0.0 {
-        if user_input && scrolling.edge_overscroll.is_active() {
-            scrolling.edge_overscroll.cancel();
-        }
-    } else if user_input && at_application_edge {
+    if !user_input || !scrolling.edge_overscroll.accepts_input() {
+        return;
+    }
+    if overflow != 0.0 && at_application_edge {
         scrolling.edge_overscroll.apply_outward_input(overflow);
+    } else if scrolling.edge_overscroll.is_active() {
+        scrolling.edge_overscroll.cancel_pull();
     }
 }
 
@@ -215,7 +216,7 @@ mod tests {
     use bevy::math::IRect;
 
     use super::{capture_gesture, constrain_motion, ready_to_snap, snap_stops, snap_target};
-    use crate::ecs::scroll::overscroll::EDGE_OVERSCROLL_MAX;
+    use crate::ecs::scroll::overscroll::{EDGE_OVERSCROLL_MAX, EdgeOverscroll};
     use crate::ecs::{PagingGesture, Scrolling};
 
     #[test]
@@ -418,6 +419,7 @@ mod tests {
                 position: attempted,
                 target_position: Some(attempted),
                 paging_gesture: Some(paging),
+                edge_overscroll: EdgeOverscroll::armed(),
                 ..Default::default()
             };
             constrain_motion(&mut scrolling, 1.0, true);
@@ -438,6 +440,7 @@ mod tests {
         };
         let mut scrolling = Scrolling {
             paging_gesture: Some(paging),
+            edge_overscroll: EdgeOverscroll::armed(),
             ..Default::default()
         };
         let mut offsets = Vec::new();
@@ -447,7 +450,16 @@ mod tests {
             offsets.push(scrolling.edge_overscroll.visual());
         }
         assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(offsets[1] - offsets[0] > offsets[3] - offsets[2]);
+        let response = [
+            offsets[0] / 12.0,
+            (offsets[1] - offsets[0]) / 24.0,
+            (offsets[2] - offsets[1]) / 96.0,
+            (offsets[3] - offsets[2]) / 10_000.0,
+        ];
+        assert!(
+            response.windows(2).all(|pair| pair[0] > pair[1]),
+            "each additional input point must produce less visual movement"
+        );
         assert!(offsets[3] <= EDGE_OVERSCROLL_MAX);
     }
 
@@ -462,6 +474,7 @@ mod tests {
         let mut scrolling = Scrolling {
             position: 10_000.0,
             paging_gesture: Some(paging),
+            edge_overscroll: EdgeOverscroll::armed(),
             ..Default::default()
         };
         constrain_motion(&mut scrolling, 1.0, true);
@@ -474,7 +487,7 @@ mod tests {
             previous = scrolling.edge_overscroll.visual();
             frames += 1;
         }
-        assert!((8..=9).contains(&frames), "settled after {frames} frames");
+        assert!((7..=8).contains(&frames), "settled after {frames} frames");
         assert_eq!(scrolling.edge_overscroll.visual(), 0.0);
         scrolling.edge_overscroll.mark_restored();
         assert!(!scrolling.edge_overscroll.is_active());
@@ -491,6 +504,7 @@ mod tests {
         let mut scrolling = Scrolling {
             position: 80.0,
             paging_gesture: Some(paging),
+            edge_overscroll: EdgeOverscroll::armed(),
             ..Default::default()
         };
         constrain_motion(&mut scrolling, 1.0, true);
@@ -515,11 +529,12 @@ mod tests {
         let mut scrolling = Scrolling {
             position: 120.0,
             paging_gesture: Some(paging),
+            edge_overscroll: EdgeOverscroll::armed(),
             ..Default::default()
         };
         constrain_motion(&mut scrolling, 1.0, true);
         scrolling.edge_overscroll.release();
-        scrolling.edge_overscroll.cancel();
+        scrolling.edge_overscroll.cancel_pull();
         assert_eq!(scrolling.edge_overscroll.visual(), 0.0);
         scrolling.edge_overscroll.mark_restored();
         assert!(!scrolling.edge_overscroll.is_active());

@@ -13,9 +13,10 @@ use bevy::ecs::system::{NonSend, NonSendMut, Query, Res, ResMut, SystemParam};
 use bevy::time::{Real, Time};
 
 use super::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EdgeOverscrollVisual, FlashMessage, FocusedMarker,
-    FreshMarker, Initializing, RefreshWindowSizes, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, Scrolling, Timeout, Unmanaged, VerifyWindowPosition, WindowDisposition,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, EdgeOverscrollPhase, EdgeOverscrollVisual,
+    FlashMessage, FocusedMarker, FreshMarker, Initializing, RefreshWindowSizes, RepositionMarker,
+    ResizeMarker, RetryFrontSwitch, Scrolling, Timeout, Unmanaged, VerifyWindowPosition,
+    WindowDisposition,
 };
 use crate::ecs::observation::ObserverDetachRetry;
 use crate::events::{Event, EventReceiver};
@@ -160,7 +161,7 @@ pub(super) struct RuntimeWork<'w, 's> {
         With<ResizeMarker>,
     >,
     scrolling: Query<'w, 's, &'static Scrolling>,
-    edge_overscroll_visuals: Query<'w, 's, (), With<EdgeOverscrollVisual>>,
+    edge_overscroll_visuals: Query<'w, 's, &'static EdgeOverscrollVisual>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     timeouts: Query<'w, 's, &'static Timeout>,
     fresh_polls: Query<'w, 's, &'static FreshPollDeadline, With<FreshMarker>>,
@@ -263,7 +264,10 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
             .scrolling
             .iter()
             .any(super::scroll::scrolling_needs_frame)
-            || !work.edge_overscroll_visuals.is_empty()
+            || work
+                .edge_overscroll_visuals
+                .iter()
+                .any(|visual| visual.phase == EdgeOverscrollPhase::RestoreQueued)
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -664,6 +668,29 @@ mod tests {
                 .unwrap()
                 .frame_work,
             "runtime must keep one frame for canonical layout after Scrolling is removed"
+        );
+    }
+
+    #[test]
+    fn held_overscroll_visual_is_input_driven_not_frame_polled() {
+        let mut app = App::new();
+        app.init_resource::<CapturedActivity>()
+            .add_systems(Update, capture_activity);
+        app.world_mut().spawn(EdgeOverscrollVisual {
+            authored_position: Origin::new(40, 20),
+            offset: 24,
+            phase: EdgeOverscrollPhase::Applied,
+        });
+
+        app.update();
+
+        assert!(
+            !app.world()
+                .resource::<CapturedActivity>()
+                .0
+                .unwrap()
+                .frame_work,
+            "a stationary finger must not keep the display link armed"
         );
     }
 

@@ -574,10 +574,23 @@ fn scroll_gesture_lifecycle(
     // Momentum belongs to the physical gesture that preceded it. Treating its
     // begin as a new gesture would recapture the paging stop and allow a
     // second hop from one finger movement.
-    let began = phase.contains(NSEventPhase::Began);
+    // A trackpad reports MayBegin as soon as the fingers make contact, before
+    // the first measurable delta. Arming on that phase lets very slow pulls
+    // own the rubber band from their first non-zero movement.
+    let began = phase.intersects(NSEventPhase::MayBegin | NSEventPhase::Began);
     let physical_ended = phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled);
     let momentum_began = momentum_phase.contains(NSEventPhase::Began);
-    let momentum_ended = momentum_phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled);
+    let physical_contact_active = phase.intersects(
+        NSEventPhase::MayBegin
+            | NSEventPhase::Began
+            | NSEventPhase::Changed
+            | NSEventPhase::Stationary,
+    );
+    // A new physical gesture can cancel an older momentum stream in the same
+    // NSEvent. That momentum Ended belongs to the old gesture and must not
+    // terminate the new contact we just armed.
+    let momentum_ended = !physical_contact_active
+        && momentum_phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled);
     (began, physical_ended, momentum_began, momentum_ended)
 }
 
@@ -792,6 +805,11 @@ fingers_count = 3
     #[test]
     fn native_scroll_lifecycle_covers_touch_and_momentum_phases() {
         assert_eq!(
+            scroll_gesture_lifecycle(NSEventPhase::MayBegin, NSEventPhase::None),
+            (true, false, false, false),
+            "trackpad contact must arm slow pulls before their first delta"
+        );
+        assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Began, NSEventPhase::None),
             (true, false, false, false)
         );
@@ -817,6 +835,11 @@ fingers_count = 3
             scroll_gesture_lifecycle(NSEventPhase::Ended, NSEventPhase::Changed),
             (false, true, false, false),
             "physical end must not end the full gesture while momentum continues"
+        );
+        assert_eq!(
+            scroll_gesture_lifecycle(NSEventPhase::Began, NSEventPhase::Ended),
+            (true, false, false, false),
+            "ending old momentum must not close a new physical contact"
         );
     }
 }
