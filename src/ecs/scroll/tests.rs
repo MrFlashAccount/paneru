@@ -109,6 +109,100 @@ fn settled_scroll_focuses_visible_window_without_warping_cursor() {
 }
 
 #[test]
+fn real_touchpad_scroll_focuses_the_adjacent_window_after_settling() {
+    let config = crate::config::Config::try_from(
+        r"
+[options]
+
+[swipe]
+sensitivity = 0.20
+continuous = true
+sticky = true
+paging = true
+snap_padding = 100
+
+[bindings]
+",
+    )
+    .expect("valid swipe config");
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::TouchpadDown,
+        Event::Scroll { delta: 500.0 },
+        Event::TouchpadUp,
+    ];
+    commands.extend((0..4).map(|_| Event::Command {
+        command: Command::PrintState,
+    }));
+    let final_iteration = commands.len() - 1;
+
+    TestHarness::new()
+        .with_config(config)
+        .with_window(0, |window| {
+            window.frame = IRect::new(0, 0, 1_024, 800);
+        })
+        .with_window(1, |window| {
+            window.frame = IRect::new(0, 0, 1_024, 800);
+        })
+        .with_focused_window(0)
+        .on_iteration(1, |world, _state| {
+            let mut query =
+                world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+            let scrolling = query.single(world).expect("active touchpad gesture");
+            let origin = scrolling
+                .scroll_focus_origin
+                .expect("gesture must capture the focused window");
+            assert!(
+                world.get::<FocusedMarker>(origin).is_some(),
+                "captured origin must still own the focus marker"
+            );
+        })
+        .on_iteration(final_iteration, |world, _state| {
+            let focused = {
+                let mut query =
+                    world.query_filtered::<(&Window, Entity), With<FocusedMarker>>();
+                query
+                    .single(world)
+                    .expect("one focused window")
+                    .0
+                    .id()
+            };
+            let strip_position = {
+                let mut query =
+                    world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+                query.single(world).expect("one active workspace").x
+            };
+            let geometry = {
+                let mut query = world.query::<(&Window, &crate::ecs::LayoutPosition, &Position)>();
+                query
+                    .iter(world)
+                    .map(|(window, layout, position)| {
+                        (window.id(), layout.x, position.x, window.frame().width())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let scrolling = {
+                let mut query =
+                    world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+                query.single(world).ok().map(|scrolling| {
+                    (
+                        scrolling.gesture_active,
+                        scrolling.is_user_swiping,
+                        scrolling.snap_pending,
+                        scrolling.target_position,
+                        scrolling.velocity,
+                    )
+                })
+            };
+            assert_eq!(
+                focused, 1,
+                "adjacent window should be focused after settling at strip offset {strip_position}; geometry={geometry:?}; scrolling={scrolling:?}"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
 fn native_scroll_smoothing_converges_without_overshoot() {
     let mut position = 0.0;
     let mut settled = false;

@@ -553,7 +553,13 @@ pub(super) fn swiping_timeout(
         let timed_out = !scroll.gesture_active
             && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD;
         let outcome = update_swipe_timeout(&mut scroll, timed_out, dt, viewport_width);
-        if outcome.remove {
+        let focus_handoff_ready = !scroll.gesture_active
+            && !scroll.is_user_swiping
+            && scroll.target_position.is_none()
+            && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
+            && !scroll.edge_overscroll.is_active()
+            && !scroll.snap_pending;
+        if focus_handoff_ready {
             let focused = windows.focused().map(|(_, entity)| entity);
             if active
                 && scroll
@@ -581,11 +587,14 @@ pub(super) fn swiping_timeout(
                     global_state.set_skip_reshuffle(true);
                     global_state.set_ffm_flag(Some(window.id()));
                     commands.focus_entity(target, true);
+                    scroll.scroll_focus_origin = Some(target);
                 }
             }
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<Scrolling>();
-            }
+        }
+        if outcome.remove
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<Scrolling>();
         }
         if outcome.emit_mouse_moved
             && let Some(point) = window_manager.cursor_position()
