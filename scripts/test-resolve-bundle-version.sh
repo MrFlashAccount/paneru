@@ -61,9 +61,9 @@ assert_ordered() {
   ASSERTIONS=$((ASSERTIONS + 1))
 }
 
-assert_resolves "0.6.15-pr20" "999.0.20"
-assert_resolves "0.6.15-local" "999.0.0"
-assert_resolves "0.6.15-local.2" "999.0.2"
+assert_resolves "0.6.15-pr20" "1.0.20"
+assert_resolves "0.6.15-local" "1.0.0"
+assert_resolves "0.6.15-local.2" "1.0.2"
 assert_resolves "0.6.15" "1000.6.15"
 assert_resolves "0.6.16" "1000.6.16"
 assert_resolves "1.2.3" "1001.2.3"
@@ -78,7 +78,8 @@ RELEASE_BUILD="$("$RESOLVER" "0.6.16")"
 assert_ordered "$PR_BUILD" "$NEXT_PR_BUILD"
 assert_ordered "$PR_BUILD" "$SAME_VERSION_RELEASE"
 assert_ordered "$PR_BUILD" "$RELEASE_BUILD"
-assert_ordered "40" "$PR_BUILD"
+assert_ordered "$PR_BUILD" "31"
+assert_ordered "40" "$SAME_VERSION_RELEASE"
 assert_ordered "$("$RESOLVER" "8999.99.99-pr9999")" "$("$RESOLVER" "0.0.0")"
 
 assert_rejected "" "Usage:"

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Convert Paneru's human-facing semantic version into a Sparkle-compatible
 # CFBundleVersion. Stable releases use the 1000+ semantic lane. Preview, test,
-# and local builds use the lower 999.x.y lane, so they can never block a stable
-# release while still sorting above historical run-number builds.
+# and local builds use the lower 1.x.y lane, so they remain below the currently
+# published build 31 as well as every release built with the new scheme.
 
 if [[ "$#" -ne 1 || -z "$1" ]]; then
   echo "Usage: $0 <major.minor.patch[-suffix]>" >&2
@@ -68,7 +68,7 @@ if [[ -n "$SUFFIX" ]]; then
     exit 1
   fi
 
-  printf '999.%s.%s\n' \
+  printf '1.%s.%s\n' \
     "$((10#$PREVIEW_SEQUENCE / 100))" \
     "$((10#$PREVIEW_SEQUENCE % 100))"
   exit 0
