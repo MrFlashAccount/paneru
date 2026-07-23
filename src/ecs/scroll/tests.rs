@@ -7,8 +7,9 @@ use bevy::time::TimeUpdateStrategy;
 use objc2_core_foundation::CGPoint;
 
 use super::{
-    Scrolling, SnapMode, begin_touchpad_gesture, resume_touchpad_gesture, scrolling_needs_frame,
-    smooth_native_scroll, snap_mode, sticky_edge_snap_target,
+    GestureInput, InitialTouchpadLifecycle, Scrolling, SnapMode, apply_initial_touchpad_lifecycle,
+    begin_touchpad_gesture, resume_touchpad_gesture, scrolling_needs_frame, smooth_native_scroll,
+    snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
 use crate::ecs::{ActiveWorkspaceMarker, EdgeOverscrollVisual, Position, VerifyWindowPosition};
@@ -56,6 +57,69 @@ fn momentum_resume_preserves_target_but_new_touch_interrupts_it() {
 }
 
 #[test]
+fn terminal_phase_closes_a_brand_new_overscroll_before_deferred_insertion() {
+    let mut scrolling = Scrolling {
+        position: 12.0,
+        is_user_swiping: true,
+        gesture_active: true,
+        paging_gesture: Some(crate::ecs::PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        }),
+        edge_overscroll: super::overscroll::EdgeOverscroll::armed(),
+        ..Default::default()
+    };
+    super::paging::constrain_motion(&mut scrolling, 1.0, true);
+
+    apply_initial_touchpad_lifecycle(
+        &mut scrolling,
+        InitialTouchpadLifecycle {
+            physical_up: true,
+            up: false,
+            direction_modifier: 1.0,
+        },
+    );
+
+    assert!(!scrolling.gesture_active);
+    assert!(scrolling.is_user_swiping);
+    assert!(!scrolling.edge_overscroll.accepts_input());
+    assert!(scrolling.edge_overscroll.is_returning());
+    assert!(scrolling_needs_frame(&scrolling));
+}
+
+#[test]
+fn terminal_events_before_latest_down_cannot_close_the_new_contact() {
+    let old_terminal_then_new_down = GestureInput {
+        touchpad_physical_up: Some(0),
+        touchpad_up: Some(1),
+        touchpad_down: Some(2),
+        ..Default::default()
+    };
+    assert!(
+        !old_terminal_then_new_down
+            .belongs_to_latest_contact(old_terminal_then_new_down.touchpad_physical_up)
+    );
+    assert!(
+        !old_terminal_then_new_down
+            .belongs_to_latest_contact(old_terminal_then_new_down.touchpad_up)
+    );
+
+    let new_down_then_terminal = GestureInput {
+        touchpad_down: Some(0),
+        touchpad_physical_up: Some(1),
+        touchpad_up: Some(2),
+        ..Default::default()
+    };
+    assert!(
+        new_down_then_terminal
+            .belongs_to_latest_contact(new_down_then_terminal.touchpad_physical_up)
+    );
+    assert!(new_down_then_terminal.belongs_to_latest_contact(new_down_then_terminal.touchpad_up));
+}
+
+#[test]
 fn settled_overscroll_does_not_request_more_frames() {
     let mut scrolling = Scrolling {
         position: 80.0,
@@ -65,14 +129,23 @@ fn settled_overscroll_does_not_request_more_frames() {
             next_stop: Some(-600.0),
             release_velocity: 0.0,
         }),
+        edge_overscroll: super::overscroll::EdgeOverscroll::armed(),
         ..Default::default()
     };
     assert!(!scrolling_needs_frame(&scrolling));
 
     super::paging::constrain_motion(&mut scrolling, 1.0, true);
-    assert!(scrolling_needs_frame(&scrolling));
+    assert!(
+        !scrolling_needs_frame(&scrolling),
+        "a static held pull is input-driven, not display-polled"
+    );
 
-    scrolling.edge_overscroll.cancel();
+    assert!(scrolling.edge_overscroll.release());
+    assert!(scrolling_needs_frame(&scrolling));
+    while scrolling.edge_overscroll.is_returning() {
+        scrolling.edge_overscroll.integrate(1.0 / 120.0);
+    }
+    assert!(scrolling_needs_frame(&scrolling));
     scrolling.edge_overscroll.mark_restored();
     assert!(!scrolling_needs_frame(&scrolling));
 }
@@ -96,7 +169,7 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
                 16,
             )));
         })
-        .on_iteration(2, |world, state| {
+        .on_iteration(2, |world, _state| {
             let mut strip =
                 world.query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>();
             let (position, scrolling) = strip.single(world).expect("active scrolling workspace");
@@ -106,9 +179,19 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
                 scrolling.target_position.is_none_or(|target| target == 0.0),
                 "any remaining logical target stays clamped to the real edge"
             );
-            let visual = scrolling.edge_overscroll.visual().round() as i32;
+            let visual = super::overscroll::visual_offset(scrolling.edge_overscroll.visual());
             assert!(visual > 0);
-
+            let mut visual_owner =
+                world.query_filtered::<&EdgeOverscrollVisual, With<ActiveWorkspaceMarker>>();
+            assert_eq!(
+                visual_owner
+                    .single(world)
+                    .expect("strip owns transient visual")
+                    .offset,
+                visual
+            );
+        })
+        .on_iteration(3, |world, state| {
             let mut windows =
                 world.query::<(Entity, &Window, &Position, Has<VerifyWindowPosition>)>();
             assert!(
@@ -120,7 +203,7 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
             assert!(
                 windows
                     .iter(world)
-                    .any(|(_, _, position, _)| position.x == visual),
+                    .any(|(_, _, position, _)| (1..=44).contains(&position.x)),
                 "layout materializes the transient offset without changing strip Position"
             );
             assert!(

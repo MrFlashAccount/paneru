@@ -64,13 +64,24 @@ fn snap_mode(paging: bool, sticky: bool, auto_center: bool) -> SnapMode {
 struct GestureInput {
     scroll_delta: Option<f64>,
     gesture_delta: Option<f64>,
-    lifecycle: u8,
+    touchpad_down: Option<usize>,
+    touchpad_physical_up: Option<usize>,
+    touchpad_momentum_start: Option<usize>,
+    touchpad_up: Option<usize>,
 }
 
-const TOUCHPAD_DOWN: u8 = 1 << 0;
-const TOUCHPAD_PHYSICAL_UP: u8 = 1 << 1;
-const TOUCHPAD_MOMENTUM_START: u8 = 1 << 2;
-const TOUCHPAD_UP: u8 = 1 << 3;
+impl GestureInput {
+    fn belongs_to_latest_contact(&self, phase: Option<usize>) -> bool {
+        phase.is_some_and(|phase| self.touchpad_down.is_none_or(|down| phase > down))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InitialTouchpadLifecycle {
+    physical_up: bool,
+    up: bool,
+    direction_modifier: f64,
+}
 
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
@@ -138,21 +149,26 @@ fn swipe_gesture(
     let scroll_scale = SCROLL_SCALE_LOWER
         + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
     let input = read_gesture_input(&mut messages, &config, scroll_scale);
-    let GestureInput {
-        scroll_delta,
-        gesture_delta,
-        lifecycle,
-    } = input;
-    let touchpad_down = lifecycle & TOUCHPAD_DOWN != 0;
-    let touchpad_physical_up = lifecycle & TOUCHPAD_PHYSICAL_UP != 0;
-    let touchpad_momentum_start = lifecycle & TOUCHPAD_MOMENTUM_START != 0;
-    let touchpad_up = lifecycle & TOUCHPAD_UP != 0;
+    // A fast second gesture can arrive in the same ECS batch as terminal
+    // events from the first. Only lifecycle phases after the latest Down
+    // belong to the new contact; otherwise the old Up closes its input latch.
+    let touchpad_down = input.touchpad_down.is_some();
+    let touchpad_physical_up = input.belongs_to_latest_contact(input.touchpad_physical_up);
+    let touchpad_momentum_start = input.belongs_to_latest_contact(input.touchpad_momentum_start);
+    let touchpad_up = input.belongs_to_latest_contact(input.touchpad_up);
+    let scroll_delta = input.scroll_delta;
+    let gesture_delta = input.gesture_delta;
     let has_gesture_event = gesture_delta.is_some();
     let has_scroll_event = scroll_delta.is_some() || has_gesture_event;
     let scroll_delta = scroll_delta.unwrap_or_default();
     let gesture_delta = gesture_delta.unwrap_or_default();
 
-    if lifecycle == 0 && !has_scroll_event {
+    if !touchpad_down
+        && !touchpad_physical_up
+        && !touchpad_momentum_start
+        && !touchpad_up
+        && !has_scroll_event
+    {
         return;
     }
 
@@ -206,12 +222,19 @@ fn swipe_gesture(
     mark_physical_touch_end(touchpad_physical_up, scrolling.as_deref_mut());
     resume_touchpad_gesture(resumes_gesture, scrolling.as_deref_mut());
 
+    let direction_modifier = horizontal_direction_modifier(&config);
+    let initial_lifecycle = InitialTouchpadLifecycle {
+        physical_up: touchpad_physical_up,
+        up: touchpad_up,
+        direction_modifier,
+    };
     if touchpad_down && !has_scroll_event && scrolling.is_none() {
         insert_touchpad_begin_state(
             *entity,
             position.x,
             snap_enabled,
             paging_gesture,
+            initial_lifecycle,
             &mut commands,
         );
     }
@@ -220,8 +243,6 @@ fn swipe_gesture(
         // Preserve the established gesture-distance normalization. Paging
         // anchors themselves use the usable viewport below.
         let viewport_width = f64::from(active_display.bounds().width());
-        let direction_modifier = horizontal_direction_modifier(&config);
-
         let dt = time.delta_secs_f64();
         let new_velocity = if has_gesture_event && dt > 0.0 {
             gesture_delta * swipe_sensitivity / dt
@@ -272,15 +293,23 @@ fn swipe_gesture(
                 is_user_swiping: !touchpad_up && (touchpad_down || has_scroll_event),
                 gesture_active: touchpad_down && !touchpad_up,
                 paging_gesture,
-                edge_overscroll: overscroll::EdgeOverscroll::default(),
+                edge_overscroll: if starts_new_gesture {
+                    overscroll::EdgeOverscroll::armed()
+                } else {
+                    overscroll::EdgeOverscroll::default()
+                },
                 last_event: Instant::now(),
             };
             constrain_paging_motion(&mut scrolling, direction_modifier, true);
+            // Commands are deferred, so lifecycle handlers above could not
+            // mutate this brand-new component. Replay terminal phases before
+            // insertion; otherwise a short Began + delta + Ended batch leaves
+            // the rubber band armed and visually stuck.
+            apply_initial_touchpad_lifecycle(&mut scrolling, initial_lifecycle);
             entity_commands.try_insert(scrolling);
         }
     }
 
-    let direction_modifier = horizontal_direction_modifier(&config);
     finish_touchpad_gesture(touchpad_up, direction_modifier, scrolling.as_deref_mut());
 }
 
@@ -290,12 +319,12 @@ fn read_gesture_input(
     scroll_scale: f64,
 ) -> GestureInput {
     let mut input = GestureInput::default();
-    for event in messages.read() {
+    for (order, event) in messages.read().enumerate() {
         match event {
-            Event::TouchpadDown => input.lifecycle |= TOUCHPAD_DOWN,
-            Event::TouchpadPhysicalUp => input.lifecycle |= TOUCHPAD_PHYSICAL_UP,
-            Event::TouchpadMomentumStart => input.lifecycle |= TOUCHPAD_MOMENTUM_START,
-            Event::TouchpadUp => input.lifecycle |= TOUCHPAD_UP,
+            Event::TouchpadDown => input.touchpad_down = Some(order),
+            Event::TouchpadPhysicalUp => input.touchpad_physical_up = Some(order),
+            Event::TouchpadMomentumStart => input.touchpad_momentum_start = Some(order),
+            Event::TouchpadUp => input.touchpad_up = Some(order),
             Event::Scroll { delta } => {
                 *input.scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
             }
@@ -317,18 +346,30 @@ fn insert_touchpad_begin_state(
     position: i32,
     snap_enabled: bool,
     paging_gesture: Option<PagingGesture>,
+    lifecycle: InitialTouchpadLifecycle,
     commands: &mut Commands,
 ) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(Scrolling {
+        let mut scrolling = Scrolling {
             position: f64::from(position),
             snap_pending: snap_enabled,
             is_user_swiping: true,
             gesture_active: true,
             paging_gesture,
+            edge_overscroll: overscroll::EdgeOverscroll::armed(),
             ..Default::default()
-        });
+        };
+        apply_initial_touchpad_lifecycle(&mut scrolling, lifecycle);
+        entity_commands.try_insert(scrolling);
     }
+}
+
+fn apply_initial_touchpad_lifecycle(
+    scrolling: &mut Scrolling,
+    lifecycle: InitialTouchpadLifecycle,
+) {
+    mark_physical_touch_end(lifecycle.physical_up, Some(scrolling));
+    finish_touchpad_gesture(lifecycle.up, lifecycle.direction_modifier, Some(scrolling));
 }
 
 fn horizontal_direction_modifier(config: &Config) -> f64 {
@@ -374,7 +415,7 @@ fn begin_touchpad_gesture(
     scrolling: Option<&mut Scrolling>,
 ) {
     if starts_new_gesture && let Some(scrolling) = scrolling {
-        scrolling.edge_overscroll.cancel();
+        scrolling.edge_overscroll.rearm();
         scrolling.velocity = 0.0;
         scrolling.target_position = None;
         scrolling.snap_pending = snap_enabled;
@@ -389,6 +430,8 @@ fn resume_touchpad_gesture(resumes_gesture: bool, scrolling: Option<&mut Scrolli
     if resumes_gesture && let Some(scrolling) = scrolling {
         scrolling.snap_pending = true;
         scrolling.is_user_swiping = true;
+        // Momentum resumes the active paging session, while overscroll's
+        // physical-input latch remains closed independently after finger lift.
         scrolling.gesture_active = true;
         scrolling.last_event = Instant::now();
     }
@@ -398,8 +441,9 @@ fn mark_physical_touch_end(physical_up: bool, scrolling: Option<&mut Scrolling>)
     if physical_up && let Some(scrolling) = scrolling {
         scrolling.edge_overscroll.release();
         scrolling.gesture_active = false;
-        // Keep user-swiping true until either momentum starts or the inactivity
-        // fallback proves there will be no native momentum phase.
+        // Physical lift is not the terminal native-scroll phase: momentum may
+        // continue the same logical paging gesture, but it no longer owns the
+        // rubber band.
         scrolling.is_user_swiping = true;
         scrolling.last_event = Instant::now();
     }
@@ -425,7 +469,7 @@ fn finish_touchpad_gesture(
 pub(super) fn scrolling_needs_frame(scroll: &Scrolling) -> bool {
     scroll.target_position.is_some()
         || scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON
-        || scroll.edge_overscroll.is_active()
+        || scroll.edge_overscroll.needs_frame()
         || (!scroll.gesture_active && (scroll.is_user_swiping || scroll.snap_pending))
 }
 
@@ -506,10 +550,12 @@ fn update_swipe_timeout(
     viewport_width: f64,
 ) -> SwipeTimeoutOutcome {
     const MIN_VELOCITY_PX: f64 = 5.0;
+    if timed_out {
+        scroll.edge_overscroll.release();
+    }
     let emit_mouse_moved = timed_out && scroll.is_user_swiping;
     if emit_mouse_moved {
         scroll.is_user_swiping = false;
-        scroll.edge_overscroll.release();
     }
     SwipeTimeoutOutcome {
         emit_mouse_moved,
