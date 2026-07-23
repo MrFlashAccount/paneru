@@ -18,7 +18,7 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::{Origin, Window, WindowManager};
 use crate::platform::Modifiers;
-use crate::tests::TestHarness;
+use crate::tests::{TEST_PROCESS_ID, TestHarness};
 
 #[test]
 fn focus_target_prefers_the_most_visible_column_then_its_leading_edge() {
@@ -81,6 +81,10 @@ fn settled_scroll_focuses_visible_window_without_warping_cursor() {
                 entity
             };
             world.entity_mut(strip_entity).insert(Scrolling {
+                // This is above SCROLL_VELOCITY_EPSILON, but already below
+                // the cleanup threshold after multiplying by dt and viewport.
+                // Real touchpad gestures commonly finish in this band.
+                velocity: 0.01,
                 position: -176.0,
                 scroll_focus_origin: Some(scroll_focus_origin),
                 last_event: Instant::now()
@@ -157,7 +161,7 @@ snap_padding = 100
                 "captured origin must still own the focus marker"
             );
         })
-        .on_iteration(final_iteration, |world, _state| {
+        .on_iteration(final_iteration, |world, state| {
             let focused = {
                 let mut query =
                     world.query_filtered::<(&Window, Entity), With<FocusedMarker>>();
@@ -197,6 +201,11 @@ snap_padding = 100
             assert_eq!(
                 focused, 1,
                 "adjacent window should be focused after settling at strip offset {strip_position}; geometry={geometry:?}; scrolling={scrolling:?}"
+            );
+            assert_eq!(
+                state.focused_window_id(TEST_PROCESS_ID),
+                Some(1),
+                "the focus backend must confirm the adjacent window, not only update FocusedMarker"
             );
         })
         .run(commands);
