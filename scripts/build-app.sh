@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(/usr/bin/awk -F '"' '/^version = / { print $2; exit }' "$ROOT/Cargo.toml")}"
-BUILD_NUMBER="${PANERU_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-1}}"
+BUNDLE_VERSION="$("$ROOT/scripts/resolve-bundle-version.sh" "$VERSION")"
 BUILD_ARCHS="${PANERU_BUILD_ARCHS:-host}"
 BUILD_ROOT="$ROOT/.build/release"
 APP_DIR="$BUILD_ROOT/Paneru.app"
@@ -28,11 +28,6 @@ fi
 if ! command -v rustc >/dev/null 2>&1 && command -v rustup >/dev/null 2>&1; then
   RUSTC_BIN="$(rustup which rustc)"
   export PATH="$(dirname "$RUSTC_BIN"):$PATH"
-fi
-
-if [[ -z "$VERSION" ]]; then
-  echo "Unable to resolve the Paneru version." >&2
-  exit 1
 fi
 
 case "$BUILD_ARCHS" in
@@ -85,7 +80,7 @@ fi
 /usr/bin/ditto "$SPARKLE_FRAMEWORK" "$FRAMEWORKS_DIR/Sparkle.framework"
 
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$VERSION" "$CONTENTS_DIR/Info.plist"
-/usr/bin/plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
+/usr/bin/plutil -replace CFBundleVersion -string "$BUNDLE_VERSION" "$CONTENTS_DIR/Info.plist"
 
 if [[ "$BUILD_ARCHS" == universal ]]; then
   EXECUTABLE_ARCHS="$(/usr/bin/lipo -archs "$EXECUTABLE")"

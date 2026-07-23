@@ -36,6 +36,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test bundle version resolver
+        run: ./scripts/test-resolve-bundle-version.sh
+
       - name: Run Clippy
         run: cargo clippy --locked --bin paneru -- -D warnings
 

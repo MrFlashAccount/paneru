@@ -30,11 +30,15 @@ jobs:
           RAW_VERSION: ${{ inputs.version }}
         run: |
           version="${RAW_VERSION#v}"
-          if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+          if [[ "$version" == *-* ]]; then
             echo "Invalid version: $RAW_VERSION"
-            echo "Use a release version like 0.5.0 or v0.5.0."
+            echo "Release versions cannot contain a pre-release suffix."
             exit 1
           fi
+          ./scripts/resolve-bundle-version.sh "$version" >/dev/null || {
+            echo "Use a release version like 0.5.0 or v0.5.0."
+            exit 1
+          }
 
           echo "PANERU_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
@@ -78,12 +82,28 @@ jobs:
           echo "SPARKLE_DIR=$sparkle_dir" >> "$GITHUB_ENV"
           echo "SPARKLE_BIN=$sparkle_dir/bin" >> "$GITHUB_ENV"
 
-      - name: Build Apple Silicon app and DMG
+      - name: Build Apple Silicon app
         env:
           PANERU_BUILD_ARCHS: host
-          PANERU_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           ./scripts/build-app.sh "$PANERU_VERSION"
+
+      - name: Verify built app version
+        run: |
+          expected_bundle_version="$(./scripts/resolve-bundle-version.sh "$PANERU_VERSION")"
+          actual_short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
+          actual_bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")"
+          [[ "$actual_short_version" == "$PANERU_VERSION" ]] || {
+            echo "CFBundleShortVersionString is '$actual_short_version', expected '$PANERU_VERSION'."
+            exit 1
+          }
+          [[ "$actual_bundle_version" == "$expected_bundle_version" ]] || {
+            echo "CFBundleVersion is '$actual_bundle_version', expected '$expected_bundle_version'."
+            exit 1
+          }
+
+      - name: Package Apple Silicon app and DMG
+        run: |
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
           ./scripts/build-dmg.sh "$PANERU_VERSION"
@@ -120,6 +140,7 @@ jobs:
       - name: Verify release artifacts
         run: |
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")" == "$PANERU_VERSION" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")" == "$(./scripts/resolve-bundle-version.sh "$PANERU_VERSION")" ]]
           executable_archs="$(lipo -archs "$APP_PATH/Contents/MacOS/paneru")"
           [[ "$executable_archs" == "arm64" ]]
           framework_archs="$(lipo -archs "$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle")"
