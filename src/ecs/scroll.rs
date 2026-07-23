@@ -160,14 +160,24 @@ fn swipe_gesture(
             || scrolling.snap_pending
             || scrolling.paging_gesture.is_some()
     });
-    let resumes_gesture = has_active_session && (touchpad_down || touchpad_momentum_start);
-    let starts_new_gesture = (touchpad_down && !has_active_session)
-        || (!has_active_session
+    let settling_motion_in_flight = scrolling.as_ref().is_some_and(|scrolling| {
+        !scrolling.gesture_active
+            && !scrolling.is_user_swiping
+            && scrolling.target_position.is_some()
+    });
+    // A fresh physical contact always starts a new gesture, even when the
+    // previous snap animation or momentum has not ended yet. Reusing that old
+    // paging session would keep its consumed edge as the one-hop bound and make
+    // the first swipe towards the next window a no-op. `TouchpadDown` is
+    // emitted only for AppKit's Began phase, not for Changed events.
+    let starts_new_gesture = touchpad_down
+        || ((!has_active_session || settling_motion_in_flight)
             && has_scroll_event
             && !touchpad_momentum_start
             && scrolling
                 .as_ref()
                 .is_none_or(|scrolling| !scrolling.is_user_swiping));
+    let resumes_gesture = has_active_session && touchpad_momentum_start && !starts_new_gesture;
     let viewport = active_display.actual_bounds(&config);
     let paging_gesture = (config.swipe_paging() && starts_new_gesture)
         .then(|| {
@@ -191,7 +201,7 @@ fn swipe_gesture(
     // AppKit can report physical Ended and momentum Began together. Apply the
     // physical end first so the momentum phase remains the final state.
     mark_physical_touch_end(touchpad_physical_up, scrolling.as_deref_mut());
-    resume_touchpad_gesture(resumes_gesture, touchpad_down, scrolling.as_deref_mut());
+    resume_touchpad_gesture(resumes_gesture, scrolling.as_deref_mut());
 
     if touchpad_down && !has_scroll_event && scrolling.is_none() {
         insert_touchpad_begin_state(
@@ -339,7 +349,16 @@ fn current_paging_gesture(
             column.width(&get_window_frame)?,
         ))
     });
-    let current_position = scrolling.map_or(f64::from(position.x), |scrolling| scrolling.position);
+    let current_position = scrolling.map_or(f64::from(position.x), |scrolling| {
+        if !scrolling.gesture_active && !scrolling.is_user_swiping {
+            // Between gestures, the constrained target is the logical
+            // continuation point even while the visual integrator is still
+            // converging and snap selection remains pending.
+            scrolling.target_position.unwrap_or(scrolling.position)
+        } else {
+            scrolling.position
+        }
+    });
     capture_paging_gesture(current_position, viewport, columns)
 }
 
@@ -361,15 +380,8 @@ fn begin_touchpad_gesture(
     }
 }
 
-fn resume_touchpad_gesture(
-    resumes_gesture: bool,
-    interrupts_target: bool,
-    scrolling: Option<&mut Scrolling>,
-) {
+fn resume_touchpad_gesture(resumes_gesture: bool, scrolling: Option<&mut Scrolling>) {
     if resumes_gesture && let Some(scrolling) = scrolling {
-        if interrupts_target {
-            scrolling.target_position = None;
-        }
         scrolling.snap_pending = true;
         scrolling.is_user_swiping = true;
         scrolling.gesture_active = true;

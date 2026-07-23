@@ -6,8 +6,8 @@ use bevy::prelude::Entity;
 use bevy::time::TimeUpdateStrategy;
 
 use super::{
-    Scrolling, SnapMode, resume_touchpad_gesture, smooth_native_scroll, snap_mode,
-    sticky_edge_snap_target,
+    Scrolling, SnapMode, begin_touchpad_gesture, resume_touchpad_gesture, smooth_native_scroll,
+    snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
 use crate::ecs::{ActiveWorkspaceMarker, Position};
@@ -38,14 +38,14 @@ fn momentum_resume_preserves_target_but_new_touch_interrupts_it() {
         ..Default::default()
     };
 
-    resume_touchpad_gesture(true, false, Some(&mut scrolling));
+    resume_touchpad_gesture(true, Some(&mut scrolling));
     assert_eq!(
         scrolling.target_position,
         Some(-320.0),
         "momentum must continue extending the in-flight native-scroll target"
     );
 
-    resume_touchpad_gesture(true, true, Some(&mut scrolling));
+    begin_touchpad_gesture(true, true, true, None, Some(&mut scrolling));
     assert_eq!(
         scrolling.target_position, None,
         "a new physical touch must interrupt the previous target"
@@ -303,29 +303,93 @@ fn later_native_momentum_keeps_original_one_hop_paging_session() {
 }
 
 #[test]
-fn touchpad_down_during_pending_settlement_does_not_recapture_stop() {
+fn touchpad_down_during_pending_snap_starts_from_reached_stop() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(crate::commands::Operation::SetWidth(2.0)),
         },
         Event::TouchpadDown,
-        Event::Scroll { delta: -100.0 },
-        Event::TouchpadPhysicalUp,
-        Event::TouchpadDown,
+        Event::Scroll { delta: 100.0 },
     ];
     TestHarness::new()
-        .with_windows(1)
-        .on_iteration(2, |world, _state| {
-            assert_original_oversized_paging_session(world);
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            insert_pending_snap_to_first_edge(world, false);
         })
-        .on_iteration(5, |world, _state| {
-            assert_original_oversized_paging_session(world);
-            let (_, _, _, gesture_active, is_user_swiping) = paging_snapshot(world);
+        .on_iteration(2, |world, _state| {
+            let (paging, _, target_position, gesture_active, is_user_swiping) =
+                paging_snapshot(world);
+            assert_eq!(paging.start_stop, -1024.0);
+            assert_eq!(paging.previous_stop, Some(0.0));
+            assert!(paging.next_stop.is_some_and(|stop| stop < -1024.0));
+            assert_eq!(target_position, None);
             assert!(gesture_active);
             assert!(is_user_swiping);
         })
+        .on_iteration(3, |world, _state| {
+            let (paging, position, target_position, _, _) = paging_snapshot(world);
+            assert_eq!(paging.start_stop, -1024.0);
+            assert!(
+                position < -1024.0 || target_position.is_some_and(|target| target < -1024.0),
+                "the first swipe of the new gesture must advance past the consumed edge"
+            );
+        })
         .run(commands);
+}
+
+#[test]
+fn scroll_delta_during_pending_snap_advances_without_waiting_for_animation() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(crate::commands::Operation::SetWidth(2.0)),
+        },
+        // Model a phase-less wheel tick or a batch where physical Began was
+        // not observed separately from motion.
+        Event::Scroll { delta: 100.0 },
+    ];
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            insert_pending_snap_to_first_edge(world, true);
+        })
+        .on_iteration(2, |world, _state| {
+            let (paging, position, target_position, _, is_user_swiping) = paging_snapshot(world);
+            assert_eq!(paging.start_stop, -1024.0);
+            assert!(paging.next_stop.is_some_and(|stop| stop < -1024.0));
+            assert!(
+                position < -1024.0 || target_position.is_some_and(|target| target < -1024.0),
+                "scroll input during snap animation must advance immediately"
+            );
+            assert!(is_user_swiping);
+        })
+        .run(commands);
+}
+
+fn insert_pending_snap_to_first_edge(world: &mut bevy::prelude::World, snap_pending: bool) {
+    let entity = {
+        let mut query = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        query.single(world).expect("one active workspace")
+    };
+    world
+        .entity_mut(entity)
+        .get_mut::<Position>()
+        .expect("active workspace position")
+        .0
+        .x = -900;
+    world.entity_mut(entity).insert(Scrolling {
+        position: -900.0,
+        target_position: Some(-1024.0),
+        snap_pending,
+        paging_gesture: Some(crate::ecs::PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-1024.0),
+            release_velocity: 0.0,
+        }),
+        ..Default::default()
+    });
 }
 
 #[test]
