@@ -63,11 +63,13 @@ pub mod workspace;
 pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<persistence::PersistenceState>()
         .init_resource::<runtime::SyntheticEventPending>();
-    let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
-        scrolling
-            .iter()
-            .next()
-            .is_none_or(|marker| !marker.is_user_swiping)
+    let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>,
+                       overscroll: Query<(), With<EdgeOverscrollVisual>>| {
+        overscroll.is_empty()
+            && scrolling
+                .iter()
+                .next()
+                .is_none_or(|marker| !marker.is_user_swiping)
     };
     let dimming_enabled = |config: Option<Res<Config>>| {
         config
@@ -259,23 +261,51 @@ pub struct ReshuffleAroundMarker;
 #[derive(Component)]
 pub struct EnsureVisibleMarker;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeOverscrollPhase {
+    Applied,
+    RestoreQueued,
+}
+
+/// Per-strip ownership of a transient visual edge offset.
+///
+/// `Position` remains the authored, persistable strip position. Layout uses
+/// this component only while its authored position still matches, so a
+/// workspace/display move supersedes overscroll instead of being undone by
+/// cleanup.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct EdgeOverscrollVisual {
+    pub(crate) authored_position: Origin,
+    pub(crate) offset: i32,
+    pub(crate) phase: EdgeOverscrollPhase,
+}
+
+impl EdgeOverscrollVisual {
+    pub(crate) fn effective_position(self, authored_position: Origin) -> Origin {
+        if authored_position == self.authored_position {
+            authored_position.with_x(authored_position.x + self.offset)
+        } else {
+            authored_position
+        }
+    }
+}
+
 #[derive(Component, Debug)]
 pub struct Scrolling {
     pub velocity: f64,
     pub position: f64,
-    /// Target supplied by native modifier-scroll events. The current position
-    /// follows it over a few frames so discrete event delivery is not visible.
+    /// Native modifier-scroll target, followed over a few frames to smooth event delivery.
     pub target_position: Option<f64>,
     /// A physical gesture ended and still needs to choose its sticky anchor.
     pub snap_pending: bool,
     /// Movement is still being supplied by the user or native scroll stream.
     pub is_user_swiping: bool,
-    /// An explicit trackpad begin event has not yet received its matching end.
-    /// This prevents the inactivity fallback from ending a paused gesture.
+    /// An explicit trackpad begin is awaiting its end, blocking inactivity fallback.
     pub gesture_active: bool,
     /// One-hop paging bounds and release decision captured for this gesture.
     pub paging_gesture: Option<PagingGesture>,
-    /// Last time a physical swipe event was received.
+    /// Transient edge-only visual displacement; logical and persisted positions stay clamped.
+    pub(crate) edge_overscroll: scroll::overscroll::EdgeOverscroll,
     pub last_event: Instant,
 }
 
@@ -289,6 +319,7 @@ impl Default for Scrolling {
             is_user_swiping: false,
             gesture_active: false,
             paging_gesture: None,
+            edge_overscroll: scroll::overscroll::EdgeOverscroll::default(),
             last_event: Instant::now(),
         }
     }

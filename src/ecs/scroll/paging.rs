@@ -60,13 +60,25 @@ pub(super) fn capture_gesture(
     })
 }
 
-pub(super) fn constrain_motion(scrolling: &mut Scrolling, direction_modifier: f64) {
+pub(super) fn constrain_motion(
+    scrolling: &mut Scrolling,
+    direction_modifier: f64,
+    user_input: bool,
+) {
     let Some(paging) = scrolling.paging_gesture else {
         return;
     };
     let lower = paging.next_stop.unwrap_or(paging.start_stop);
     let upper = paging.previous_stop.unwrap_or(paging.start_stop);
     let previous_position = scrolling.position;
+    let attempted_position = scrolling.target_position.unwrap_or(scrolling.position);
+    let constrained_position = attempted_position.clamp(lower, upper);
+    update_edge_overscroll(
+        scrolling,
+        attempted_position - constrained_position,
+        paging,
+        user_input,
+    );
     scrolling.position = scrolling.position.clamp(lower, upper);
     if let Some(target) = scrolling.target_position.as_mut() {
         *target = target.clamp(lower, upper);
@@ -77,6 +89,23 @@ pub(super) fn constrain_motion(scrolling: &mut Scrolling, direction_modifier: f6
         || (previous_position > upper && coordinate_velocity > 0.0)
     {
         scrolling.velocity = 0.0;
+    }
+}
+
+fn update_edge_overscroll(
+    scrolling: &mut Scrolling,
+    overflow: f64,
+    paging: PagingGesture,
+    user_input: bool,
+) {
+    let at_application_edge = overflow > 0.0 && paging.previous_stop.is_none()
+        || overflow < 0.0 && paging.next_stop.is_none();
+    if overflow == 0.0 {
+        if user_input && scrolling.edge_overscroll.is_active() {
+            scrolling.edge_overscroll.cancel();
+        }
+    } else if user_input && at_application_edge {
+        scrolling.edge_overscroll.apply_outward_input(overflow);
     }
 }
 
@@ -186,6 +215,7 @@ mod tests {
     use bevy::math::IRect;
 
     use super::{capture_gesture, constrain_motion, ready_to_snap, snap_stops, snap_target};
+    use crate::ecs::scroll::overscroll::EDGE_OVERSCROLL_MAX;
     use crate::ecs::{PagingGesture, Scrolling};
 
     #[test]
@@ -249,7 +279,7 @@ mod tests {
             paging_gesture: Some(paging),
             ..Default::default()
         };
-        constrain_motion(&mut towards_previous, 1.0);
+        constrain_motion(&mut towards_previous, 1.0, false);
         assert_eq!(towards_previous.position, -600.0);
         assert_eq!(towards_previous.target_position, Some(-600.0));
 
@@ -260,7 +290,7 @@ mod tests {
             paging_gesture: Some(paging),
             ..Default::default()
         };
-        constrain_motion(&mut towards_next, 1.0);
+        constrain_motion(&mut towards_next, 1.0, false);
         assert_eq!(towards_next.position, -1100.0);
         assert_eq!(towards_next.target_position, Some(-1100.0));
     }
@@ -274,7 +304,7 @@ mod tests {
             paging_gesture: Some(gesture()),
             ..Default::default()
         };
-        constrain_motion(&mut scrolling, 1.0);
+        constrain_motion(&mut scrolling, 1.0, false);
         assert_eq!(
             (
                 scrolling.position,
@@ -287,7 +317,7 @@ mod tests {
         scrolling.position = 5000.0;
         scrolling.target_position = Some(4000.0);
         scrolling.velocity = 2.0;
-        constrain_motion(&mut scrolling, 1.0);
+        constrain_motion(&mut scrolling, 1.0, false);
         assert_eq!(
             (
                 scrolling.position,
@@ -358,6 +388,141 @@ mod tests {
         assert!(!ready_to_snap(&scrolling));
         scrolling.velocity = 0.5;
         assert!(ready_to_snap(&scrolling));
+    }
+
+    #[test]
+    fn both_application_edges_resist_outward_motion_without_moving_logical_state() {
+        for (paging, attempted, sign) in [
+            (
+                PagingGesture {
+                    start_stop: 0.0,
+                    previous_stop: None,
+                    next_stop: Some(-600.0),
+                    release_velocity: 0.0,
+                },
+                120.0,
+                1.0,
+            ),
+            (
+                PagingGesture {
+                    start_stop: -600.0,
+                    previous_stop: Some(0.0),
+                    next_stop: None,
+                    release_velocity: 0.0,
+                },
+                -720.0,
+                -1.0,
+            ),
+        ] {
+            let mut scrolling = Scrolling {
+                position: attempted,
+                target_position: Some(attempted),
+                paging_gesture: Some(paging),
+                ..Default::default()
+            };
+            constrain_motion(&mut scrolling, 1.0, true);
+            assert_eq!(scrolling.position, paging.start_stop);
+            assert_eq!(scrolling.target_position, Some(paging.start_stop));
+            assert_eq!(scrolling.edge_overscroll.visual().signum(), sign);
+            assert!(scrolling.edge_overscroll.visual().abs() < EDGE_OVERSCROLL_MAX);
+        }
+    }
+
+    #[test]
+    fn resistance_is_nonlinear_and_capped() {
+        let paging = PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        };
+        let mut scrolling = Scrolling {
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        let mut offsets = Vec::new();
+        for delta in [12.0, 24.0, 96.0, 10_000.0] {
+            scrolling.position = delta;
+            constrain_motion(&mut scrolling, 1.0, true);
+            offsets.push(scrolling.edge_overscroll.visual());
+        }
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(offsets[1] - offsets[0] > offsets[3] - offsets[2]);
+        assert!(offsets[3] <= EDGE_OVERSCROLL_MAX);
+    }
+
+    #[test]
+    fn release_returns_monotonically_and_settles_in_about_nine_sixty_hz_frames() {
+        let paging = PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        };
+        let mut scrolling = Scrolling {
+            position: 10_000.0,
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        constrain_motion(&mut scrolling, 1.0, true);
+        scrolling.edge_overscroll.release();
+        let mut frames = 0;
+        let mut previous = scrolling.edge_overscroll.visual();
+        while scrolling.edge_overscroll.visual() != 0.0 {
+            scrolling.edge_overscroll.integrate(1.0 / 60.0);
+            assert!(scrolling.edge_overscroll.visual().abs() <= previous.abs());
+            previous = scrolling.edge_overscroll.visual();
+            frames += 1;
+        }
+        assert!((8..=9).contains(&frames), "settled after {frames} frames");
+        assert_eq!(scrolling.edge_overscroll.visual(), 0.0);
+        scrolling.edge_overscroll.mark_restored();
+        assert!(!scrolling.edge_overscroll.is_active());
+    }
+
+    #[test]
+    fn inward_input_cancels_overscroll_and_resumes_logical_motion() {
+        let paging = PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        };
+        let mut scrolling = Scrolling {
+            position: 80.0,
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        constrain_motion(&mut scrolling, 1.0, true);
+        assert!(scrolling.edge_overscroll.visual() > 0.0);
+
+        scrolling.position = -40.0;
+        constrain_motion(&mut scrolling, 1.0, true);
+        assert_eq!(scrolling.position, -40.0);
+        assert_eq!(scrolling.edge_overscroll.visual(), 0.0);
+        scrolling.edge_overscroll.mark_restored();
+        assert!(!scrolling.edge_overscroll.is_active());
+    }
+
+    #[test]
+    fn cancel_clears_all_transient_motion() {
+        let paging = PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        };
+        let mut scrolling = Scrolling {
+            position: 120.0,
+            paging_gesture: Some(paging),
+            ..Default::default()
+        };
+        constrain_motion(&mut scrolling, 1.0, true);
+        scrolling.edge_overscroll.release();
+        scrolling.edge_overscroll.cancel();
+        assert_eq!(scrolling.edge_overscroll.visual(), 0.0);
+        scrolling.edge_overscroll.mark_restored();
+        assert!(!scrolling.edge_overscroll.is_active());
     }
 
     fn gesture() -> PagingGesture {

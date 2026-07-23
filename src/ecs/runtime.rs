@@ -13,9 +13,9 @@ use bevy::ecs::system::{NonSend, NonSendMut, Query, Res, ResMut, SystemParam};
 use bevy::time::{Real, Time};
 
 use super::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FlashMessage, FocusedMarker, FreshMarker,
-    Initializing, RefreshWindowSizes, RepositionMarker, ResizeMarker, RetryFrontSwitch, Scrolling,
-    Timeout, Unmanaged, VerifyWindowPosition, WindowDisposition,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, EdgeOverscrollVisual, FlashMessage, FocusedMarker,
+    FreshMarker, Initializing, RefreshWindowSizes, RepositionMarker, ResizeMarker,
+    RetryFrontSwitch, Scrolling, Timeout, Unmanaged, VerifyWindowPosition, WindowDisposition,
 };
 use crate::ecs::observation::ObserverDetachRetry;
 use crate::events::{Event, EventReceiver};
@@ -160,6 +160,7 @@ pub(super) struct RuntimeWork<'w, 's> {
         With<ResizeMarker>,
     >,
     scrolling: Query<'w, 's, &'static Scrolling>,
+    edge_overscroll_visuals: Query<'w, 's, (), With<EdgeOverscrollVisual>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     timeouts: Query<'w, 's, &'static Timeout>,
     fresh_polls: Query<'w, 's, &'static FreshPollDeadline, With<FreshMarker>>,
@@ -262,6 +263,7 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
             .scrolling
             .iter()
             .any(super::scroll::scrolling_needs_frame)
+            || !work.edge_overscroll_visuals.is_empty()
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -405,8 +407,12 @@ mod tests {
         ACTIVE_FRAME_INTERVAL, FreshPollDeadline, RuntimeActivity, RuntimeWork,
         SyntheticEventPending, pump_receiver, runtime_activity, should_resync_real_time_after_wait,
     };
-    use crate::ecs::{ActiveWorkspaceMarker, RefreshWindowSizes, Scrolling, SendMessageTrigger};
+    use crate::ecs::{
+        ActiveWorkspaceMarker, EdgeOverscrollPhase, EdgeOverscrollVisual, RefreshWindowSizes,
+        Scrolling, SendMessageTrigger,
+    };
     use crate::events::{Event, EventReceiver, EventSender};
+    use crate::manager::Origin;
     use crate::platform::Modifiers;
     use bevy::app::{App, First, PostUpdate, PreUpdate, Update};
     use bevy::ecs::message::{MessageReader, MessageWriter, Messages};
@@ -636,6 +642,29 @@ mod tests {
                 "velocity, target settlement, and actionable snapping need display frames"
             );
         }
+    }
+
+    #[test]
+    fn queued_overscroll_restore_requests_a_display_frame_without_scrolling() {
+        let mut app = App::new();
+        app.init_resource::<CapturedActivity>()
+            .add_systems(Update, capture_activity);
+        app.world_mut().spawn(EdgeOverscrollVisual {
+            authored_position: Origin::new(40, 20),
+            offset: 0,
+            phase: EdgeOverscrollPhase::RestoreQueued,
+        });
+
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<CapturedActivity>()
+                .0
+                .unwrap()
+                .frame_work,
+            "runtime must keep one frame for canonical layout after Scrolling is removed"
+        );
     }
 
     #[derive(Resource, Default)]

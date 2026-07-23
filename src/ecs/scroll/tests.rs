@@ -1,17 +1,20 @@
 use std::time::{Duration, Instant};
 
-use bevy::ecs::query::With;
+use bevy::ecs::query::{Has, With};
 use bevy::math::IRect;
 use bevy::prelude::Entity;
 use bevy::time::TimeUpdateStrategy;
+use objc2_core_foundation::CGPoint;
 
 use super::{
-    Scrolling, SnapMode, begin_touchpad_gesture, resume_touchpad_gesture, smooth_native_scroll,
-    snap_mode, sticky_edge_snap_target,
+    Scrolling, SnapMode, begin_touchpad_gesture, resume_touchpad_gesture, scrolling_needs_frame,
+    smooth_native_scroll, snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
-use crate::ecs::{ActiveWorkspaceMarker, Position};
+use crate::ecs::{ActiveWorkspaceMarker, EdgeOverscrollVisual, Position, VerifyWindowPosition};
 use crate::events::Event;
+use crate::manager::Window;
+use crate::platform::Modifiers;
 use crate::tests::TestHarness;
 
 #[test]
@@ -50,6 +53,162 @@ fn momentum_resume_preserves_target_but_new_touch_interrupts_it() {
         scrolling.target_position, None,
         "a new physical touch must interrupt the previous target"
     );
+}
+
+#[test]
+fn settled_overscroll_does_not_request_more_frames() {
+    let mut scrolling = Scrolling {
+        position: 80.0,
+        paging_gesture: Some(crate::ecs::PagingGesture {
+            start_stop: 0.0,
+            previous_stop: None,
+            next_stop: Some(-600.0),
+            release_velocity: 0.0,
+        }),
+        ..Default::default()
+    };
+    assert!(!scrolling_needs_frame(&scrolling));
+
+    super::paging::constrain_motion(&mut scrolling, 1.0, true);
+    assert!(scrolling_needs_frame(&scrolling));
+
+    scrolling.edge_overscroll.cancel();
+    scrolling.edge_overscroll.mark_restored();
+    assert!(!scrolling_needs_frame(&scrolling));
+}
+
+#[test]
+fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::TouchpadDown,
+        Event::Scroll { delta: -100.0 },
+        Event::TouchpadUp,
+    ];
+    commands.extend((0..10).map(|_| Event::Command {
+        command: Command::PrintState,
+    }));
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, _state| {
+            world.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )));
+        })
+        .on_iteration(2, |world, state| {
+            let mut strip =
+                world.query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>();
+            let (position, scrolling) = strip.single(world).expect("active scrolling workspace");
+            assert_eq!(position.x, 0, "persisted strip position stays at the edge");
+            assert_eq!(scrolling.position, 0.0);
+            assert!(
+                scrolling.target_position.is_none_or(|target| target == 0.0),
+                "any remaining logical target stays clamped to the real edge"
+            );
+            let visual = scrolling.edge_overscroll.visual().round() as i32;
+            assert!(visual > 0);
+
+            let mut windows =
+                world.query::<(Entity, &Window, &Position, Has<VerifyWindowPosition>)>();
+            assert!(
+                windows
+                    .iter(world)
+                    .all(|(_, window, position, _)| window.frame().min == position.0),
+                "transient window positions use the ordinary verified commit path"
+            );
+            assert!(
+                windows
+                    .iter(world)
+                    .any(|(_, _, position, _)| position.x == visual),
+                "layout materializes the transient offset without changing strip Position"
+            );
+            assert!(
+                windows.iter(world).any(|(_, _, _, verifying)| verifying),
+                "transient commits participate in the shared position verifier"
+            );
+            let delayed_position = windows
+                .iter(world)
+                .find_map(|(_, window, position, _)| (window.id() == 0).then_some(position.0))
+                .expect("first window has a transient position");
+            state.os_move_window(0, delayed_position);
+        })
+        .on_iteration(13, |world, _state| {
+            let mut strip =
+                world.query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>();
+            let (position, scrolling) = strip.single(world).expect("active scrolling workspace");
+            assert_eq!(position.x, 0);
+            assert_eq!(scrolling.position, 0.0);
+            assert!(!scrolling.edge_overscroll.is_active());
+
+            let mut windows = world.query::<(&Window, &Position)>();
+            assert!(
+                windows
+                    .iter(world)
+                    .all(|(window, position)| window.frame().min == position.0),
+                "settlement restores exact authored window positions"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn mouse_down_removal_gets_a_zero_offset_restore_frame() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::TouchpadDown,
+        Event::Scroll { delta: -100.0 },
+        Event::MouseDown {
+            point: CGPoint::new(100.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, _state| {
+            world.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )));
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                world
+                    .query::<&EdgeOverscrollVisual>()
+                    .iter(world)
+                    .next()
+                    .is_some(),
+                "edge gesture claims visual ownership before mouse cancellation"
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            assert!(
+                world
+                    .query::<&EdgeOverscrollVisual>()
+                    .iter(world)
+                    .next()
+                    .is_none(),
+                "mouse-down cancellation completes the two-phase restore"
+            );
+            assert!(world.query::<&Scrolling>().iter(world).next().is_none());
+            let mut strip = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+            assert_eq!(
+                strip.single(world).expect("active strip").x,
+                0,
+                "persisted strip position never contains the transient offset"
+            );
+            let mut windows = world.query::<(&Window, &Position)>();
+            assert!(
+                windows
+                    .iter(world)
+                    .all(|(window, position)| window.frame().min == position.0),
+                "final AX and authored window positions are canonical"
+            );
+        })
+        .run(commands);
 }
 
 #[test]

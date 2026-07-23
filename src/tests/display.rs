@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, DockPosition, RefreshWindowSizes, Timeout};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size};
+use crate::manager::{Display, Origin, Size, WindowManager};
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
 
 use super::*;
@@ -320,9 +320,13 @@ fn test_mouse_to_next_display() {
             data.frame = frame;
         })
         .on_iteration(1, move |world, state| {
-            let entity = find_window_entity(100, world);
-            let window = world.get::<Window>(entity).expect("need window");
-            assert_eq!(state.cursor_position(), window.frame().center());
+            let initial_cursor = Origin::new(10, 30);
+            world.resource::<WindowManager>().warp_mouse(initial_cursor);
+            assert_eq!(
+                state.cursor_position(),
+                initial_cursor,
+                "ordinary focus must not move the cursor by default"
+            );
         })
         .on_iteration(3, move |world, state| {
             let mut query = world.query::<(&Display, Option<&DockPosition>)>();
