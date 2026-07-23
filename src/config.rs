@@ -63,6 +63,7 @@ const DEFAULT_CONFIGURATION: &str = r#"# Paneru configuration
 preset_column_widths = [0.5, 0.75, 1.0, 1.5, 2.0]
 window_resize_cycle = false
 focus_follows_mouse = false
+mouse_follows_focus = false
 
 [swipe]
 sensitivity = 0.20
@@ -880,11 +881,11 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
-    /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
-    /// If the configuration option is not set, it defaults to `true`.
+    /// Returns `true` only when moving the cursor with keyboard-driven focus is explicitly enabled.
     pub fn mouse_follows_focus(&self) -> bool {
-        // Default is enabled.
-        self.options().mouse_follows_focus.is_none_or(|mff| mff)
+        self.options()
+            .mouse_follows_focus
+            .is_some_and(|enabled| enabled)
     }
 
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {
@@ -2091,6 +2092,7 @@ fn test_parse_hex_color_malformed_hex() {
 fn test_config_defaults() {
     let config = Config::default();
     assert!(!config.focus_follows_mouse());
+    assert!(!config.mouse_follows_focus());
     assert_eq!(config.dim_inactive_opacity(), 0.0);
     assert_eq!(config.dim_inactive_color(), (0.0, 0.0, 0.0));
     assert!(!config.border_active_window());
@@ -2105,6 +2107,14 @@ fn test_config_defaults() {
     assert_eq!(config.border_radius(), expected_radius);
     assert_eq!(config.menubar_height(), None);
     assert_eq!(config.snap_padding(), 32);
+}
+
+#[test]
+fn test_mouse_follows_focus_is_opt_in() {
+    let enabled = Config::try_from("[options]\nmouse_follows_focus = true\n\n[bindings]\n")
+        .expect("mouse-follows-focus config should parse");
+
+    assert!(enabled.mouse_follows_focus());
 }
 
 #[test]

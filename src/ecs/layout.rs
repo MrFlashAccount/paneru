@@ -15,8 +15,9 @@ use tracing::{Level, instrument, trace};
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    Position, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EdgeOverscrollVisual, EnsureVisibleMarker,
+    Initializing, LayoutPosition, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
+    SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -1121,10 +1122,10 @@ fn ensure_visible_in_strip(
 
 /// Reacts to changes in the position of the `LayoutStrip` to Display, and if changed,
 /// marks all the windows in the strip as requiring re-positioning.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_strips(
-    moved_strips: Populated<&LayoutStrip, Changed<Position>>,
+    moved_strips: Populated<&LayoutStrip, Or<(Changed<Position>, Changed<EdgeOverscrollVisual>)>>,
     mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
 ) {
     for strip in moved_strips {
@@ -1256,7 +1257,16 @@ fn position_layout_windows(
         (Entity, &Window, &LayoutPosition, &mut Position, &mut Bounds),
         (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
     >,
-    workspaces: Query<(&LayoutStrip, &Position, Has<Scrolling>, &ChildOf), With<LayoutStrip>>,
+    workspaces: Query<
+        (
+            &LayoutStrip,
+            &Position,
+            Option<&EdgeOverscrollVisual>,
+            Has<Scrolling>,
+            &ChildOf,
+        ),
+        With<LayoutStrip>,
+    >,
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
     mut commands: Commands,
@@ -1264,12 +1274,15 @@ fn position_layout_windows(
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
-    for (layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
+    for (layout_strip, Position(strip_position), overscroll, swiping, child_of) in &workspaces {
+        let strip_position = overscroll.copied().map_or(*strip_position, |visual| {
+            visual.effective_position(*strip_position)
+        });
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
-            *strip_position,
-            swiping,
+            strip_position,
+            swiping || overscroll.is_some(),
             child_of.parent(),
         );
     }

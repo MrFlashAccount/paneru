@@ -24,7 +24,11 @@ use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
 use crate::platform::Modifiers;
 
+mod motion;
+pub(crate) mod overscroll;
 mod paging;
+use motion::{reconcile_integrated_position, smooth_native_scroll};
+use overscroll::apply_edge_overscroll;
 use paging::{
     capture_gesture as capture_paging_gesture, constrain_motion as constrain_paging_motion,
     ready_to_snap as scrolling_ready_to_snap, snap_target as paging_snap_target,
@@ -32,8 +36,6 @@ use paging::{
 
 pub struct ScrollEventsPlugin;
 
-const NATIVE_SCROLL_RESPONSE_SECONDS: f64 = 0.04;
-const NATIVE_SCROLL_SETTLE_PX: f64 = 0.25;
 const SCROLL_VELOCITY_EPSILON: f64 = 0.0001;
 const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
 const STALE_GESTURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,6 +89,7 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
+                    apply_edge_overscroll,
                     swiping_timeout,
                 )
                     .chain()
@@ -257,7 +260,7 @@ fn swipe_gesture(
                 let target = scrolling.target_position.unwrap_or(scrolling.position);
                 scrolling.target_position = Some(target + scroll_distance);
             }
-            constrain_paging_motion(scrolling, direction_modifier);
+            constrain_paging_motion(scrolling, direction_modifier, true);
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             let initial_position = f64::from(position.0.x) + gesture_distance;
             let mut scrolling = Scrolling {
@@ -269,9 +272,10 @@ fn swipe_gesture(
                 is_user_swiping: !touchpad_up && (touchpad_down || has_scroll_event),
                 gesture_active: touchpad_down && !touchpad_up,
                 paging_gesture,
+                edge_overscroll: overscroll::EdgeOverscroll::default(),
                 last_event: Instant::now(),
             };
-            constrain_paging_motion(&mut scrolling, direction_modifier);
+            constrain_paging_motion(&mut scrolling, direction_modifier, true);
             entity_commands.try_insert(scrolling);
         }
     }
@@ -370,6 +374,7 @@ fn begin_touchpad_gesture(
     scrolling: Option<&mut Scrolling>,
 ) {
     if starts_new_gesture && let Some(scrolling) = scrolling {
+        scrolling.edge_overscroll.cancel();
         scrolling.velocity = 0.0;
         scrolling.target_position = None;
         scrolling.snap_pending = snap_enabled;
@@ -391,6 +396,7 @@ fn resume_touchpad_gesture(resumes_gesture: bool, scrolling: Option<&mut Scrolli
 
 fn mark_physical_touch_end(physical_up: bool, scrolling: Option<&mut Scrolling>) {
     if physical_up && let Some(scrolling) = scrolling {
+        scrolling.edge_overscroll.release();
         scrolling.gesture_active = false;
         // Keep user-swiping true until either momentum starts or the inactivity
         // fallback proves there will be no native momentum phase.
@@ -407,6 +413,7 @@ fn finish_touchpad_gesture(
     // Momentum can keep moving afterwards, but sticky selection starts only
     // after both the gesture and any remaining target/velocity have settled.
     if touchpad_up && let Some(scrolling) = scrolling {
+        scrolling.edge_overscroll.release();
         if let Some(paging) = scrolling.paging_gesture.as_mut() {
             paging.release_velocity = scrolling.velocity * direction_modifier;
         }
@@ -418,6 +425,7 @@ fn finish_touchpad_gesture(
 pub(super) fn scrolling_needs_frame(scroll: &Scrolling) -> bool {
     scroll.target_position.is_some()
         || scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON
+        || scroll.edge_overscroll.is_active()
         || (!scroll.gesture_active && (scroll.is_user_swiping || scroll.snap_pending))
 }
 
@@ -440,6 +448,7 @@ fn expire_stale_gesture(scroll: &mut Scrolling, now: Instant) -> bool {
     {
         scroll.gesture_active = false;
         scroll.is_user_swiping = false;
+        scroll.edge_overscroll.release();
         true
     } else {
         false
@@ -500,12 +509,14 @@ fn update_swipe_timeout(
     let emit_mouse_moved = timed_out && scroll.is_user_swiping;
     if emit_mouse_moved {
         scroll.is_user_swiping = false;
+        scroll.edge_overscroll.release();
     }
     SwipeTimeoutOutcome {
         emit_mouse_moved,
         remove: timed_out
             && scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
             && scroll.target_position.is_none()
+            && !scroll.edge_overscroll.is_active()
             && !scroll.snap_pending,
     }
 }
@@ -686,6 +697,7 @@ fn integrate_scrolling(
     viewport_width: f64,
     direction_modifier: f64,
 ) {
+    scroll.edge_overscroll.integrate(dt);
     if let Some(target) = scroll.target_position {
         let (position, settled) = smooth_native_scroll(scroll.position, target, dt);
         scroll.position = position;
@@ -697,32 +709,7 @@ fn integrate_scrolling(
         }
     } else if scroll.velocity.abs() > SCROLL_VELOCITY_EPSILON {
         scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
-        constrain_paging_motion(scroll, direction_modifier);
-    }
-}
-
-fn smooth_native_scroll(position: f64, target: f64, dt: f64) -> (f64, bool) {
-    let blend = 1.0 - (-dt / NATIVE_SCROLL_RESPONSE_SECONDS).exp();
-    let position = position + (target - position) * blend;
-
-    if (target - position).abs() <= NATIVE_SCROLL_SETTLE_PX {
-        (target, true)
-    } else {
-        (position, false)
-    }
-}
-
-/// Preserve the integrator's subpixel remainder unless viewport constraints
-/// actually changed the integer position that macOS can apply.
-fn reconcile_integrated_position(
-    integrated_position: f64,
-    effective_position: i32,
-    clamped_position: i32,
-) -> f64 {
-    if effective_position == clamped_position {
-        integrated_position
-    } else {
-        f64::from(clamped_position)
+        constrain_paging_motion(scroll, direction_modifier, false);
     }
 }
 
