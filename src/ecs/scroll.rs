@@ -553,12 +553,13 @@ pub(super) fn swiping_timeout(
         let timed_out = !scroll.gesture_active
             && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD;
         let outcome = update_swipe_timeout(&mut scroll, timed_out, dt, viewport_width);
-        let focus_handoff_ready = !scroll.gesture_active
-            && !scroll.is_user_swiping
-            && scroll.target_position.is_none()
-            && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
-            && !scroll.edge_overscroll.is_active()
-            && !scroll.snap_pending;
+        let focus_handoff_ready = outcome.remove
+            || (!scroll.gesture_active
+                && !scroll.is_user_swiping
+                && scroll.target_position.is_none()
+                && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
+                && !scroll.edge_overscroll.is_active()
+                && !scroll.snap_pending);
         if focus_handoff_ready {
             let focused = windows.focused().map(|(_, entity)| entity);
             if active

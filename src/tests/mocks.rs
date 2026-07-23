@@ -339,6 +339,14 @@ impl MockState {
         self.inner.force_read().cursor_position
     }
 
+    pub(crate) fn focused_window_id(&self, pid: Pid) -> Option<WinID> {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .and_then(|app| app.focused_window_id)
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]
