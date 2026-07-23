@@ -2,7 +2,7 @@ use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{With, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
@@ -14,10 +14,10 @@ use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, PagingGesture, Position, Scrolling,
-    SendMessageTrigger,
+    SendMessageTrigger, SpawnCommandsExt,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -209,6 +209,14 @@ fn swipe_gesture(
             )
         })
         .flatten();
+    let scroll_focus_origin = starts_new_gesture
+        .then(|| {
+            windows
+                .focused()
+                .map(|(_, entity)| entity)
+                .filter(|entity| layout_strip.contains(*entity))
+        })
+        .flatten();
 
     begin_touchpad_gesture(
         starts_new_gesture,
@@ -217,6 +225,9 @@ fn swipe_gesture(
         paging_gesture,
         scrolling.as_deref_mut(),
     );
+    if starts_new_gesture && let Some(scrolling) = scrolling.as_deref_mut() {
+        scrolling.scroll_focus_origin = scroll_focus_origin;
+    }
     // AppKit can report physical Ended and momentum Began together. Apply the
     // physical end first so the momentum phase remains the final state.
     mark_physical_touch_end(touchpad_physical_up, scrolling.as_deref_mut());
@@ -234,6 +245,7 @@ fn swipe_gesture(
             position.x,
             snap_enabled,
             paging_gesture,
+            scroll_focus_origin,
             initial_lifecycle,
             &mut commands,
         );
@@ -298,6 +310,7 @@ fn swipe_gesture(
                 } else {
                     overscroll::EdgeOverscroll::default()
                 },
+                scroll_focus_origin,
                 last_event: Instant::now(),
             };
             constrain_paging_motion(&mut scrolling, direction_modifier, true);
@@ -346,6 +359,7 @@ fn insert_touchpad_begin_state(
     position: i32,
     snap_enabled: bool,
     paging_gesture: Option<PagingGesture>,
+    scroll_focus_origin: Option<Entity>,
     lifecycle: InitialTouchpadLifecycle,
     commands: &mut Commands,
 ) {
@@ -357,6 +371,7 @@ fn insert_touchpad_begin_state(
             gesture_active: true,
             paging_gesture,
             edge_overscroll: overscroll::EdgeOverscroll::armed(),
+            scroll_focus_origin,
             ..Default::default()
         };
         apply_initial_touchpad_lifecycle(&mut scrolling, lifecycle);
@@ -499,32 +514,78 @@ fn expire_stale_gesture(scroll: &mut Scrolling, now: Instant) -> bool {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
-    strips: Populated<(Entity, &mut Scrolling, &ChildOf), With<LayoutStrip>>,
+    strips: Populated<
+        (
+            Entity,
+            &LayoutStrip,
+            &Position,
+            &mut Scrolling,
+            &ChildOf,
+            Has<ActiveWorkspaceMarker>,
+        ),
+        With<LayoutStrip>,
+    >,
     displays: Query<(&Display, Option<&DockPosition>)>,
     time: Res<Time>,
     config: Res<Config>,
     window_manager: Res<WindowManager>,
+    windows: Windows,
+    mut global_state: GlobalState,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs_f64();
     let now = Instant::now();
 
-    for (entity, mut scroll, parent) in strips {
+    for (entity, strip, position, mut scroll, parent, active) in strips {
         let Ok((display, dock)) = displays.get(parent.parent()) else {
             continue;
         };
-        let viewport_width = f64::from(display.actual_display_bounds(dock, &config).width());
+        let viewport = display.actual_display_bounds(dock, &config);
+        let viewport_width = f64::from(viewport.width());
         expire_stale_gesture(&mut scroll, now);
         let timed_out = !scroll.gesture_active
             && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD;
         let outcome = update_swipe_timeout(&mut scroll, timed_out, dt, viewport_width);
-        if outcome.remove
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_remove::<Scrolling>();
+        if outcome.remove {
+            let focused = windows.focused().map(|(_, entity)| entity);
+            if active
+                && scroll
+                    .scroll_focus_origin
+                    .is_some_and(|origin| Some(origin) == focused)
+            {
+                let target = focus_target_after_scroll(
+                    &viewport,
+                    position.x,
+                    strip.columns().filter_map(|column| {
+                        let geometry_entity = column.top()?;
+                        let focus_entity = focused
+                            .filter(|entity| column.position_of(*entity).is_some())
+                            .unwrap_or(geometry_entity);
+                        let layout_x = windows.layout_position(geometry_entity)?.0.x;
+                        let width = column.width(&|entity| windows.moving_frame(entity))?;
+                        Some((focus_entity, layout_x, width))
+                    }),
+                );
+                if let Some(target) = target.filter(|target| Some(*target) != focused)
+                    && let Some(window) = windows.get(target)
+                {
+                    // Scroll-selected focus must not recenter the strip or warp
+                    // the cursor, even when mouse_follows_focus is opt-in.
+                    global_state.set_skip_reshuffle(true);
+                    global_state.set_ffm_flag(Some(window.id()));
+                    commands.focus_entity(target, true);
+                }
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<Scrolling>();
+            }
         }
         if outcome.emit_mouse_moved
             && let Some(point) = window_manager.cursor_position()
@@ -535,6 +596,35 @@ pub(super) fn swiping_timeout(
             }));
         }
     }
+}
+
+fn focus_target_after_scroll(
+    viewport: &IRect,
+    strip_offset: i32,
+    columns: impl IntoIterator<Item = (Entity, i32, i32)>,
+) -> Option<Entity> {
+    use std::cmp::Reverse;
+
+    columns
+        .into_iter()
+        .filter(|(_, _, width)| *width > 0)
+        .filter_map(|(entity, layout_x, width)| {
+            let left = strip_offset.saturating_add(layout_x);
+            let right = left.saturating_add(width);
+            let visible_width = right
+                .min(viewport.max.x)
+                .saturating_sub(left.max(viewport.min.x));
+            (visible_width > 0).then_some((
+                entity,
+                visible_width,
+                left.abs_diff(viewport.min.x),
+                layout_x,
+            ))
+        })
+        .min_by_key(|(_, visible_width, leading_distance, layout_x)| {
+            (Reverse(*visible_width), *leading_distance, *layout_x)
+        })
+        .map(|(entity, _, _, _)| entity)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

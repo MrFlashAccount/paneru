@@ -306,6 +306,10 @@ pub struct Scrolling {
     pub paging_gesture: Option<PagingGesture>,
     /// Transient edge-only visual displacement; logical and persisted positions stay clamped.
     pub(crate) edge_overscroll: scroll::overscroll::EdgeOverscroll,
+    /// Window focused when the current user-authored scroll gesture began.
+    /// Internal strip animations leave this empty and must not change focus.
+    pub scroll_focus_origin: Option<Entity>,
+    /// Last time a physical swipe event was received.
     pub last_event: Instant,
 }
 
@@ -320,6 +324,7 @@ impl Default for Scrolling {
             gesture_active: false,
             paging_gesture: None,
             edge_overscroll: scroll::overscroll::EdgeOverscroll::default(),
+            scroll_focus_origin: None,
             last_event: Instant::now(),
         }
     }
