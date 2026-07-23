@@ -61,18 +61,25 @@ assert_ordered() {
   ASSERTIONS=$((ASSERTIONS + 1))
 }
 
-assert_resolves "0.6.15-pr20" "1000.6.15"
+assert_resolves "0.6.15-pr20" "999.0.20"
+assert_resolves "0.6.15-local" "999.0.0"
+assert_resolves "0.6.15-local.2" "999.0.2"
 assert_resolves "0.6.15" "1000.6.15"
 assert_resolves "0.6.16" "1000.6.16"
 assert_resolves "1.2.3" "1001.2.3"
 assert_resolves "0.0.0" "1000.0.0"
-assert_resolves "0001.08.09-rc.1" "1001.8.9"
+assert_resolves "0001.08.09" "1001.8.9"
 assert_resolves "8999.99.99" "9999.99.99"
 
 PR_BUILD="$("$RESOLVER" "0.6.15-pr20")"
+NEXT_PR_BUILD="$("$RESOLVER" "0.6.15-pr21")"
+SAME_VERSION_RELEASE="$("$RESOLVER" "0.6.15")"
 RELEASE_BUILD="$("$RESOLVER" "0.6.16")"
+assert_ordered "$PR_BUILD" "$NEXT_PR_BUILD"
+assert_ordered "$PR_BUILD" "$SAME_VERSION_RELEASE"
 assert_ordered "$PR_BUILD" "$RELEASE_BUILD"
 assert_ordered "40" "$PR_BUILD"
+assert_ordered "$("$RESOLVER" "8999.99.99-pr9999")" "$("$RESOLVER" "0.0.0")"
 
 assert_rejected "" "Usage:"
 assert_rejected "1.2" "exactly three numeric components"
@@ -86,5 +93,6 @@ assert_rejected "9000.0.0" "major component exceeds 8999"
 assert_rejected "1.100.0" "minor component exceeds"
 assert_rejected "1.0.100" "patch component exceeds"
 assert_rejected "999999999999999999999999.0.0" "major component exceeds 8999"
+assert_rejected "1.2.3-pr10000" "preview sequence exceeds"
 
 printf 'PASS: %s resolver assertions\n' "$ASSERTIONS"

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Convert Paneru's human-facing semantic version into Sparkle's monotonically
-# ordered CFBundleVersion. The epoch keeps all mapped builds above historical
-# run-number builds while preserving semantic ordering.
+# Convert Paneru's human-facing semantic version into a Sparkle-compatible
+# CFBundleVersion. Stable releases use the 1000+ semantic lane. Preview, test,
+# and local builds use the lower 999.x.y lane, so they can never block a stable
+# release while still sorting above historical run-number builds.
 
 if [[ "$#" -ne 1 || -z "$1" ]]; then
   echo "Usage: $0 <major.minor.patch[-suffix]>" >&2
@@ -12,6 +13,7 @@ fi
 
 VERSION="$1"
 BASE_VERSION="$VERSION"
+SUFFIX=""
 
 if [[ "$VERSION" == *-* ]]; then
   BASE_VERSION="${VERSION%%-*}"
@@ -54,6 +56,22 @@ fi
 if [[ "${#PATCH}" -gt 2 ]] || (( 10#$PATCH > 99 )); then
   echo "Invalid Paneru version '$VERSION': patch component exceeds Apple's CFBundleVersion maximum of 99." >&2
   exit 1
+fi
+
+if [[ -n "$SUFFIX" ]]; then
+  PREVIEW_SEQUENCE="0"
+  if [[ "$SUFFIX" =~ ([0-9]+)$ ]]; then
+    PREVIEW_SEQUENCE="$(normalize_decimal "${BASH_REMATCH[1]}")"
+  fi
+  if [[ "${#PREVIEW_SEQUENCE}" -gt 4 ]] || (( 10#$PREVIEW_SEQUENCE > 9999 )); then
+    echo "Invalid Paneru version '$VERSION': preview sequence exceeds the supported maximum of 9999." >&2
+    exit 1
+  fi
+
+  printf '999.%s.%s\n' \
+    "$((10#$PREVIEW_SEQUENCE / 100))" \
+    "$((10#$PREVIEW_SEQUENCE % 100))"
+  exit 0
 fi
 
 printf '%s.%s.%s\n' "$((1000 + 10#$MAJOR))" "$((10#$MINOR))" "$((10#$PATCH))"
