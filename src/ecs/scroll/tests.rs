@@ -8,15 +8,105 @@ use objc2_core_foundation::CGPoint;
 
 use super::{
     GestureInput, InitialTouchpadLifecycle, Scrolling, SnapMode, apply_initial_touchpad_lifecycle,
-    begin_touchpad_gesture, resume_touchpad_gesture, scrolling_needs_frame, smooth_native_scroll,
-    snap_mode, sticky_edge_snap_target,
+    begin_touchpad_gesture, focus_target_after_scroll, resume_touchpad_gesture,
+    scrolling_needs_frame, smooth_native_scroll, snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
-use crate::ecs::{ActiveWorkspaceMarker, EdgeOverscrollVisual, Position, VerifyWindowPosition};
+use crate::ecs::{
+    ActiveWorkspaceMarker, EdgeOverscrollVisual, FocusedMarker, Position, VerifyWindowPosition,
+};
 use crate::events::Event;
-use crate::manager::Window;
+use crate::manager::{Origin, Window, WindowManager};
 use crate::platform::Modifiers;
 use crate::tests::TestHarness;
+
+#[test]
+fn focus_target_prefers_the_most_visible_column_then_its_leading_edge() {
+    let mut world = bevy::prelude::World::new();
+    let first = world.spawn_empty().id();
+    let second = world.spawn_empty().id();
+    let third = world.spawn_empty().id();
+    let viewport = IRect::new(0, 0, 1_000, 800);
+
+    assert_eq!(
+        focus_target_after_scroll(
+            &viewport,
+            -200,
+            [(first, 0, 400), (second, 400, 400), (third, 800, 400)],
+        ),
+        Some(second),
+        "equal fully-visible columns prefer the one closest to the leading edge"
+    );
+    assert_eq!(
+        focus_target_after_scroll(
+            &viewport,
+            -1_000,
+            [(first, 0, 1_000), (second, 1_000, 1_000)],
+        ),
+        Some(second),
+        "a full-width page selects the newly visible window"
+    );
+    assert_eq!(
+        focus_target_after_scroll(&viewport, -500, [(first, 0, 1_500), (second, 1_500, 500)],),
+        Some(first),
+        "panning inside an oversized window keeps that window focused"
+    );
+}
+
+#[test]
+fn settled_scroll_focuses_visible_window_without_warping_cursor() {
+    let cursor = Origin::new(700, 300);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, move |world, _state| {
+            world.resource::<WindowManager>().warp_mouse(cursor);
+            let scroll_focus_origin = {
+                let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+                focused.single(world).expect("one focused window")
+            };
+            let strip_entity = {
+                let mut strips = world.query_filtered::<(Entity, &mut Position), (
+                    With<ActiveWorkspaceMarker>,
+                    With<crate::ecs::layout::LayoutStrip>,
+                )>();
+                let (entity, mut position) = strips.single_mut(world).expect("one active strip");
+                position.x = -176;
+                entity
+            };
+            world.entity_mut(strip_entity).insert(Scrolling {
+                position: -176.0,
+                scroll_focus_origin: Some(scroll_focus_origin),
+                last_event: Instant::now()
+                    .checked_sub(Duration::from_millis(100))
+                    .expect("100ms must fit before now"),
+                ..Default::default()
+            });
+        })
+        .on_iteration(1, move |world, state| {
+            crate::assert_focused!(world, 1);
+            assert_eq!(
+                state.cursor_position(),
+                cursor,
+                "scroll-driven focus must not warp the cursor"
+            );
+            let mut scrolling = world.query_filtered::<&Scrolling, (
+                With<ActiveWorkspaceMarker>,
+                With<crate::ecs::layout::LayoutStrip>,
+            )>();
+            assert!(
+                scrolling.single(world).is_err(),
+                "focus changes only after scrolling reaches its terminal state"
+            );
+        })
+        .run(commands);
+}
 
 #[test]
 fn native_scroll_smoothing_converges_without_overshoot() {
@@ -476,6 +566,13 @@ fn explicit_touchpad_begin_creates_lifecycle_state_before_first_delta() {
             assert!(scrolling.is_user_swiping);
             assert!(scrolling.gesture_active);
             assert!(scrolling.paging_gesture.is_some());
+            let scroll_focus_origin = scrolling
+                .scroll_focus_origin
+                .expect("user gesture must retain its initial focused window");
+            assert!(
+                world.get::<FocusedMarker>(scroll_focus_origin).is_some(),
+                "captured scroll focus must match the focused window"
+            );
         })
         .run(commands);
 }
