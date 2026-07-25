@@ -29,7 +29,10 @@ mod focus;
 mod motion;
 pub(crate) mod overscroll;
 mod paging;
+#[cfg(test)]
+use focus::has_aligned_edge as focus_has_aligned_edge;
 use focus::request_for_offset as request_scroll_focus;
+use focus::request_when_aligned as request_scroll_focus_when_aligned;
 #[cfg(test)]
 use focus::target_after_scroll as focus_target_after_scroll;
 use motion::{reconcile_integrated_position, smooth_native_scroll};
@@ -106,6 +109,7 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
+                    prefocus_visible_scroll_target,
                     apply_edge_overscroll,
                     swiping_timeout,
                 )
@@ -981,6 +985,66 @@ fn apply_scrolling_constraints(
             scroll.velocity = 0.0;
             scroll.target_position = None;
         }
+    }
+}
+
+/// Native momentum can keep emitting sub-pixel deltas after the strip has
+/// visually reached the next window. Pre-focus a target aligned to its snap edge
+/// instead of waiting for the invisible tail to end and `apply_snap_force` to
+/// commit. Scroll focus suppresses reshuffle, auto-center, and cursor movement,
+/// so this changes focus without pulling the target into the viewport.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+fn prefocus_visible_scroll_target(
+    mut strips: Populated<
+        (
+            &LayoutStrip,
+            &Position,
+            &mut Scrolling,
+            &ChildOf,
+            Has<ActiveWorkspaceMarker>,
+        ),
+        With<LayoutStrip>,
+    >,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    windows: Windows,
+    focus_intent: Res<FocusIntentState>,
+    config: Res<Config>,
+    mut global_state: GlobalState,
+    mut commands: Commands,
+) {
+    let snap_enabled = config.swipe_paging() || config.sticky_scroll() || config.auto_center();
+    if !snap_enabled {
+        return;
+    }
+
+    for (strip, position, mut scroll, parent, active) in &mut strips {
+        if !scroll.snap_pending || scroll.physical_contact.is_active() {
+            continue;
+        }
+        if scroll.target_position.is_some_and(|target| {
+            (target - scroll.position).abs() > f64::from(focus::PREFOCUS_ALIGNMENT_TOLERANCE_PX)
+        }) {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(parent.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        request_scroll_focus_when_aligned(
+            &viewport,
+            strip,
+            position.x,
+            active,
+            &mut scroll,
+            &windows,
+            &focus_intent,
+            &mut global_state,
+            &mut commands,
+        );
     }
 }
 

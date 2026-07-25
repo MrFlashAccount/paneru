@@ -9,8 +9,8 @@ use objc2_core_foundation::CGPoint;
 use super::{
     GestureInput, InitialTouchpadLifecycle, PhysicalContact, Scrolling, SnapMode,
     accepts_scroll_delta, apply_initial_touchpad_lifecycle, begin_touchpad_gesture,
-    focus_target_after_scroll, resume_touchpad_gesture, scrolling_needs_frame,
-    smooth_native_scroll, snap_mode, sticky_edge_snap_target,
+    focus_has_aligned_edge, focus_target_after_scroll, resume_touchpad_gesture,
+    scrolling_needs_frame, smooth_native_scroll, snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
 use crate::ecs::{
@@ -67,6 +67,22 @@ fn focus_target_prefers_the_most_visible_column_then_its_leading_edge() {
         focus_target_after_scroll(&viewport, -500, [(first, 0, 1_500), (second, 1_500, 500)],),
         Some(first),
         "panning inside an oversized window keeps that window focused"
+    );
+}
+
+#[test]
+fn momentum_prefocus_requires_snap_edge_alignment() {
+    let viewport = IRect::new(0, 0, 1_000, 800);
+
+    assert_eq!(
+        focus_has_aligned_edge(&viewport, -999, [(0, 1_000), (1_000, 1_000)],),
+        false,
+        "focus must not block a frame while visible motion remains"
+    );
+    assert_eq!(
+        focus_has_aligned_edge(&viewport, -1_000, [(0, 1_000), (1_000, 1_000)],),
+        true,
+        "focus may be requested once the target is exactly at its snap edge"
     );
 }
 

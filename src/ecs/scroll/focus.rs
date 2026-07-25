@@ -10,7 +10,18 @@ use crate::ecs::focus::{FocusIntentState, FocusWindow};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 
+pub(super) const PREFOCUS_ALIGNMENT_TOLERANCE_PX: i32 = 0;
+
+#[cfg(test)]
 pub(super) fn target_after_scroll(
+    viewport: &IRect,
+    strip_offset: i32,
+    columns: impl IntoIterator<Item = (Entity, i32, i32)>,
+) -> Option<Entity> {
+    select_target_after_scroll(viewport, strip_offset, columns)
+}
+
+fn select_target_after_scroll(
     viewport: &IRect,
     strip_offset: i32,
     columns: impl IntoIterator<Item = (Entity, i32, i32)>,
@@ -37,6 +48,60 @@ pub(super) fn target_after_scroll(
             (Reverse(*visible_width), *leading_distance, *layout_x)
         })
         .map(|(entity, _, _, _)| entity)
+}
+
+#[cfg(test)]
+pub(super) fn has_aligned_edge(
+    viewport: &IRect,
+    strip_offset: i32,
+    columns: impl IntoIterator<Item = (i32, i32)>,
+) -> bool {
+    columns.into_iter().any(|(layout_x, width)| {
+        let left = strip_offset.saturating_add(layout_x);
+        let right = left.saturating_add(width);
+        left == viewport.min.x || right == viewport.max.x
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn request_when_aligned(
+    viewport: &IRect,
+    strip: &LayoutStrip,
+    strip_offset: i32,
+    active: bool,
+    scroll: &mut Scrolling,
+    windows: &Windows<'_, '_>,
+    intent: &FocusIntentState,
+    global_state: &mut GlobalState<'_>,
+    commands: &mut Commands,
+) {
+    let aligned = strip.columns().any(|column| {
+        let Some(entity) = column.top() else {
+            return false;
+        };
+        let Some(layout_x) = windows.layout_position(entity).map(|position| position.0.x) else {
+            return false;
+        };
+        let Some(width) = column.width(&|entity| windows.moving_frame(entity)) else {
+            return false;
+        };
+        let left = strip_offset.saturating_add(layout_x);
+        let right = left.saturating_add(width);
+        left == viewport.min.x || right == viewport.max.x
+    });
+    if aligned {
+        request_for_offset(
+            viewport,
+            strip,
+            strip_offset,
+            active,
+            scroll,
+            windows,
+            intent,
+            global_state,
+            commands,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +139,7 @@ pub(super) fn request_for_offset(
         );
         return;
     }
-    let target = target_after_scroll(
+    let target = select_target_after_scroll(
         viewport,
         strip_offset,
         strip.columns().filter_map(|column| {
