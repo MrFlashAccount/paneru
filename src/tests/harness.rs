@@ -157,6 +157,20 @@ impl TestHarness {
         self
     }
 
+    pub(crate) fn with_app_window(
+        mut self,
+        pid: Pid,
+        id: WinID,
+        workspace_id: WorkspaceId,
+    ) -> Self {
+        let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        let window = self.mock_state.spawn_window(pid, workspace_id, id, frame);
+        self.app
+            .world_mut()
+            .trigger(SpawnWindowTrigger(vec![window]));
+        self
+    }
+
     pub(crate) fn with_config(mut self, config: Config) -> Self {
         self.app.world_mut().insert_resource(config);
         self

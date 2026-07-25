@@ -355,8 +355,9 @@ impl InputHandler {
         }
 
         if let Some(events) = &self.events {
-            let (gesture_began, physical_ended, momentum_began, gesture_ended) =
-                NSEvent::eventWithCGEvent(event)
+            let native_event = NSEvent::eventWithCGEvent(event);
+            let (gesture_began, physical_ended, momentum_began, gesture_ended, is_momentum) =
+                native_event
                     .as_deref()
                     .map(|event| scroll_gesture_lifecycle(event.phase(), event.momentumPhase()))
                     .unwrap_or_default();
@@ -401,7 +402,7 @@ impl InputHandler {
 
             let has_delta = delta.abs() > 0.001;
             if has_delta {
-                _ = events.send(Event::Scroll { delta });
+                _ = events.send(Event::Scroll { delta, is_momentum });
             }
             if base_match && gesture_ended {
                 _ = events.send(Event::TouchpadUp);
@@ -570,7 +571,7 @@ fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: u
 fn scroll_gesture_lifecycle(
     phase: NSEventPhase,
     momentum_phase: NSEventPhase,
-) -> (bool, bool, bool, bool) {
+) -> (bool, bool, bool, bool, bool) {
     // Momentum belongs to the physical gesture that preceded it. Treating its
     // begin as a new gesture would recapture the paging stop and allow a
     // second hop from one finger movement.
@@ -591,7 +592,14 @@ fn scroll_gesture_lifecycle(
     // terminate the new contact we just armed.
     let momentum_ended = !physical_contact_active
         && momentum_phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled);
-    (began, physical_ended, momentum_began, momentum_ended)
+    let is_momentum_delta = !physical_contact_active && !momentum_phase.is_empty();
+    (
+        began,
+        physical_ended,
+        momentum_began,
+        momentum_ended,
+        is_momentum_delta,
+    )
 }
 
 fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
@@ -806,39 +814,39 @@ fingers_count = 3
     fn native_scroll_lifecycle_covers_touch_and_momentum_phases() {
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::MayBegin, NSEventPhase::None),
-            (true, false, false, false),
+            (true, false, false, false, false),
             "trackpad contact must arm slow pulls before their first delta"
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Began, NSEventPhase::None),
-            (true, false, false, false)
+            (true, false, false, false, false)
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Ended, NSEventPhase::None),
-            (false, true, false, false)
+            (false, true, false, false, false)
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::None, NSEventPhase::Began),
-            (false, false, true, false),
+            (false, false, true, false, true),
             "momentum must continue the existing physical gesture"
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::None, NSEventPhase::Ended),
-            (false, false, false, true)
+            (false, false, false, true, true)
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Ended, NSEventPhase::Began),
-            (false, true, true, false),
+            (false, true, true, false, true),
             "momentum beginning in the same event must keep the gesture active"
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Ended, NSEventPhase::Changed),
-            (false, true, false, false),
+            (false, true, false, false, true),
             "physical end must not end the full gesture while momentum continues"
         );
         assert_eq!(
             scroll_gesture_lifecycle(NSEventPhase::Began, NSEventPhase::Ended),
-            (true, false, false, false),
+            (true, false, false, false, false),
             "ending old momentum must not close a new physical contact"
         );
     }
