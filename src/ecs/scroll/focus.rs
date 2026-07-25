@@ -10,6 +10,8 @@ use crate::ecs::focus::{FocusIntentState, FocusWindow};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 
+/// Integer snap-edge alignment is exact: focus must not start while a visible
+/// point of strip motion remains.
 pub(super) const PREFOCUS_ALIGNMENT_TOLERANCE_PX: i32 = 0;
 
 #[cfg(test)]
@@ -64,6 +66,12 @@ pub(super) fn has_aligned_edge(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Readiness gate for momentum-tail focus.
+///
+/// Alignment only decides when focus may begin. Target selection remains in
+/// [`request_for_offset`], preserving the existing most-visible-column
+/// semantics instead of treating whichever column supplied the aligned edge as
+/// the target.
 pub(super) fn request_when_aligned(
     viewport: &IRect,
     strip: &LayoutStrip,
@@ -105,6 +113,8 @@ pub(super) fn request_when_aligned(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Select the most-visible managed target at `strip_offset` and request it once
+/// for the gesture's current semantic focus owner.
 pub(super) fn request_for_offset(
     viewport: &IRect,
     strip: &LayoutStrip,
@@ -176,7 +186,8 @@ pub(super) fn request_for_offset(
         window_id = window.id(),
         "issuing semantic scroll focus request"
     );
-    // Scroll focus never owns layout reshuffling or cursor movement.
+    // Scroll focus and its exact OS confirmation never own layout reshuffling,
+    // auto-centering, or cursor movement.
     global_state.set_skip_reshuffle(true);
     global_state.set_ffm_flag(Some(window.id()));
     commands.trigger(FocusWindow {

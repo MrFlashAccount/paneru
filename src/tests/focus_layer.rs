@@ -6,8 +6,8 @@ use crate::commands::Command;
 use crate::config::Config;
 use crate::ecs::focus::FocusIntentState;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, PagingGesture, Position, Scrolling, Unmanaged,
-    WindowDisposition,
+    ActiveWorkspaceMarker, FocusedMarker, LayoutPosition, PagingGesture, Position, Scrolling,
+    Unmanaged, WindowDisposition,
 };
 use crate::events::Event;
 use crate::manager::{Origin, Window, WindowManager};
@@ -67,6 +67,21 @@ fn print_state_events(count: usize) -> Vec<Event> {
             command: Command::PrintState,
         })
         .collect()
+}
+
+fn geometry_snapshot(world: &mut World) -> (Origin, Vec<(i32, Origin, Origin)>) {
+    let strip_position = world
+        .query_filtered::<&Position, bevy::prelude::With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("one active strip")
+        .0;
+    let mut windows = world
+        .query::<(&Window, &Position, &LayoutPosition)>()
+        .iter(world)
+        .map(|(window, position, layout)| (window.id(), position.0, layout.0))
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(window_id, ..)| *window_id);
+    (strip_position, windows)
 }
 
 fn focus_request_before_snap_settlement() -> TestHarness {
@@ -131,7 +146,7 @@ fn semantic_snap_commit_requests_focus_before_animation_settles() {
 }
 
 #[test]
-fn momentum_tail_prefocuses_without_pulling_the_window_into_viewport() {
+fn quick_swipe_focuses_once_at_visual_snap_without_geometry_side_effects() {
     let cursor = Origin::new(700, 300);
     let mut harness = TestHarness::new()
         .with_config(paging_config())
@@ -160,10 +175,9 @@ fn momentum_tail_prefocuses_without_pulling_the_window_into_viewport() {
         .single(world)
         .expect("active strip");
     world.entity_mut(strip).insert((
-        Position(Origin::new(-576, 0)),
+        Position(Origin::new(-575, 0)),
         Scrolling {
-            position: -576.0,
-            target_position: Some(-576.0),
+            position: -575.0,
             snap_pending: true,
             is_user_swiping: true,
             gesture_active: true,
@@ -180,59 +194,78 @@ fn momentum_tail_prefocuses_without_pulling_the_window_into_viewport() {
     ));
 
     harness.app.update();
-    assert_eq!(harness.mock_state.focus_attempts(), vec![1]);
+    assert!(
+        harness.mock_state.focus_attempts().is_empty(),
+        "focus must wait while visible motion remains before the exact snap edge"
+    );
     crate::assert_focused!(harness.world(), 0);
 
-    let geometry_before_confirmation = {
-        let world = harness.world();
-        let strip_position = world
-            .query_filtered::<&Position, bevy::prelude::With<ActiveWorkspaceMarker>>()
-            .single(world)
-            .expect("one active strip")
-            .0;
-        let mut windows = world
-            .query::<(&Window, &Position, &crate::ecs::LayoutPosition)>()
-            .iter(world)
-            .map(|(window, position, layout)| (window.id(), position.0, layout.0))
-            .collect::<Vec<_>>();
-        windows.sort_by_key(|(window_id, ..)| *window_id);
-        (strip_position, windows)
-    };
+    let world = harness.world();
+    world
+        .entity_mut(strip)
+        .get_mut::<Position>()
+        .expect("strip position")
+        .0 = Origin::new(-576, 0);
+    let mut strip_entity = world.entity_mut(strip);
+    let mut scrolling = strip_entity
+        .get_mut::<Scrolling>()
+        .expect("scrolling state");
+    scrolling.position = -576.0;
+    scrolling.target_position = Some(-576.0);
+    drop(scrolling);
+    drop(strip_entity);
+    for (layout, mut position) in world
+        .query::<(&LayoutPosition, &mut Position)>()
+        .iter_mut(world)
+    {
+        position.0.x = layout.0.x - 576;
+    }
+
+    let geometry_at_snap = geometry_snapshot(harness.world());
+    harness.app.update();
+    assert_eq!(
+        harness.mock_state.focus_attempts(),
+        vec![1],
+        "visual snap completion must request the most-visible managed target exactly once"
+    );
+    crate::assert_focused!(harness.world(), 0);
+    assert_eq!(geometry_snapshot(harness.world()), geometry_at_snap);
+    assert_eq!(harness.mock_state.cursor_position(), cursor);
 
     harness.mock_state.confirm_window_focus(1);
     for event in harness.mock_state.drain_events() {
         harness.world().write_message(event);
     }
-    for _ in 0..5 {
+    for _ in 0..2 {
         harness.app.update();
+        assert_eq!(harness.mock_state.focus_attempts(), vec![1]);
+        assert_eq!(geometry_snapshot(harness.world()), geometry_at_snap);
+        assert_eq!(harness.mock_state.cursor_position(), cursor);
     }
-
     crate::assert_focused!(harness.world(), 1);
-    let geometry_after_confirmation = {
-        let world = harness.world();
-        let strip_position = world
-            .query_filtered::<&Position, bevy::prelude::With<ActiveWorkspaceMarker>>()
-            .single(world)
-            .expect("one active strip")
-            .0;
-        let mut windows = world
-            .query::<(&Window, &Position, &crate::ecs::LayoutPosition)>()
-            .iter(world)
-            .map(|(window, position, layout)| (window.id(), position.0, layout.0))
-            .collect::<Vec<_>>();
-        windows.sort_by_key(|(window_id, ..)| *window_id);
-        (strip_position, windows)
-    };
 
-    assert_eq!(
-        geometry_after_confirmation, geometry_before_confirmation,
-        "pre-focus must not reshuffle, auto-center, or pull the target into the viewport"
-    );
-    assert_eq!(
-        harness.mock_state.cursor_position(),
-        cursor,
-        "pre-focus must not warp the cursor"
-    );
+    for delta in [0.25, 0.15, 0.05, 0.01] {
+        harness.world().write_message(Event::Scroll {
+            delta,
+            is_momentum: true,
+        });
+        harness.app.update();
+        assert_eq!(
+            harness.mock_state.focus_attempts(),
+            vec![1],
+            "remaining native momentum must not retry the confirmed focus"
+        );
+        assert_eq!(
+            geometry_snapshot(harness.world()),
+            geometry_at_snap,
+            "focus confirmation and momentum tail must not rebound or move strip/window geometry"
+        );
+        assert_eq!(
+            harness.mock_state.cursor_position(),
+            cursor,
+            "scroll focus must not warp the cursor"
+        );
+    }
 }
 
 #[test]
