@@ -18,7 +18,8 @@ use super::{
 use crate::commands::set_last_focused_window_target;
 use crate::config::Config;
 use crate::ecs::floating::{clamp_origin_to_bounds, offset_frame_within_bounds};
-use crate::ecs::focus::{FocusHistory, FocusIntentState};
+use crate::ecs::focus::tier::{ManagedTierRaiseState, reconcile_confirmed_focus};
+use crate::ecs::focus::{FocusHistory, FocusIntentState, exact_confirmation_policy};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::observation::{
     ApplicationObservationScope, attach_managed_window, detach_unmanaged_window,
@@ -197,6 +198,7 @@ pub(super) fn window_focused_trigger(
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut focus_history: ResMut<FocusHistory>,
     mut focus_intent: ResMut<FocusIntentState>,
+    mut tier_raise: ResMut<ManagedTierRaiseState>,
     config: Res<Config>,
     mut global_state: GlobalState,
     mut commands: Commands,
@@ -227,22 +229,9 @@ pub(super) fn window_focused_trigger(
             .focused()
             .is_some_and(|(focused, _)| focused.id() == window_id);
 
-        // Delayed confirmations must not restore an old focus.
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
-            continue;
-        }
-        if app.focused_window_id().ok() != Some(window_id) {
-            continue;
-        }
-        let Some(suppress_side_effects) = focus_intent.confirmation_policy(window_id) else {
-            debug!(
-                window_id,
-                pending = ?focus_intent.pending(),
-                "ignoring exact focus for a superseded intent"
-            );
+        let Some(suppress_side_effects) =
+            exact_confirmation_policy(app, &mut focus_intent, window_id)
+        else {
             continue;
         };
         if suppress_side_effects {
@@ -270,12 +259,8 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        // Handle tab switching: if the focused window is a tab, make it the leader.
-        // Also reactivate the owning virtual strip before treating duplicate
-        // focus as a no-op; the focus marker can be stale on a hidden strip.
-        // Track the active workspace as a fallback so focus_history can record
-        // a workspace id even when the entity hasn't been routed into a strip.
         let mut owner = None;
+        let mut owner_windows = None;
         let mut owning_workspace_id = None;
         let mut active_workspace_id = None;
         for (strip_entity, mut strip, active) in &mut workspaces {
@@ -289,12 +274,12 @@ pub(super) fn window_focused_trigger(
                     column.move_to_front(entity);
                 }
                 owning_workspace_id = Some(strip.id());
+                owner_windows = Some(strip.all_windows());
                 owner = Some((strip_entity, active));
             }
         }
 
         if owner.is_none() && managed.is_none() {
-            // The window just spawned and has not yet been inserted into the strip.
             continue;
         }
 
@@ -305,12 +290,17 @@ pub(super) fn window_focused_trigger(
             entity_commands.try_insert(ActiveWorkspaceMarker);
         }
 
-        // Record before the already-focused short-circuit so confirmation can
-        // refresh per-workspace history without republishing the marker.
         if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
             let unmanaged = windows.get_managed(entity).and_then(|(_, _, u)| u);
             focus_history.record(workspace_id, entity, unmanaged);
         }
+        reconcile_confirmed_focus(
+            entity,
+            owner_windows.as_deref(),
+            &windows,
+            &dispositions,
+            &mut tier_raise,
+        );
 
         if already_focused {
             if managed.is_none() && !global_state.skip_reshuffle() && !global_state.initializing() {

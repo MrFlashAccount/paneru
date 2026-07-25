@@ -25,6 +25,8 @@ use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{AxMainThread, WorkspaceId};
 
+pub(crate) mod tier;
+
 #[derive(Default)]
 pub struct TierMemory {
     pub last_managed: Option<Entity>,
@@ -89,6 +91,7 @@ impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
         app.init_resource::<FocusIntentState>();
+        app.init_resource::<tier::ManagedTierRaiseState>();
         app.init_resource::<FocusRecoveryDeadline>();
         app.add_systems(
             PostUpdate,
@@ -255,6 +258,27 @@ impl FocusIntentState {
             false
         }
     }
+}
+
+/// Accepts a focus confirmation only when macOS still reports both the target
+/// application frontmost and the exact target window focused.
+pub(crate) fn exact_confirmation_policy(
+    app: &Application,
+    focus_intent: &mut FocusIntentState,
+    window_id: crate::platform::WinID,
+) -> Option<bool> {
+    if !app.is_frontmost() || app.focused_window_id().ok() != Some(window_id) {
+        return None;
+    }
+    let policy = focus_intent.confirmation_policy(window_id);
+    if policy.is_none() {
+        debug!(
+            window_id,
+            pending = ?focus_intent.pending(),
+            "ignoring exact focus for a superseded intent"
+        );
+    }
+    policy
 }
 
 #[allow(clippy::needless_pass_by_value)]

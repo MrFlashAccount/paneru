@@ -86,7 +86,15 @@ struct MockStateInner {
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
     focus_attempts: Vec<WinID>,
+    native_actions: Vec<MockNativeAction>,
+    raise_failures: HashSet<WinID>,
     auto_confirm_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MockNativeAction {
+    Focus(WinID),
+    Raise(WinID),
 }
 
 #[derive(Clone)]
@@ -106,6 +114,8 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 focus_attempts: Vec::new(),
+                native_actions: Vec::new(),
+                raise_failures: HashSet::new(),
                 auto_confirm_focus: true,
             })),
         }
@@ -162,6 +172,7 @@ impl MockState {
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         inner.focus_attempts.push(id);
+        inner.native_actions.push(MockNativeAction::Focus(id));
         if !inner.auto_confirm_focus {
             return;
         }
@@ -395,6 +406,18 @@ impl MockState {
         self.inner.force_read().focus_attempts.clone()
     }
 
+    pub(crate) fn clear_native_actions(&self) {
+        self.inner.force_write().native_actions.clear();
+    }
+
+    pub(crate) fn native_actions(&self) -> Vec<MockNativeAction> {
+        self.inner.force_read().native_actions.clone()
+    }
+
+    pub(crate) fn fail_raise(&self, id: WinID) {
+        self.inner.force_write().raise_failures.insert(id);
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]
@@ -553,7 +576,12 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus().returning(move || {
+            let mut inner = s.inner.force_write();
+            inner.native_actions.push(MockNativeAction::Raise(id));
+            !inner.raise_failures.contains(&id)
+        });
         let s = self.clone();
         mw.expect_focus_without_raise().returning(move |_, _, _| {
             s.focus_window(id);
