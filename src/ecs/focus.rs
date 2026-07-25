@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bevy::app::{App, Plugin, PostUpdate};
 use bevy::ecs::entity::Entity;
@@ -25,7 +25,9 @@ use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{AxMainThread, WorkspaceId};
 
+mod intent;
 pub(crate) mod tier;
+pub(crate) use intent::{FocusIntentState, FocusRequestPolicy};
 
 #[derive(Default)]
 pub struct TierMemory {
@@ -114,7 +116,7 @@ impl Plugin for FocusEventsPlugin {
 #[derive(BevyEvent)]
 pub(super) struct FocusWindow {
     pub entity: Entity,
-    pub raise: bool,
+    policy: FocusRequestPolicy,
     pub suppress_side_effects: bool,
 }
 
@@ -122,8 +124,23 @@ impl FocusWindow {
     pub(super) const fn standard(entity: Entity, raise: bool) -> Self {
         Self {
             entity,
-            raise,
+            policy: if raise {
+                FocusRequestPolicy::RaiseNow
+            } else {
+                FocusRequestPolicy::NoRaise
+            },
             suppress_side_effects: false,
+        }
+    }
+
+    /// Starts scroll focus without blocking the animation on AX raise. Exact
+    /// confirmation completes the request; otherwise reconciliation may raise
+    /// only after the target's strip has stopped scrolling.
+    pub(super) const fn scrolling(entity: Entity) -> Self {
+        Self {
+            entity,
+            policy: FocusRequestPolicy::RaiseAfterScroll,
+            suppress_side_effects: true,
         }
     }
 }
@@ -154,115 +171,6 @@ pub(super) fn application_focus_changed_trigger(
     }
 }
 
-const FOCUS_RETRY_DELAY: Duration = Duration::from_millis(40);
-const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(300);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PendingFocusIntent {
-    generation: u64,
-    entity: Entity,
-    window_id: crate::platform::WinID,
-    retry_at: Instant,
-    expires_at: Instant,
-    retried: bool,
-    raise: bool,
-    suppress_side_effects: bool,
-}
-
-/// Separates the latest requested native focus from the last focus confirmed
-/// by macOS. Replacing `pending` is the cancellation mechanism: callbacks and
-/// watchdog work for an older generation can no longer publish stale focus.
-#[derive(Default, Resource)]
-pub(crate) struct FocusIntentState {
-    generation: u64,
-    pending: Option<PendingFocusIntent>,
-}
-
-impl FocusIntentState {
-    pub(crate) fn request(
-        &mut self,
-        entity: Entity,
-        window_id: crate::platform::WinID,
-        raise: bool,
-        suppress_side_effects: bool,
-        now: Instant,
-    ) -> u64 {
-        self.generation = self.generation.wrapping_add(1);
-        self.pending = Some(PendingFocusIntent {
-            generation: self.generation,
-            entity,
-            window_id,
-            retry_at: now + FOCUS_RETRY_DELAY,
-            expires_at: now + FOCUS_CONFIRM_TIMEOUT,
-            retried: false,
-            raise,
-            suppress_side_effects,
-        });
-        self.generation
-    }
-
-    pub(crate) fn effective_entity(&self, confirmed: Option<Entity>) -> Option<Entity> {
-        self.pending
-            .map_or(confirmed, |pending| Some(pending.entity))
-    }
-
-    pub(crate) fn pending(&self) -> Option<PendingFocusIntent> {
-        self.pending
-    }
-
-    pub(crate) fn pending_suppresses_side_effects(&self) -> bool {
-        self.pending
-            .is_some_and(|pending| pending.suppress_side_effects)
-    }
-
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.pending.map(|pending| {
-            if pending.retried {
-                pending.expires_at
-            } else {
-                pending.retry_at
-            }
-        })
-    }
-
-    pub(crate) fn confirmation_policy(
-        &mut self,
-        window_id: crate::platform::WinID,
-    ) -> Option<bool> {
-        let Some(pending) = self.pending else {
-            return Some(false);
-        };
-        if pending.window_id != window_id {
-            return None;
-        }
-        self.pending = None;
-        Some(pending.suppress_side_effects)
-    }
-
-    fn mark_retried(&mut self, generation: u64) -> bool {
-        let Some(pending) = self.pending.as_mut() else {
-            return false;
-        };
-        if pending.generation != generation {
-            return false;
-        }
-        pending.retried = true;
-        true
-    }
-
-    fn clear_generation(&mut self, generation: u64) -> bool {
-        if self
-            .pending
-            .is_some_and(|pending| pending.generation == generation)
-        {
-            self.pending = None;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Accepts a focus confirmation only when macOS still reports both the target
 /// application frontmost and the exact target window focused.
 pub(crate) fn exact_confirmation_policy(
@@ -278,7 +186,7 @@ pub(crate) fn exact_confirmation_policy(
         .is_some_and(|pending| pending.window_id != window_id)
     {
         let superseded = focus_intent.pending();
-        focus_intent.pending = None;
+        focus_intent.clear_superseded();
         debug!(
             window_id,
             pending = ?superseded,
@@ -489,7 +397,7 @@ fn focus_window_trigger(
 ) {
     let FocusWindow {
         entity,
-        raise,
+        policy,
         suppress_side_effects,
     } = *trigger.event();
     let Some(window) = windows.get(entity) else {
@@ -501,7 +409,7 @@ fn focus_window_trigger(
     let generation = intent.request(
         entity,
         window.id(),
-        raise,
+        policy,
         suppress_side_effects,
         Instant::now(),
     );
@@ -510,13 +418,30 @@ fn focus_window_trigger(
         window_id = window.id(),
         "requesting native window focus"
     );
-    if !raise
-        && let Some((focused_window, _)) = windows.focused()
-        && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
-    {
-        window.focus_without_raise(psn, focused_window, focused_psn);
-    } else {
-        window.focus_with_raise(psn);
+    match policy {
+        FocusRequestPolicy::RaiseNow => window.focus_with_raise(psn),
+        FocusRequestPolicy::NoRaise => {
+            if let Some((focused_window, _)) = windows.focused()
+                && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+            {
+                window.focus_without_raise(psn, focused_window, focused_psn);
+            } else {
+                window.focus_with_raise(psn);
+            }
+        }
+        FocusRequestPolicy::RaiseAfterScroll => {
+            if let Some((focused_window, _)) = windows.focused()
+                && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+            {
+                window.focus_without_raise(psn, focused_window, focused_psn);
+            } else {
+                warn!(
+                    generation,
+                    window_id = window.id(),
+                    "scroll pre-focus skipped without a confirmed focused window"
+                );
+            }
+        }
     }
 }
 
@@ -528,6 +453,7 @@ fn reconcile_focus_intent(
     _main_thread: NonSend<AxMainThread>,
     windows: Windows,
     apps: Query<&Application>,
+    scrolling_strips: Query<(&LayoutStrip, &Scrolling)>,
     mut intent: ResMut<FocusIntentState>,
     mut global_state: GlobalState,
     mut commands: Commands,
@@ -567,24 +493,43 @@ fn reconcile_focus_intent(
     }
 
     if !pending.retried {
-        if intent.mark_retried(pending.generation) {
+        if pending.policy == FocusRequestPolicy::RaiseAfterScroll
+            && scrolling_strips
+                .iter()
+                .any(|(strip, _)| strip.contains(pending.entity))
+        {
+            intent.defer_retry(pending.generation, now);
+            debug!(
+                generation = pending.generation,
+                window_id = pending.window_id,
+                "deferring native raise until scroll focus target has settled"
+            );
+            return;
+        }
+
+        if intent.mark_retried(pending.generation, now) {
             debug!(
                 generation = pending.generation,
                 window_id = pending.window_id,
                 "native focus not confirmed; retrying exact target once"
             );
-            if pending.raise {
-                window.focus_with_raise(app.psn());
-            } else if let Some((focused_window, _)) = windows.focused()
-                && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
-            {
-                window.focus_without_raise(app.psn(), focused_window, focused_psn);
-            } else {
-                warn!(
-                    generation = pending.generation,
-                    window_id = pending.window_id,
-                    "no-raise focus retry skipped without a confirmed focused window"
-                );
+            match pending.policy {
+                FocusRequestPolicy::RaiseNow | FocusRequestPolicy::RaiseAfterScroll => {
+                    window.focus_with_raise(app.psn());
+                }
+                FocusRequestPolicy::NoRaise => {
+                    if let Some((focused_window, _)) = windows.focused()
+                        && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+                    {
+                        window.focus_without_raise(app.psn(), focused_window, focused_psn);
+                    } else {
+                        warn!(
+                            generation = pending.generation,
+                            window_id = pending.window_id,
+                            "no-raise focus retry skipped without a confirmed focused window"
+                        );
+                    }
+                }
             }
         }
         return;
@@ -741,8 +686,8 @@ mod tests {
         let now = Instant::now();
         let mut intent = FocusIntentState::default();
 
-        intent.request(first, 10, true, false, now);
-        intent.request(second, 20, true, true, now);
+        intent.request(first, 10, FocusRequestPolicy::RaiseNow, false, now);
+        intent.request(second, 20, FocusRequestPolicy::RaiseNow, true, now);
 
         assert_eq!(intent.confirmation_policy(10), None);
         assert_eq!(intent.effective_entity(Some(first)), Some(second));

@@ -4,7 +4,7 @@ use bevy::prelude::{Entity, World};
 
 use crate::commands::Command;
 use crate::config::Config;
-use crate::ecs::focus::FocusIntentState;
+use crate::ecs::focus::{FocusIntentState, FocusRequestPolicy};
 use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, LayoutPosition, PagingGesture, Position, Scrolling,
     SpawnCommandsExt, Unmanaged, WindowDisposition,
@@ -131,6 +131,15 @@ fn focus_request_before_snap_settlement() -> TestHarness {
 fn semantic_snap_commit_requests_focus_before_animation_settles() {
     let mut harness = focus_request_before_snap_settlement();
     assert_eq!(harness.mock_state.focus_attempts(), vec![1]);
+    assert_eq!(
+        harness.mock_state.focus_without_raise_attempts(),
+        vec![1],
+        "animation-critical pre-focus must use the no-raise path"
+    );
+    assert!(
+        harness.mock_state.focus_with_raise_attempts().is_empty(),
+        "animation-critical pre-focus must never perform AX raise"
+    );
     crate::assert_focused!(harness.world(), 0);
 
     let scrolling = harness
@@ -277,8 +286,84 @@ fn exact_os_confirmation_commits_requested_focus() {
     }
     harness.app.update();
     harness.app.update();
+    std::thread::sleep(Duration::from_millis(45));
+    harness.app.update();
 
     crate::assert_focused!(harness.world(), 1);
+    assert!(
+        harness.mock_state.focus_with_raise_attempts().is_empty(),
+        "exact no-raise confirmation must complete without fallback"
+    );
+}
+
+#[test]
+fn unconfirmed_scroll_focus_raises_only_after_scrolling_settles() {
+    let mut harness = focus_request_before_snap_settlement();
+
+    std::thread::sleep(Duration::from_millis(45));
+    harness.app.update();
+    assert!(
+        harness.mock_state.focus_with_raise_attempts().is_empty(),
+        "fallback must remain deferred while the owner strip is scrolling"
+    );
+
+    let strip = harness
+        .world()
+        .query_filtered::<Entity, (
+            bevy::prelude::With<ActiveWorkspaceMarker>,
+            bevy::prelude::With<crate::ecs::layout::LayoutStrip>,
+        )>()
+        .single(harness.world())
+        .expect("active strip");
+    harness.world().entity_mut(strip).remove::<Scrolling>();
+    harness.mock_state.set_auto_confirm_focus(true);
+    std::thread::sleep(Duration::from_millis(45));
+    harness.app.update();
+
+    assert_eq!(
+        harness.mock_state.focus_with_raise_attempts(),
+        vec![1],
+        "unconfirmed no-raise attempt must fall back exactly once after settlement"
+    );
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+    harness.app.update();
+    harness.app.update();
+    crate::assert_focused!(harness.world(), 1);
+}
+
+#[test]
+fn superseding_focus_intent_cancels_old_deferred_raise() {
+    let mut harness = focus_request_before_snap_settlement();
+    let replacement = window_entity(harness.world(), 0);
+
+    harness.world().commands().focus_entity(replacement, false);
+    harness.app.update();
+    std::thread::sleep(Duration::from_millis(45));
+    let scrolling_entities = {
+        let world = harness.world();
+        world
+            .query_filtered::<Entity, bevy::prelude::With<Scrolling>>()
+            .iter(world)
+            .collect::<Vec<_>>()
+    };
+    for entity in scrolling_entities {
+        harness.world().entity_mut(entity).remove::<Scrolling>();
+    }
+    harness.app.update();
+
+    assert!(
+        harness.mock_state.focus_with_raise_attempts().is_empty(),
+        "superseded fallback must not raise the old scroll target"
+    );
+    assert!(
+        harness
+            .mock_state
+            .focus_without_raise_attempts()
+            .contains(&0),
+        "replacement intent must become the active native request"
+    );
 }
 
 #[test]
@@ -288,7 +373,7 @@ fn stale_confirmation_cannot_override_latest_intent() {
     harness.world().resource_mut::<FocusIntentState>().request(
         latest,
         0,
-        true,
+        FocusRequestPolicy::RaiseNow,
         true,
         Instant::now(),
     );
@@ -335,7 +420,7 @@ fn authoritative_external_focus_supersedes_pending_intent() {
     harness.world().resource_mut::<FocusIntentState>().request(
         pending_target,
         1,
-        true,
+        FocusRequestPolicy::RaiseNow,
         false,
         Instant::now() - Duration::from_millis(100),
     );
