@@ -56,6 +56,9 @@ pub enum Event {
     WindowDestroyed { window_id: WinID },
     /// A window has gained focus.
     WindowFocused { window_id: WinID },
+    /// An application's focused UI element changed. Consumers must read back
+    /// the exact focused window before publishing window focus.
+    ApplicationFocusChanged { pid: i32 },
     /// A window has been moved.
     WindowMoved { window_id: WinID },
     /// A window has been resized.
@@ -98,7 +101,11 @@ pub enum Event {
     VerticalScrollTick { delta: f64 },
 
     /// A mouse scroll has been detected.
-    Scroll { delta: f64 },
+    Scroll {
+        delta: f64,
+        /// Whether this delta belongs to `AppKit`'s momentum phase.
+        is_momentum: bool,
+    },
 
     /// Fingers have been placed on the touchpad.
     TouchpadDown,

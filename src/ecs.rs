@@ -188,6 +188,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         Update,
         (
             triggers::front_switched_trigger,
+            focus::application_focus_changed_trigger,
             triggers::window_focused_trigger,
             triggers::mission_control_trigger,
             observation::application_event_trigger,
@@ -300,8 +301,13 @@ pub struct Scrolling {
     pub snap_pending: bool,
     /// Movement is still being supplied by the user or native scroll stream.
     pub is_user_swiping: bool,
-    /// An explicit trackpad begin is awaiting its end, blocking inactivity fallback.
+    /// A native trackpad gesture, including momentum, is awaiting its terminal phase.
     pub gesture_active: bool,
+    /// Fingers are still physically touching the trackpad.
+    ///
+    /// Only physical contact uses the long stale-event watchdog. Momentum uses
+    /// the short input-idle fallback because `AppKit` can omit its terminal event.
+    pub(crate) physical_contact: PhysicalContact,
     /// One-hop paging bounds and release decision captured for this gesture.
     pub paging_gesture: Option<PagingGesture>,
     /// Transient edge-only visual displacement; logical and persisted positions stay clamped.
@@ -322,11 +328,25 @@ impl Default for Scrolling {
             snap_pending: false,
             is_user_swiping: false,
             gesture_active: false,
+            physical_contact: PhysicalContact::Inactive,
             paging_gesture: None,
             edge_overscroll: scroll::overscroll::EdgeOverscroll::default(),
             scroll_focus_origin: None,
             last_event: Instant::now(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PhysicalContact {
+    Active,
+    #[default]
+    Inactive,
+}
+
+impl PhysicalContact {
+    pub(crate) const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
     }
 }
 
@@ -717,9 +737,8 @@ impl SpawnCommandsExt for Commands<'_, '_> {
 
     #[instrument(level = Level::TRACE, skip(self))]
     fn focus_entity(&mut self, entity: Entity, raise: bool) {
-        if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(FocusedMarker);
-            self.trigger(focus::FocusWindow { entity, raise });
+        if self.get_entity(entity).is_ok() {
+            self.trigger(focus::FocusWindow::standard(entity, raise));
         }
     }
 

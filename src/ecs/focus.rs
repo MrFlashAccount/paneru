@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use bevy::app::{App, Plugin, PostUpdate};
 use bevy::ecs::entity::Entity;
@@ -23,6 +24,8 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{AxMainThread, WorkspaceId};
+
+pub(crate) mod tier;
 
 #[derive(Default)]
 pub struct TierMemory {
@@ -87,12 +90,15 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
+        app.init_resource::<FocusIntentState>();
+        app.init_resource::<tier::ManagedTierRaiseState>();
         app.init_resource::<FocusRecoveryDeadline>();
         app.add_systems(
             PostUpdate,
             (
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
+                reconcile_focus_intent,
                 recover_lost_focus,
             ),
         );
@@ -109,6 +115,186 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+    pub suppress_side_effects: bool,
+}
+
+impl FocusWindow {
+    pub(super) const fn standard(entity: Entity, raise: bool) -> Self {
+        Self {
+            entity,
+            raise,
+            suppress_side_effects: false,
+        }
+    }
+}
+
+/// UI-element notifications carry only an application-level focus hint.
+/// Resolve the application's focused-window attribute before publishing an
+/// exact window confirmation.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn application_focus_changed_trigger(
+    _main_thread: NonSend<AxMainThread>,
+    mut messages: bevy::ecs::message::MessageReader<Event>,
+    applications: Query<&Application>,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::ApplicationFocusChanged { pid } = *event else {
+            continue;
+        };
+        let Some(app) = applications
+            .iter()
+            .find(|app| app.pid() == pid && app.is_frontmost())
+        else {
+            continue;
+        };
+        if let Ok(window_id) = app.focused_window_id() {
+            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+        }
+    }
+}
+
+const FOCUS_RETRY_DELAY: Duration = Duration::from_millis(40);
+const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingFocusIntent {
+    generation: u64,
+    entity: Entity,
+    window_id: crate::platform::WinID,
+    retry_at: Instant,
+    expires_at: Instant,
+    retried: bool,
+    raise: bool,
+    suppress_side_effects: bool,
+}
+
+/// Separates the latest requested native focus from the last focus confirmed
+/// by macOS. Replacing `pending` is the cancellation mechanism: callbacks and
+/// watchdog work for an older generation can no longer publish stale focus.
+#[derive(Default, Resource)]
+pub(crate) struct FocusIntentState {
+    generation: u64,
+    pending: Option<PendingFocusIntent>,
+}
+
+impl FocusIntentState {
+    pub(crate) fn request(
+        &mut self,
+        entity: Entity,
+        window_id: crate::platform::WinID,
+        raise: bool,
+        suppress_side_effects: bool,
+        now: Instant,
+    ) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = Some(PendingFocusIntent {
+            generation: self.generation,
+            entity,
+            window_id,
+            retry_at: now + FOCUS_RETRY_DELAY,
+            expires_at: now + FOCUS_CONFIRM_TIMEOUT,
+            retried: false,
+            raise,
+            suppress_side_effects,
+        });
+        self.generation
+    }
+
+    pub(crate) fn effective_entity(&self, confirmed: Option<Entity>) -> Option<Entity> {
+        self.pending
+            .map_or(confirmed, |pending| Some(pending.entity))
+    }
+
+    pub(crate) fn pending(&self) -> Option<PendingFocusIntent> {
+        self.pending
+    }
+
+    pub(crate) fn pending_suppresses_side_effects(&self) -> bool {
+        self.pending
+            .is_some_and(|pending| pending.suppress_side_effects)
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.pending.map(|pending| {
+            if pending.retried {
+                pending.expires_at
+            } else {
+                pending.retry_at
+            }
+        })
+    }
+
+    pub(crate) fn confirmation_policy(
+        &mut self,
+        window_id: crate::platform::WinID,
+    ) -> Option<bool> {
+        let Some(pending) = self.pending else {
+            return Some(false);
+        };
+        if pending.window_id != window_id {
+            return None;
+        }
+        self.pending = None;
+        Some(pending.suppress_side_effects)
+    }
+
+    fn mark_retried(&mut self, generation: u64) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        if pending.generation != generation {
+            return false;
+        }
+        pending.retried = true;
+        true
+    }
+
+    fn clear_generation(&mut self, generation: u64) -> bool {
+        if self
+            .pending
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Accepts a focus confirmation only when macOS still reports both the target
+/// application frontmost and the exact target window focused.
+pub(crate) fn exact_confirmation_policy(
+    app: &Application,
+    focus_intent: &mut FocusIntentState,
+    window_id: crate::platform::WinID,
+) -> Option<bool> {
+    if !app.is_frontmost() || app.focused_window_id().ok() != Some(window_id) {
+        return None;
+    }
+    if focus_intent
+        .pending()
+        .is_some_and(|pending| pending.window_id != window_id)
+    {
+        let superseded = focus_intent.pending();
+        focus_intent.pending = None;
+        debug!(
+            window_id,
+            pending = ?superseded,
+            "authoritative external focus superseded pending intent"
+        );
+        return Some(false);
+    }
+    let policy = focus_intent.confirmation_policy(window_id);
+    if policy.is_none() {
+        debug!(
+            window_id,
+            pending = ?focus_intent.pending(),
+            "ignoring exact focus for a superseded intent"
+        );
+    }
+    policy
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -299,14 +485,31 @@ fn focus_window_trigger(
     _main_thread: NonSend<AxMainThread>,
     windows: Windows,
     apps: Query<&Application>,
+    mut intent: ResMut<FocusIntentState>,
 ) {
-    let FocusWindow { entity, raise } = *trigger.event();
+    let FocusWindow {
+        entity,
+        raise,
+        suppress_side_effects,
+    } = *trigger.event();
     let Some(window) = windows.get(entity) else {
         return;
     };
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
+    let generation = intent.request(
+        entity,
+        window.id(),
+        raise,
+        suppress_side_effects,
+        Instant::now(),
+    );
+    debug!(
+        generation,
+        window_id = window.id(),
+        "requesting native window focus"
+    );
     if !raise
         && let Some((focused_window, _)) = windows.focused()
         && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
@@ -317,15 +520,101 @@ fn focus_window_trigger(
     }
 }
 
+/// Performs one bounded, state-checked retry and authoritative readback.
+/// Deadlines only wake the runtime; app-frontmost plus AX focused-window
+/// equality remains the source of truth.
+#[allow(clippy::needless_pass_by_value)]
+fn reconcile_focus_intent(
+    _main_thread: NonSend<AxMainThread>,
+    windows: Windows,
+    apps: Query<&Application>,
+    mut intent: ResMut<FocusIntentState>,
+    mut global_state: GlobalState,
+    mut commands: Commands,
+) {
+    let Some(pending) = intent.pending() else {
+        return;
+    };
+    let now = Instant::now();
+    let due = if pending.retried {
+        now >= pending.expires_at
+    } else {
+        now >= pending.retry_at
+    };
+    if !due {
+        return;
+    }
+
+    let Some((window, entity, parent)) = windows.find_parent(pending.window_id) else {
+        intent.clear_generation(pending.generation);
+        return;
+    };
+    let Ok(app) = apps.get(parent) else {
+        intent.clear_generation(pending.generation);
+        return;
+    };
+    let actual_focus = app
+        .is_frontmost()
+        .then(|| app.focused_window_id().ok())
+        .flatten();
+    if entity == pending.entity && actual_focus == Some(pending.window_id) {
+        // Leave the intent pending until the exact event is reconciled so its
+        // side-effect policy travels with the confirmation.
+        commands.trigger(SendMessageTrigger(Event::WindowFocused {
+            window_id: pending.window_id,
+        }));
+        return;
+    }
+
+    if !pending.retried {
+        if intent.mark_retried(pending.generation) {
+            debug!(
+                generation = pending.generation,
+                window_id = pending.window_id,
+                "native focus not confirmed; retrying exact target once"
+            );
+            if pending.raise {
+                window.focus_with_raise(app.psn());
+            } else if let Some((focused_window, _)) = windows.focused()
+                && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+            {
+                window.focus_without_raise(app.psn(), focused_window, focused_psn);
+            } else {
+                warn!(
+                    generation = pending.generation,
+                    window_id = pending.window_id,
+                    "no-raise focus retry skipped without a confirmed focused window"
+                );
+            }
+        }
+        return;
+    }
+
+    if intent.clear_generation(pending.generation) {
+        warn!(
+            generation = pending.generation,
+            target_window_id = pending.window_id,
+            actual_window_id = ?actual_focus,
+            "native focus intent expired without exact confirmation"
+        );
+        global_state.set_skip_reshuffle(false);
+        global_state.set_ffm_flag(None);
+        if let Some(window_id) = actual_focus {
+            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn recover_lost_focus(
     windows: Windows,
     active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    intent: Res<FocusIntentState>,
     mut deadline: ResMut<FocusRecoveryDeadline>,
     mut commands: Commands,
 ) {
-    if windows.focused().is_some() {
+    if windows.focused().is_some() || intent.pending().is_some() {
         return;
     }
     let now = std::time::Instant::now();
@@ -442,5 +731,22 @@ mod tests {
         history.forget_workspace(1);
 
         assert_eq!(history.last_managed(1), None);
+    }
+
+    #[test]
+    fn latest_focus_intent_rejects_superseded_confirmation() {
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        let now = Instant::now();
+        let mut intent = FocusIntentState::default();
+
+        intent.request(first, 10, true, false, now);
+        intent.request(second, 20, true, true, now);
+
+        assert_eq!(intent.confirmation_policy(10), None);
+        assert_eq!(intent.effective_entity(Some(first)), Some(second));
+        assert_eq!(intent.confirmation_policy(20), Some(true));
+        assert_eq!(intent.effective_entity(Some(first)), Some(first));
     }
 }

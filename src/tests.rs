@@ -1,4 +1,6 @@
 mod display;
+mod focus_layer;
+mod focus_tier;
 mod harness;
 mod interaction;
 mod mocks;

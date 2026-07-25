@@ -18,7 +18,8 @@ use super::{
 use crate::commands::set_last_focused_window_target;
 use crate::config::Config;
 use crate::ecs::floating::{clamp_origin_to_bounds, offset_frame_within_bounds};
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::tier::{ManagedTierRaiseState, reconcile_confirmed_focus};
+use crate::ecs::focus::{FocusHistory, FocusIntentState, exact_confirmation_policy};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::observation::{
     ApplicationObservationScope, attach_managed_window, detach_unmanaged_window,
@@ -62,6 +63,7 @@ pub(super) fn front_switched_trigger(
     mut observation: ApplicationObservationScope,
     window_manager: Res<WindowManager>,
     runtime_config: Res<Config>,
+    focus_intent: Res<FocusIntentState>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
@@ -98,7 +100,8 @@ pub(super) fn front_switched_trigger(
         if let Ok(focused_id) = focused_id.inspect_err(|err| {
             warn!("can not get current focus: {err}");
         }) {
-            if let Some(point) = window_manager.cursor_position()
+            if !focus_intent.pending_suppresses_side_effects()
+                && let Some(point) = window_manager.cursor_position()
                 && window_manager
                     .find_window_at_point(&point)
                     .is_ok_and(|window_id| window_id != focused_id)
@@ -183,18 +186,7 @@ pub(super) fn theme_change_trigger(
     }
 }
 
-/// Handles the event when a window gains focus. It updates the focused window, PSN, and reshuffles windows.
-/// It also centers the mouse on the focused window if focus-follows-mouse is enabled.
-///
-/// # Arguments
-///
-/// * `trigger` - The Bevy event trigger containing the window focused event.
-/// * `applications` - A query for all applications.
-/// * `windows` - A query for all windows with their parent and focus state.
-/// * `main_cid` - The main connection ID resource.
-/// * `focus_follows_mouse_id` - The resource to track focus follows mouse window ID.
-/// * `skip_reshuffle` - The resource to indicate if reshuffling should be skipped.
-/// * `commands` - Bevy commands to manage components and trigger events.
+/// Reconciles an exact OS-confirmed focused window into ECS state.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_focused_trigger(
@@ -205,8 +197,10 @@ pub(super) fn window_focused_trigger(
     dispositions: Query<&WindowDisposition>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut focus_history: ResMut<FocusHistory>,
+    mut focus_intent: ResMut<FocusIntentState>,
+    mut tier_raise: ResMut<ManagedTierRaiseState>,
     config: Res<Config>,
-    global_state: GlobalState,
+    mut global_state: GlobalState,
     mut commands: Commands,
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
@@ -231,28 +225,21 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        // Always keep passthrough in sync. An internal focus_entity call races
-        // with the OS WindowFocused event; without this the passthrough keys
-        // remain stale from a previously focused window.
-        update_passthrough(window, app, &config);
-
         let already_focused = windows
             .focused()
             .is_some_and(|(focused, _)| focused.id() == window_id);
 
-        // Guard against stale focus events. Without these checks, delayed
-        // events (e.g. from RetryFrontSwitch or dont_focus re-assertions)
-        // can pull FocusedMarker back to an old window after focus has moved on.
-        //
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
+        let Some(suppress_side_effects) =
+            exact_confirmation_policy(app, &mut focus_intent, window_id)
+        else {
             continue;
+        };
+        if suppress_side_effects {
+            global_state.set_skip_reshuffle(true);
+            global_state.set_ffm_flag(Some(window_id));
         }
-        if app.focused_window_id().is_ok_and(|id| id != window_id) {
-            continue;
-        }
+
+        update_passthrough(window, app, &config);
         set_last_focused_window_target(window_id);
 
         let managed = windows
@@ -272,12 +259,8 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        // Handle tab switching: if the focused window is a tab, make it the leader.
-        // Also reactivate the owning virtual strip before treating duplicate
-        // focus as a no-op; the focus marker can be stale on a hidden strip.
-        // Track the active workspace as a fallback so focus_history can record
-        // a workspace id even when the entity hasn't been routed into a strip.
         let mut owner = None;
+        let mut owner_windows = None;
         let mut owning_workspace_id = None;
         let mut active_workspace_id = None;
         for (strip_entity, mut strip, active) in &mut workspaces {
@@ -291,12 +274,12 @@ pub(super) fn window_focused_trigger(
                     column.move_to_front(entity);
                 }
                 owning_workspace_id = Some(strip.id());
+                owner_windows = Some(strip.all_windows());
                 owner = Some((strip_entity, active));
             }
         }
 
         if owner.is_none() && managed.is_none() {
-            // The window just spawned and has not yet been inserted into the strip.
             continue;
         }
 
@@ -307,13 +290,17 @@ pub(super) fn window_focused_trigger(
             entity_commands.try_insert(ActiveWorkspaceMarker);
         }
 
-        // Record before the already-focused short-circuit below: focus_entity
-        // sets FocusedMarker synchronously, so OS-confirmed events for the
-        // same entity would otherwise skip the write.
         if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
             let unmanaged = windows.get_managed(entity).and_then(|(_, _, u)| u);
             focus_history.record(workspace_id, entity, unmanaged);
         }
+        reconcile_confirmed_focus(
+            entity,
+            owner_windows.as_deref(),
+            &windows,
+            &dispositions,
+            &mut tier_raise,
+        );
 
         if already_focused {
             if managed.is_none() && !global_state.skip_reshuffle() && !global_state.initializing() {
@@ -1050,6 +1037,7 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    focus_intent: Res<FocusIntentState>,
     mut commands: Commands,
 ) {
     for entity in added {
@@ -1167,7 +1155,9 @@ pub(super) fn apply_window_positions(
         // reshuffle after all windows are added.
         if initializing.is_none() {
             if properties.dont_focus() {
-                if let Some((focus, prev)) = windows.focused() {
+                if focus_intent.pending().is_none()
+                    && let Some((focus, prev)) = windows.focused()
+                {
                     debug!(
                         "Not focusing new window {entity}, keeping focus on '{}'",
                         focus.title().unwrap_or_default()

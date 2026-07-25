@@ -372,7 +372,10 @@ fn modifier_scroll_uses_native_momentum_without_synthetic_velocity() {
         Event::Command {
             command: Command::Window(Operation::SetWidth(2.0)),
         },
-        Event::Scroll { delta: 1.0 },
+        Event::Scroll {
+            delta: 1.0,
+            is_momentum: false,
+        },
         Event::Command {
             command: Command::PrintState,
         },
@@ -408,7 +411,10 @@ paging = false
         Event::Command {
             command: Command::Window(Operation::SetWidth(2.0)),
         },
-        Event::Scroll { delta: 1.0 },
+        Event::Scroll {
+            delta: 1.0,
+            is_momentum: false,
+        },
     ];
 
     TestHarness::new()
@@ -795,11 +801,7 @@ fn test_rapid_focus_not_swallowed() {
         command: Command::Window(Operation::Focus(Direction::West)),
     };
     for _ in 0..3 {
-        harness
-            .app
-            .world_mut()
-            .write_message::<Event>(focus_west.clone());
-        harness.app.update();
+        harness.run(vec![focus_west.clone()]);
     }
 
     assert_focused!(harness.world(), 1);

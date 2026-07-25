@@ -37,6 +37,8 @@ use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+mod focus;
+
 /// macOS may partially apply an AX width increase when the requested right edge
 /// would be far outside the display. Moving the partial result left by the
 /// missing width before retrying gives `WindowServer` enough offscreen room.
@@ -83,11 +85,13 @@ pub trait WindowApi: Send + Sync {
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
     );
+    /// Selects this exact window for keyboard focus, activates its application,
+    /// and raises the window as one ordered native operation.
     fn focus_with_raise(&self, psn: ProcessSerialNumber);
     /// Raises the window in the OS z-order without changing focus. Used to
     /// shuffle the floating-vs-tiled tier order. Best-effort: AX raise can't
     /// lift a window above another app's frontmost window.
-    fn raise_without_focus(&self);
+    fn raise_without_focus(&self) -> bool;
     fn pid(&self) -> Result<Pid>;
     fn set_padding(&mut self, padding: WindowPadding);
     fn horizontal_padding(&self) -> i32;
@@ -649,21 +653,19 @@ impl WindowApi for WindowOS {
     /// Focuses the window and raises it to the front.
     #[instrument(level = Level::DEBUG)]
     fn focus_with_raise(&self, psn: ProcessSerialNumber) {
-        let window_id = self.id();
-        unsafe {
-            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
-        }
-        self.make_key_window(&psn);
-        let element_ref = self.ax_element.as_ptr();
-        let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        focus::focus_with_raise(self, psn);
     }
 
     #[instrument(level = Level::DEBUG)]
-    fn raise_without_focus(&self) {
+    fn raise_without_focus(&self) -> bool {
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        let result =
+            unsafe { AXUIElementPerformAction(element_ref, &action) }.to_result(function_name!());
+        if let Err(err) = &result {
+            warn!(window_id = self.id(), "AX raise failed: {err}");
+        }
+        result.is_ok()
     }
 
     fn pid(&self) -> Result<Pid> {

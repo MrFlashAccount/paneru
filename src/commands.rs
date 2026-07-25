@@ -546,7 +546,7 @@ fn command_raise_floating(
 
     for (window, entity) in windows.iter() {
         if is_visible_float(entity) && Some(entity) != target {
-            window.raise_without_focus();
+            let _ = window.raise_without_focus();
         }
     }
 
@@ -604,7 +604,7 @@ fn command_toggle_floating_layer(
             return;
         }
         if let Some(window) = windows.get(entity) {
-            window.raise_without_focus();
+            let _ = window.raise_without_focus();
         }
     };
     match target_layer {

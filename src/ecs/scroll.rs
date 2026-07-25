@@ -8,25 +8,33 @@ use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
-use tracing::{Level, instrument};
+use tracing::{Level, debug, instrument, trace};
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
+use crate::ecs::focus::FocusIntentState;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, MissionControlActive, PagingGesture, Position, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt,
+    ActiveWorkspaceMarker, DockPosition, MissionControlActive, PagingGesture, PhysicalContact,
+    Position, Scrolling, SendMessageTrigger,
 };
 use crate::errors::Result;
 use crate::events::Event;
 use crate::manager::{Display, Window, WindowManager};
 use crate::platform::Modifiers;
 
+mod focus;
 mod motion;
 pub(crate) mod overscroll;
 mod paging;
+#[cfg(test)]
+use focus::has_aligned_edge as focus_has_aligned_edge;
+use focus::request_for_offset as request_scroll_focus;
+use focus::request_when_aligned as request_scroll_focus_when_aligned;
+#[cfg(test)]
+use focus::target_after_scroll as focus_target_after_scroll;
 use motion::{reconcile_integrated_position, smooth_native_scroll};
 use overscroll::apply_edge_overscroll;
 use paging::{
@@ -62,7 +70,8 @@ fn snap_mode(paging: bool, sticky: bool, auto_center: bool) -> SnapMode {
 
 #[derive(Default)]
 struct GestureInput {
-    scroll_delta: Option<f64>,
+    physical_scroll_delta: Option<f64>,
+    momentum_scroll_delta: Option<f64>,
     gesture_delta: Option<f64>,
     touchpad_down: Option<usize>,
     touchpad_physical_up: Option<usize>,
@@ -100,6 +109,7 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
+                    prefocus_visible_scroll_target,
                     apply_edge_overscroll,
                     swiping_timeout,
                 )
@@ -122,9 +132,12 @@ fn cleanup_detached_scrolling(
     }
 }
 
-// This ECS system intentionally keeps event aggregation and component updates
-// in one schedule boundary; pure paging math lives in `scroll::paging`.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+// Event aggregation and component updates share one schedule boundary; paging math is separate.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn swipe_gesture(
     mut messages: MessageReader<Event>,
@@ -134,33 +147,31 @@ fn swipe_gesture(
         With<ActiveWorkspaceMarker>,
     >,
     windows: Windows,
+    focus_intent: Res<FocusIntentState>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
     let snap_enabled = config.swipe_paging() || config.sticky_scroll() || config.auto_center();
-    // Normalization: Touchpad deltas are typically small fractions.
-    // Scroll wheel deltas can be larger. We scale it down slightly
-    // to match the "feel" of a finger swipe.
+    // Scale larger scroll-wheel deltas down toward fractional touchpad input.
     const SCROLL_SCALE_UPPER: f64 = 0.15;
     const SCROLL_SCALE_LOWER: f64 = 0.005;
     const SCROLL_FULL_RANGE: f64 = 2.0;
     let scroll_scale = SCROLL_SCALE_LOWER
         + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
     let input = read_gesture_input(&mut messages, &config, scroll_scale);
-    // A fast second gesture can arrive in the same ECS batch as terminal
-    // events from the first. Only lifecycle phases after the latest Down
-    // belong to the new contact; otherwise the old Up closes its input latch.
+    // Only phases after the latest Down belong to a fast second gesture.
     let touchpad_down = input.touchpad_down.is_some();
     let touchpad_physical_up = input.belongs_to_latest_contact(input.touchpad_physical_up);
     let touchpad_momentum_start = input.belongs_to_latest_contact(input.touchpad_momentum_start);
     let touchpad_up = input.belongs_to_latest_contact(input.touchpad_up);
-    let scroll_delta = input.scroll_delta;
+    let physical_scroll_delta = input.physical_scroll_delta;
+    let momentum_scroll_delta = input.momentum_scroll_delta;
     let gesture_delta = input.gesture_delta;
     let has_gesture_event = gesture_delta.is_some();
-    let has_scroll_event = scroll_delta.is_some() || has_gesture_event;
-    let scroll_delta = scroll_delta.unwrap_or_default();
+    let has_scroll_event =
+        physical_scroll_delta.is_some() || momentum_scroll_delta.is_some() || has_gesture_event;
     let gesture_delta = gesture_delta.unwrap_or_default();
 
     if !touchpad_down
@@ -179,16 +190,25 @@ fn swipe_gesture(
             || scrolling.snap_pending
             || scrolling.paging_gesture.is_some()
     });
+    let momentum_has_owner = !touchpad_down
+        && (scrolling
+            .as_ref()
+            .is_some_and(|scrolling| scrolling.gesture_active)
+            || (touchpad_momentum_start && has_active_session));
+    let accepts_momentum_scroll = accepts_scroll_delta(true, momentum_has_owner);
+    let ignored_orphaned_momentum = momentum_scroll_delta.is_some() && !accepts_momentum_scroll;
+    let scroll_delta = physical_scroll_delta.unwrap_or_default()
+        + momentum_scroll_delta
+            .filter(|_| accepts_momentum_scroll)
+            .unwrap_or_default();
+    let has_scroll_event = scroll_delta != 0.0 || has_gesture_event;
     let settling_motion_in_flight = scrolling.as_ref().is_some_and(|scrolling| {
         !scrolling.gesture_active
             && !scrolling.is_user_swiping
             && scrolling.target_position.is_some()
     });
-    // A fresh physical contact always starts a new gesture, even when the
-    // previous snap animation or momentum has not ended yet. Reusing that old
-    // paging session would keep its consumed edge as the one-hop bound and make
-    // the first swipe towards the next window a no-op. `TouchpadDown` is
-    // emitted only for AppKit's Began phase, not for Changed events.
+    // Fresh contact interrupts old snap/momentum and its consumed one-hop bound.
+    // `TouchpadDown` represents AppKit Began, not Changed.
     let starts_new_gesture = touchpad_down
         || ((!has_active_session || settling_motion_in_flight)
             && has_scroll_event
@@ -197,6 +217,41 @@ fn swipe_gesture(
                 .as_ref()
                 .is_none_or(|scrolling| !scrolling.is_user_swiping));
     let resumes_gesture = has_active_session && touchpad_momentum_start && !starts_new_gesture;
+    trace!(
+        touchpad_down,
+        touchpad_physical_up,
+        touchpad_momentum_start,
+        touchpad_up,
+        has_scroll_event,
+        has_physical_scroll = physical_scroll_delta.is_some(),
+        has_momentum_scroll = momentum_scroll_delta.is_some(),
+        ignored_orphaned_momentum,
+        scroll_delta,
+        gesture_delta,
+        has_active_session,
+        settling_motion_in_flight,
+        starts_new_gesture,
+        resumes_gesture,
+        current_gesture_active = scrolling
+            .as_ref()
+            .is_some_and(|scroll| scroll.gesture_active),
+        current_physical_contact_active = scrolling
+            .as_ref()
+            .is_some_and(|scroll| scroll.physical_contact.is_active()),
+        current_user_swiping = scrolling
+            .as_ref()
+            .is_some_and(|scroll| scroll.is_user_swiping),
+        current_snap_pending = scrolling
+            .as_ref()
+            .is_some_and(|scroll| scroll.snap_pending),
+        current_target = ?scrolling
+            .as_ref()
+            .and_then(|scroll| scroll.target_position),
+        current_focus_origin = ?scrolling
+            .as_ref()
+            .and_then(|scroll| scroll.scroll_focus_origin),
+        "aggregated scroll gesture input"
+    );
     let viewport = active_display.actual_bounds(&config);
     let paging_gesture = (config.swipe_paging() && starts_new_gesture)
         .then(|| {
@@ -211,12 +266,32 @@ fn swipe_gesture(
         .flatten();
     let scroll_focus_origin = starts_new_gesture
         .then(|| {
-            windows
-                .focused()
-                .map(|(_, entity)| entity)
+            focus_intent
+                .effective_entity(windows.focused().map(|(_, entity)| entity))
                 .filter(|entity| layout_strip.contains(*entity))
         })
         .flatten();
+    if touchpad_down
+        || touchpad_physical_up
+        || touchpad_momentum_start
+        || touchpad_up
+        || starts_new_gesture
+    {
+        debug!(
+            touchpad_down,
+            touchpad_physical_up,
+            touchpad_momentum_start,
+            touchpad_up,
+            starts_new_gesture,
+            resumes_gesture,
+            has_active_session,
+            settling_motion_in_flight,
+            confirmed_focus = ?windows.focused().map(|(_, entity)| entity),
+            pending_focus = ?focus_intent.pending(),
+            selected_focus_origin = ?scroll_focus_origin,
+            "scroll gesture lifecycle"
+        );
+    }
 
     begin_touchpad_gesture(
         starts_new_gesture,
@@ -228,8 +303,7 @@ fn swipe_gesture(
     if starts_new_gesture && let Some(scrolling) = scrolling.as_deref_mut() {
         scrolling.scroll_focus_origin = scroll_focus_origin;
     }
-    // AppKit can report physical Ended and momentum Began together. Apply the
-    // physical end first so the momentum phase remains the final state.
+    // Apply simultaneous physical Ended before momentum Began.
     mark_physical_touch_end(touchpad_physical_up, scrolling.as_deref_mut());
     resume_touchpad_gesture(resumes_gesture, scrolling.as_deref_mut());
 
@@ -252,8 +326,7 @@ fn swipe_gesture(
     }
 
     if has_scroll_event {
-        // Preserve the established gesture-distance normalization. Paging
-        // anchors themselves use the usable viewport below.
+        // Preserve established distance normalization; paging uses the usable viewport.
         let viewport_width = f64::from(active_display.bounds().width());
         let dt = time.delta_secs_f64();
         let new_velocity = if has_gesture_event && dt > 0.0 {
@@ -285,8 +358,7 @@ fn swipe_gesture(
             }
 
             if scroll_delta != 0.0 {
-                // A new physical gesture interrupts an in-flight sticky snap.
-                // Native momentum events keep extending the same target.
+                // Physical input interrupts sticky snap; momentum extends its target.
                 if !was_user_swiping {
                     scrolling.target_position = None;
                 }
@@ -304,6 +376,11 @@ fn swipe_gesture(
                 snap_pending: snap_enabled,
                 is_user_swiping: !touchpad_up && (touchpad_down || has_scroll_event),
                 gesture_active: touchpad_down && !touchpad_up,
+                physical_contact: if touchpad_down && !touchpad_up {
+                    PhysicalContact::Active
+                } else {
+                    PhysicalContact::Inactive
+                },
                 paging_gesture,
                 edge_overscroll: if starts_new_gesture {
                     overscroll::EdgeOverscroll::armed()
@@ -314,16 +391,18 @@ fn swipe_gesture(
                 last_event: Instant::now(),
             };
             constrain_paging_motion(&mut scrolling, direction_modifier, true);
-            // Commands are deferred, so lifecycle handlers above could not
-            // mutate this brand-new component. Replay terminal phases before
-            // insertion; otherwise a short Began + delta + Ended batch leaves
-            // the rubber band armed and visually stuck.
+            // Replay terminal phases before deferred insertion so a short
+            // Began + delta + Ended batch cannot leave the rubber band armed.
             apply_initial_touchpad_lifecycle(&mut scrolling, initial_lifecycle);
             entity_commands.try_insert(scrolling);
         }
     }
 
     finish_touchpad_gesture(touchpad_up, direction_modifier, scrolling.as_deref_mut());
+}
+
+fn accepts_scroll_delta(is_momentum: bool, momentum_has_owner: bool) -> bool {
+    !is_momentum || momentum_has_owner
 }
 
 fn read_gesture_input(
@@ -334,12 +413,21 @@ fn read_gesture_input(
     let mut input = GestureInput::default();
     for (order, event) in messages.read().enumerate() {
         match event {
-            Event::TouchpadDown => input.touchpad_down = Some(order),
+            Event::TouchpadDown => {
+                input.touchpad_down = Some(order);
+                input.physical_scroll_delta = None;
+                input.momentum_scroll_delta = None;
+            }
             Event::TouchpadPhysicalUp => input.touchpad_physical_up = Some(order),
             Event::TouchpadMomentumStart => input.touchpad_momentum_start = Some(order),
             Event::TouchpadUp => input.touchpad_up = Some(order),
-            Event::Scroll { delta } => {
-                *input.scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
+            Event::Scroll { delta, is_momentum } => {
+                let scroll_delta = if *is_momentum {
+                    &mut input.momentum_scroll_delta
+                } else {
+                    &mut input.physical_scroll_delta
+                };
+                *scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
             }
             Event::Swipe { delta, fingers }
                 if config
@@ -369,6 +457,7 @@ fn insert_touchpad_begin_state(
             snap_pending: snap_enabled,
             is_user_swiping: true,
             gesture_active: true,
+            physical_contact: PhysicalContact::Active,
             paging_gesture,
             edge_overscroll: overscroll::EdgeOverscroll::armed(),
             scroll_focus_origin,
@@ -436,6 +525,11 @@ fn begin_touchpad_gesture(
         scrolling.snap_pending = snap_enabled;
         scrolling.is_user_swiping = true;
         scrolling.gesture_active = touchpad_down;
+        scrolling.physical_contact = if touchpad_down {
+            PhysicalContact::Active
+        } else {
+            PhysicalContact::Inactive
+        };
         scrolling.paging_gesture = paging_gesture;
         scrolling.last_event = Instant::now();
     }
@@ -445,9 +539,8 @@ fn resume_touchpad_gesture(resumes_gesture: bool, scrolling: Option<&mut Scrolli
     if resumes_gesture && let Some(scrolling) = scrolling {
         scrolling.snap_pending = true;
         scrolling.is_user_swiping = true;
-        // Momentum resumes the active paging session, while overscroll's
-        // physical-input latch remains closed independently after finger lift.
         scrolling.gesture_active = true;
+        scrolling.physical_contact = PhysicalContact::Inactive;
         scrolling.last_event = Instant::now();
     }
 }
@@ -456,6 +549,7 @@ fn mark_physical_touch_end(physical_up: bool, scrolling: Option<&mut Scrolling>)
     if physical_up && let Some(scrolling) = scrolling {
         scrolling.edge_overscroll.release();
         scrolling.gesture_active = false;
+        scrolling.physical_contact = PhysicalContact::Inactive;
         // Physical lift is not the terminal native-scroll phase: momentum may
         // continue the same logical paging gesture, but it no longer owns the
         // rubber band.
@@ -477,6 +571,7 @@ fn finish_touchpad_gesture(
             paging.release_velocity = scrolling.velocity * direction_modifier;
         }
         scrolling.gesture_active = false;
+        scrolling.physical_contact = PhysicalContact::Inactive;
         scrolling.is_user_swiping = false;
     }
 }
@@ -489,12 +584,9 @@ pub(super) fn scrolling_needs_frame(scroll: &Scrolling) -> bool {
 }
 
 pub(super) fn scrolling_deadline(scroll: &Scrolling) -> Option<Instant> {
-    if scroll.gesture_active {
+    if scroll.physical_contact.is_active() {
         Some(scroll.last_event + STALE_GESTURE_TIMEOUT)
-    } else if scroll.is_user_swiping
-        && scroll.target_position.is_none()
-        && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
-    {
+    } else if scroll.gesture_active || scroll.is_user_swiping {
         Some(scroll.last_event + FINGER_LIFT_THRESHOLD)
     } else {
         None
@@ -502,10 +594,11 @@ pub(super) fn scrolling_deadline(scroll: &Scrolling) -> Option<Instant> {
 }
 
 fn expire_stale_gesture(scroll: &mut Scrolling, now: Instant) -> bool {
-    if scroll.gesture_active
+    if scroll.physical_contact.is_active()
         && now.saturating_duration_since(scroll.last_event) >= STALE_GESTURE_TIMEOUT
     {
         scroll.gesture_active = false;
+        scroll.physical_contact = PhysicalContact::Inactive;
         scroll.is_user_swiping = false;
         scroll.edge_overscroll.release();
         true
@@ -537,6 +630,7 @@ pub(super) fn swiping_timeout(
     config: Res<Config>,
     window_manager: Res<WindowManager>,
     windows: Windows,
+    focus_intent: Res<FocusIntentState>,
     mut global_state: GlobalState,
     mut commands: Commands,
 ) {
@@ -550,47 +644,21 @@ pub(super) fn swiping_timeout(
         let viewport = display.actual_display_bounds(dock, &config);
         let viewport_width = f64::from(viewport.width());
         expire_stale_gesture(&mut scroll, now);
-        let timed_out = !scroll.gesture_active
+        let timed_out = !scroll.physical_contact.is_active()
             && now.saturating_duration_since(scroll.last_event) >= FINGER_LIFT_THRESHOLD;
         let outcome = update_swipe_timeout(&mut scroll, timed_out, dt, viewport_width);
-        let focus_handoff_ready = outcome.remove
-            || (!scroll.gesture_active
-                && !scroll.is_user_swiping
-                && scroll.target_position.is_none()
-                && scroll.velocity.abs() <= SCROLL_VELOCITY_EPSILON
-                && !scroll.edge_overscroll.is_active()
-                && !scroll.snap_pending);
-        if focus_handoff_ready {
-            let focused = windows.focused().map(|(_, entity)| entity);
-            if active
-                && scroll
-                    .scroll_focus_origin
-                    .is_some_and(|origin| Some(origin) == focused)
-            {
-                let target = focus_target_after_scroll(
-                    &viewport,
-                    position.x,
-                    strip.columns().filter_map(|column| {
-                        let geometry_entity = column.top()?;
-                        let focus_entity = focused
-                            .filter(|entity| column.position_of(*entity).is_some())
-                            .unwrap_or(geometry_entity);
-                        let layout_x = windows.layout_position(geometry_entity)?.0.x;
-                        let width = column.width(&|entity| windows.moving_frame(entity))?;
-                        Some((focus_entity, layout_x, width))
-                    }),
-                );
-                if let Some(target) = target.filter(|target| Some(*target) != focused)
-                    && let Some(window) = windows.get(target)
-                {
-                    // Scroll-selected focus must not recenter the strip or warp
-                    // the cursor, even when mouse_follows_focus is opt-in.
-                    global_state.set_skip_reshuffle(true);
-                    global_state.set_ffm_flag(Some(window.id()));
-                    commands.focus_entity(target, true);
-                    scroll.scroll_focus_origin = Some(target);
-                }
-            }
+        if outcome.remove {
+            request_scroll_focus(
+                &viewport,
+                strip,
+                position.x,
+                active,
+                &mut scroll,
+                &windows,
+                &focus_intent,
+                &mut global_state,
+                &mut commands,
+            );
         }
         if outcome.remove
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -606,35 +674,6 @@ pub(super) fn swiping_timeout(
             }));
         }
     }
-}
-
-fn focus_target_after_scroll(
-    viewport: &IRect,
-    strip_offset: i32,
-    columns: impl IntoIterator<Item = (Entity, i32, i32)>,
-) -> Option<Entity> {
-    use std::cmp::Reverse;
-
-    columns
-        .into_iter()
-        .filter(|(_, _, width)| *width > 0)
-        .filter_map(|(entity, layout_x, width)| {
-            let left = strip_offset.saturating_add(layout_x);
-            let right = left.saturating_add(width);
-            let visible_width = right
-                .min(viewport.max.x)
-                .saturating_sub(left.max(viewport.min.x));
-            (visible_width > 0).then_some((
-                entity,
-                visible_width,
-                left.abs_diff(viewport.min.x),
-                layout_x,
-            ))
-        })
-        .min_by_key(|(_, visible_width, leading_distance, layout_x)| {
-            (Reverse(*visible_width), *leading_distance, *layout_x)
-        })
-        .map(|(entity, _, _, _)| entity)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -655,6 +694,7 @@ fn update_swipe_timeout(
     }
     let emit_mouse_moved = timed_out && scroll.is_user_swiping;
     if emit_mouse_moved {
+        scroll.gesture_active = false;
         scroll.is_user_swiping = false;
     }
     SwipeTimeoutOutcome {
@@ -692,17 +732,26 @@ fn apply_inertia(
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
-    mut strips: Populated<(&LayoutStrip, &Position, &mut Scrolling, &ChildOf)>,
+    mut strips: Populated<(
+        &LayoutStrip,
+        &Position,
+        &mut Scrolling,
+        &ChildOf,
+        Has<ActiveWorkspaceMarker>,
+    )>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     windows: Windows,
+    focus_intent: Res<FocusIntentState>,
     config: Res<Config>,
+    mut global_state: GlobalState,
+    mut commands: Commands,
 ) {
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
 
     let paging = config.swipe_paging();
     let snap_padding = config.snap_padding();
     let mode = snap_mode(paging, config.sticky_scroll(), config.auto_center());
-    for (layout_strip, position, mut scroll, parent) in &mut strips {
+    for (layout_strip, position, mut scroll, parent, active) in &mut strips {
         if mode == SnapMode::Disabled {
             scroll.snap_pending = false;
             continue;
@@ -779,6 +828,25 @@ fn apply_snap_force(
             // the anchor for native modifier-scroll and raw gestures alike.
             scroll.velocity = 0.0;
             scroll.target_position = Some(f64::from(target_offset));
+            debug!(
+                ?mode,
+                active,
+                current_offset = position.x,
+                target_offset,
+                scroll_focus_origin = ?scroll.scroll_focus_origin,
+                "committed semantic scroll target"
+            );
+            request_scroll_focus(
+                &viewport,
+                layout_strip,
+                target_offset,
+                active,
+                &mut scroll,
+                &windows,
+                &focus_intent,
+                &mut global_state,
+                &mut commands,
+            );
         }
     }
 }
@@ -915,6 +983,66 @@ fn apply_scrolling_constraints(
             scroll.velocity = 0.0;
             scroll.target_position = None;
         }
+    }
+}
+
+/// Native momentum can keep emitting sub-pixel deltas after the strip has
+/// visually reached the next window. Pre-focus a target aligned to its snap edge
+/// instead of waiting for the invisible tail to end and `apply_snap_force` to
+/// commit. Scroll focus suppresses reshuffle, auto-center, and cursor movement,
+/// so this changes focus without pulling the target into the viewport.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+fn prefocus_visible_scroll_target(
+    mut strips: Populated<
+        (
+            &LayoutStrip,
+            &Position,
+            &mut Scrolling,
+            &ChildOf,
+            Has<ActiveWorkspaceMarker>,
+        ),
+        With<LayoutStrip>,
+    >,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    windows: Windows,
+    focus_intent: Res<FocusIntentState>,
+    config: Res<Config>,
+    mut global_state: GlobalState,
+    mut commands: Commands,
+) {
+    let snap_enabled = config.swipe_paging() || config.sticky_scroll() || config.auto_center();
+    if !snap_enabled {
+        return;
+    }
+
+    for (strip, position, mut scroll, parent, active) in &mut strips {
+        if !scroll.snap_pending || scroll.physical_contact.is_active() {
+            continue;
+        }
+        if scroll.target_position.is_some_and(|target| {
+            (target - scroll.position).abs() > f64::from(focus::PREFOCUS_ALIGNMENT_TOLERANCE_PX)
+        }) {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(parent.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        request_scroll_focus_when_aligned(
+            &viewport,
+            strip,
+            position.x,
+            active,
+            &mut scroll,
+            &windows,
+            &focus_intent,
+            &mut global_state,
+            &mut commands,
+        );
     }
 }
 
@@ -1063,6 +1191,8 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
 }
 
 #[cfg(test)]
+mod mixed_input_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -1072,11 +1202,11 @@ mod performance_tests {
     use bevy::prelude::{App, ChildOf, Update};
 
     use super::{
-        STALE_GESTURE_TIMEOUT, Scrolling, cleanup_detached_scrolling, expire_stale_gesture,
-        integrate_scrolling, reconcile_integrated_position, scrolling_needs_frame,
-        set_position_x_if_changed, update_swipe_timeout,
+        FINGER_LIFT_THRESHOLD, STALE_GESTURE_TIMEOUT, Scrolling, cleanup_detached_scrolling,
+        expire_stale_gesture, integrate_scrolling, reconcile_integrated_position,
+        scrolling_deadline, scrolling_needs_frame, set_position_x_if_changed, update_swipe_timeout,
     };
-    use crate::ecs::Position;
+    use crate::ecs::{PhysicalContact, Position};
     use crate::manager::Origin;
 
     #[test]
@@ -1101,6 +1231,7 @@ mod performance_tests {
         let mut scrolling = Scrolling {
             is_user_swiping: true,
             gesture_active: true,
+            physical_contact: PhysicalContact::Active,
             snap_pending: true,
             last_event,
             ..Default::default()
@@ -1112,14 +1243,34 @@ mod performance_tests {
             last_event + STALE_GESTURE_TIMEOUT.saturating_sub(std::time::Duration::from_millis(1))
         ));
         assert!(scrolling.gesture_active);
+        assert!(scrolling.physical_contact.is_active());
 
         assert!(expire_stale_gesture(
             &mut scrolling,
             last_event + STALE_GESTURE_TIMEOUT
         ));
         assert!(!scrolling.gesture_active);
+        assert!(!scrolling.physical_contact.is_active());
         assert!(!scrolling.is_user_swiping);
         assert!(scrolling_needs_frame(&scrolling));
+    }
+
+    #[test]
+    fn interrupted_momentum_uses_short_idle_deadline_with_an_in_flight_target() {
+        let last_event = Instant::now();
+        let scrolling = Scrolling {
+            is_user_swiping: true,
+            gesture_active: true,
+            physical_contact: PhysicalContact::Inactive,
+            target_position: Some(-2_056.0),
+            last_event,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scrolling_deadline(&scrolling),
+            Some(last_event + FINGER_LIFT_THRESHOLD)
+        );
     }
 
     #[test]
@@ -1173,12 +1324,14 @@ mod performance_tests {
         let mut narrow = Scrolling {
             velocity: 1.0,
             is_user_swiping: true,
+            gesture_active: true,
             last_event: now,
             ..Scrolling::default()
         };
         let mut wide = Scrolling {
             velocity: 1.0,
             is_user_swiping: true,
+            gesture_active: true,
             last_event: now,
             ..Scrolling::default()
         };
@@ -1188,6 +1341,8 @@ mod performance_tests {
         assert!(!wide_result.remove);
         assert!(narrow_result.emit_mouse_moved);
         assert!(wide_result.emit_mouse_moved);
+        assert!(!narrow.gesture_active);
+        assert!(!wide.gesture_active);
         assert!(
             !update_swipe_timeout(&mut narrow, true, 0.016, 100.0).emit_mouse_moved,
             "synthetic mouse move is emitted only on the swiping transition"

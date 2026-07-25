@@ -390,6 +390,7 @@ fn apply_removal_results(
 struct ObserverContext {
     events: EventSender,
     which: ObserverType,
+    pid: Pid,
 }
 
 impl ObserverContext {
@@ -407,13 +408,7 @@ impl ObserverContext {
         }
     }
 
-    /// Notifies the event sender about an application-level accessibility event.
-    /// It translates the notification string and element into a corresponding `Event`.
-    ///
-    /// # Arguments
-    ///
-    /// * `notification` - The name of the accessibility notification as a `&str`.
-    /// * `element` - The `AXUIElementRef` associated with the notification.
+    /// Translates an application-level AX notification into an internal event.
     fn notify_app(&self, notification: &str, element: AXUIElementRef) {
         if notification == accessibility_sys::kAXCreatedNotification {
             let Ok(element) = AXUIWrapper::retain(element).inspect_err(|err| {
@@ -425,14 +420,20 @@ impl ObserverContext {
             return;
         }
 
+        if notification == accessibility_sys::kAXFocusedUIElementChangedNotification {
+            _ = self
+                .events
+                .send(Event::ApplicationFocusChanged { pid: self.pid });
+            return;
+        }
+
         let Ok(window_id) =
             ax_window_id(element).inspect_err(|err| debug!("notification {notification}: {err}"))
         else {
             return;
         };
         let event = match notification {
-            accessibility_sys::kAXFocusedWindowChangedNotification
-            | accessibility_sys::kAXFocusedUIElementChangedNotification => {
+            accessibility_sys::kAXFocusedWindowChangedNotification => {
                 Event::WindowFocused { window_id }
             }
             accessibility_sys::kAXWindowMovedNotification => Event::WindowMoved { window_id },
@@ -483,6 +484,7 @@ impl ObserverContext {
 struct AxObserverHandler {
     observer: CFRetained<AXUIWrapper>,
     events: EventSender,
+    pid: Pid,
     contexts: Arc<RwLock<Vec<Pin<Box<ObserverContext>>>>>,
     pending_removals: Vec<PendingObserverRemoval>,
 }
@@ -529,6 +531,7 @@ impl AxObserverHandler {
         Ok(Self {
             observer,
             events,
+            pid,
             contexts: Arc::new(RwLock::new(Vec::new())),
             pending_removals: Vec::new(),
         })
@@ -558,6 +561,7 @@ impl AxObserverHandler {
             Box::pin(ObserverContext {
                 events: self.events.clone(),
                 which,
+                pid: self.pid,
             })
         });
         let context_ptr = existing_context.map_or_else(
@@ -744,6 +748,7 @@ mod tests {
         let contexts = vec![Box::pin(ObserverContext {
             events,
             which: ObserverType::Application,
+            pid: 1,
         })];
         let pointer = observer_context_ptr(&contexts, ObserverType::Application).unwrap();
 
@@ -776,12 +781,14 @@ mod tests {
         let mut contexts = vec![Box::pin(ObserverContext {
             events: events.clone(),
             which: ObserverType::Window(42),
+            pid: 1,
         })];
         let pointer = observer_context_ptr(&contexts, ObserverType::Window(42)).unwrap();
 
         contexts.push(Box::pin(ObserverContext {
             events,
             which: ObserverType::Window(7),
+            pid: 1,
         }));
 
         let reused = observer_context_ptr(&contexts, ObserverType::Window(42));

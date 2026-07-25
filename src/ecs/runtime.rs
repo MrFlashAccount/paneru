@@ -22,12 +22,10 @@ use crate::ecs::observation::ObserverDetachRetry;
 use crate::events::{Event, EventReceiver};
 use crate::manager::{Display, Window};
 use crate::platform::PlatformCallbacks;
-
 pub(crate) const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const FRESH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ORPHAN_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const FOCUS_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
-
 #[derive(Component, Debug)]
 pub(crate) struct FreshPollDeadline(Instant);
 
@@ -108,10 +106,7 @@ pub(crate) struct RuntimeActivity {
     pub nearest_deadline: Option<Instant>,
 }
 
-/// Latches synthetic Bevy messages produced after the `First`-stage native
-/// event pump. The next pump consumes the latch and skips its blocking wait so
-/// those already-published messages reach their readers without requiring an
-/// unrelated native wake.
+/// Keeps post-pump synthetic messages from waiting for an unrelated native wake.
 #[derive(Resource, Debug, Default)]
 pub(super) struct SyntheticEventPending(bool);
 
@@ -171,6 +166,7 @@ pub(super) struct RuntimeWork<'w, 's> {
     windows: Query<'w, 's, (), With<Window>>,
     focused_windows: Query<'w, 's, (), (With<Window>, With<FocusedMarker>)>,
     active_display: Query<'w, 's, &'static Display, With<ActiveDisplayMarker>>,
+    focus_intent: Option<Res<'w, super::focus::FocusIntentState>>,
     focus_recovery: Option<Res<'w, FocusRecoveryDeadline>>,
     retries: Query<'w, 's, &'static RetryFrontSwitch>,
     verifications: Query<
@@ -187,6 +183,7 @@ pub(super) struct RuntimeWork<'w, 's> {
     persistence: Option<Res<'w, crate::ecs::persistence::PersistenceState>>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity {
     let timeout_deadline = work.timeouts.iter().map(Timeout::next_deadline).min();
     let fresh_poll_deadline = work
@@ -209,13 +206,18 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
         .iter()
         .map(OrphanReconcileDeadline::next_deadline)
         .min();
-    let focus_recovery_deadline = (!work.windows.is_empty() && work.focused_windows.is_empty())
-        .then(|| {
-            work.focus_recovery
-                .as_deref()
-                .map(FocusRecoveryDeadline::next_deadline)
-        })
-        .flatten();
+    let focus_intent = work.focus_intent.as_deref();
+    let focus_recovery_deadline = (!work.windows.is_empty()
+        && work.focused_windows.is_empty()
+        && focus_intent.is_none_or(|intent| intent.pending().is_none()))
+    .then(|| {
+        work.focus_recovery
+            .as_deref()
+            .map(FocusRecoveryDeadline::next_deadline)
+    })
+    .flatten();
+    let focus_intent_deadline =
+        focus_intent.and_then(super::focus::FocusIntentState::next_deadline);
     let retry_deadline = work
         .retries
         .iter()
@@ -275,6 +277,7 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
             refresh_deadline,
             observer_detach_deadline,
             orphan_deadline,
+            focus_intent_deadline,
             focus_recovery_deadline,
             retry_deadline,
             verification_deadline,
@@ -324,10 +327,7 @@ pub(super) fn pump_events(
 }
 
 fn should_resync_real_time_after_wait(activity: RuntimeActivity, did_wait: bool) -> bool {
-    // Long idle/deadline waits must not become one giant animation delta.
-    // Active frame pacing is different: its actual elapsed time must reach
-    // Bevy's Virtual clock on the next update, otherwise every 16 ms frame wait
-    // is discarded and easing animations run dramatically slower in wall time.
+    // Idle waits must not become animation delta; active frame waits must.
     did_wait && !activity.frame_work
 }
 
@@ -412,8 +412,8 @@ mod tests {
         SyntheticEventPending, pump_receiver, runtime_activity, should_resync_real_time_after_wait,
     };
     use crate::ecs::{
-        ActiveWorkspaceMarker, EdgeOverscrollPhase, EdgeOverscrollVisual, RefreshWindowSizes,
-        Scrolling, SendMessageTrigger,
+        ActiveWorkspaceMarker, EdgeOverscrollPhase, EdgeOverscrollVisual, PhysicalContact,
+        RefreshWindowSizes, Scrolling, SendMessageTrigger,
     };
     use crate::events::{Event, EventReceiver, EventSender};
     use crate::manager::Origin;
@@ -597,6 +597,7 @@ mod tests {
         app.world_mut().spawn(Scrolling {
             is_user_swiping: true,
             gesture_active: true,
+            physical_contact: PhysicalContact::Active,
             snap_pending: true,
             ..Default::default()
         });

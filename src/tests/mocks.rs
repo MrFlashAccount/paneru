@@ -85,6 +85,18 @@ struct MockStateInner {
     active_display_id: u32,
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
+    focus_attempts: Vec<WinID>,
+    focus_with_raise_attempts: Vec<WinID>,
+    focus_without_raise_attempts: Vec<WinID>,
+    native_actions: Vec<MockNativeAction>,
+    raise_failures: HashSet<WinID>,
+    auto_confirm_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MockNativeAction {
+    Focus(WinID),
+    Raise(WinID),
 }
 
 #[derive(Clone)]
@@ -103,6 +115,12 @@ impl MockState {
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
+                focus_attempts: Vec::new(),
+                focus_with_raise_attempts: Vec::new(),
+                focus_without_raise_attempts: Vec::new(),
+                native_actions: Vec::new(),
+                raise_failures: HashSet::new(),
+                auto_confirm_focus: true,
             })),
         }
     }
@@ -157,18 +175,54 @@ impl MockState {
 
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
-        if let Some(win) = inner.windows.get(&id) {
-            let pid = win.pid;
-            if let Some(app) = inner.apps.get_mut(&pid) {
-                app.focused_window_id = Some(id);
-                let psn = app.psn;
-                inner
-                    .event_queue
-                    .push_back(Event::ApplicationFrontSwitched { psn });
-                inner
-                    .event_queue
-                    .push_back(Event::WindowFocused { window_id: id });
-            }
+        inner.focus_attempts.push(id);
+        inner.native_actions.push(MockNativeAction::Focus(id));
+        if !inner.auto_confirm_focus {
+            return;
+        }
+        Self::confirm_window_focus_inner(&mut inner, id);
+    }
+
+    fn confirm_window_focus_inner(inner: &mut MockStateInner, id: WinID) {
+        let Some(pid) = inner.windows.get(&id).map(|window| window.pid) else {
+            return;
+        };
+        for app in inner.apps.values_mut() {
+            app.is_frontmost = false;
+        }
+        if let Some(app) = inner.apps.get_mut(&pid) {
+            app.is_frontmost = true;
+            app.focused_window_id = Some(id);
+            let psn = app.psn;
+            inner
+                .event_queue
+                .push_back(Event::ApplicationFrontSwitched { psn });
+            inner
+                .event_queue
+                .push_back(Event::WindowFocused { window_id: id });
+        }
+    }
+
+    pub(crate) fn confirm_window_focus(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        Self::confirm_window_focus_inner(&mut inner, id);
+    }
+
+    pub(crate) fn set_auto_confirm_focus(&self, enabled: bool) {
+        self.inner.force_write().auto_confirm_focus = enabled;
+    }
+
+    pub(crate) fn confirm_frontmost(&self, pid: Pid) {
+        let mut inner = self.inner.force_write();
+        for app in inner.apps.values_mut() {
+            app.is_frontmost = false;
+        }
+        if let Some(app) = inner.apps.get_mut(&pid) {
+            app.is_frontmost = true;
+            let psn = app.psn;
+            inner
+                .event_queue
+                .push_back(Event::ApplicationFrontSwitched { psn });
         }
     }
 
@@ -347,6 +401,37 @@ impl MockState {
             .and_then(|app| app.focused_window_id)
     }
 
+    pub(crate) fn clear_focus_attempts(&self) {
+        let mut inner = self.inner.force_write();
+        inner.focus_attempts.clear();
+        inner.focus_with_raise_attempts.clear();
+        inner.focus_without_raise_attempts.clear();
+    }
+
+    pub(crate) fn focus_attempts(&self) -> Vec<WinID> {
+        self.inner.force_read().focus_attempts.clone()
+    }
+
+    pub(crate) fn focus_with_raise_attempts(&self) -> Vec<WinID> {
+        self.inner.force_read().focus_with_raise_attempts.clone()
+    }
+
+    pub(crate) fn focus_without_raise_attempts(&self) -> Vec<WinID> {
+        self.inner.force_read().focus_without_raise_attempts.clone()
+    }
+
+    pub(crate) fn clear_native_actions(&self) {
+        self.inner.force_write().native_actions.clear();
+    }
+
+    pub(crate) fn native_actions(&self) -> Vec<MockNativeAction> {
+        self.inner.force_read().native_actions.clone()
+    }
+
+    pub(crate) fn fail_raise(&self, id: WinID) {
+        self.inner.force_write().raise_failures.insert(id);
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]
@@ -395,9 +480,9 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
+            s.inner.force_write().focus_with_raise_attempts.push(id);
             s.focus_window(id);
         });
-
         let s = self.clone();
         mw.expect_title().returning(move || {
             Ok(s.inner
@@ -506,8 +591,17 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
-        mw.expect_focus_without_raise().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus().returning(move || {
+            let mut inner = s.inner.force_write();
+            inner.native_actions.push(MockNativeAction::Raise(id));
+            !inner.raise_failures.contains(&id)
+        });
+        let s = self.clone();
+        mw.expect_focus_without_raise().returning(move |_, _, _| {
+            s.inner.force_write().focus_without_raise_attempts.push(id);
+            s.focus_window(id);
+        });
         mw.expect_set_padding().return_const(());
 
         Window::new(Box::new(mw))

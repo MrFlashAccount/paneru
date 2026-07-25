@@ -7,8 +7,9 @@ use bevy::time::TimeUpdateStrategy;
 use objc2_core_foundation::CGPoint;
 
 use super::{
-    GestureInput, InitialTouchpadLifecycle, Scrolling, SnapMode, apply_initial_touchpad_lifecycle,
-    begin_touchpad_gesture, focus_target_after_scroll, resume_touchpad_gesture,
+    GestureInput, InitialTouchpadLifecycle, PhysicalContact, Scrolling, SnapMode,
+    accepts_scroll_delta, apply_initial_touchpad_lifecycle, begin_touchpad_gesture,
+    focus_has_aligned_edge, focus_target_after_scroll, resume_touchpad_gesture,
     scrolling_needs_frame, smooth_native_scroll, snap_mode, sticky_edge_snap_target,
 };
 use crate::commands::Command;
@@ -19,6 +20,22 @@ use crate::events::Event;
 use crate::manager::{Origin, Window, WindowManager};
 use crate::platform::Modifiers;
 use crate::tests::{TEST_PROCESS_ID, TestHarness};
+
+#[test]
+fn orphaned_momentum_tail_is_ignored_after_idle_timeout() {
+    assert!(
+        !accepts_scroll_delta(true, false),
+        "settling or removed scroll state must reject its late momentum tail"
+    );
+    assert!(
+        accepts_scroll_delta(true, true),
+        "the real momentum start must resume a physical gesture"
+    );
+    assert!(
+        accepts_scroll_delta(false, false),
+        "a new physical or phase-less scroll must remain immediately responsive"
+    );
+}
 
 #[test]
 fn focus_target_prefers_the_most_visible_column_then_its_leading_edge() {
@@ -50,6 +67,22 @@ fn focus_target_prefers_the_most_visible_column_then_its_leading_edge() {
         focus_target_after_scroll(&viewport, -500, [(first, 0, 1_500), (second, 1_500, 500)],),
         Some(first),
         "panning inside an oversized window keeps that window focused"
+    );
+}
+
+#[test]
+fn momentum_prefocus_requires_snap_edge_alignment() {
+    let viewport = IRect::new(0, 0, 1_000, 800);
+
+    assert_eq!(
+        focus_has_aligned_edge(&viewport, -999, [(0, 1_000), (1_000, 1_000)],),
+        false,
+        "focus must not block a frame while visible motion remains"
+    );
+    assert_eq!(
+        focus_has_aligned_edge(&viewport, -1_000, [(0, 1_000), (1_000, 1_000)],),
+        true,
+        "focus may be requested once the target is exactly at its snap edge"
     );
 }
 
@@ -132,7 +165,10 @@ snap_padding = 100
     let mut commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::TouchpadDown,
-        Event::Scroll { delta: 500.0 },
+        Event::Scroll {
+            delta: 500.0,
+            is_momentum: false,
+        },
         Event::TouchpadUp,
     ];
     commands.extend((0..4).map(|_| Event::Command {
@@ -231,11 +267,25 @@ fn native_scroll_smoothing_converges_without_overshoot() {
 #[test]
 fn momentum_resume_preserves_target_but_new_touch_interrupts_it() {
     let mut scrolling = Scrolling {
+        gesture_active: true,
+        physical_contact: PhysicalContact::Active,
         target_position: Some(-320.0),
         ..Default::default()
     };
 
     resume_touchpad_gesture(true, Some(&mut scrolling));
+    assert!(
+        scrolling.gesture_active,
+        "momentum must keep the logical native gesture active"
+    );
+    assert!(
+        !scrolling.physical_contact.is_active(),
+        "momentum must not reopen the physical-contact lifecycle"
+    );
+    assert!(
+        scrolling.is_user_swiping,
+        "momentum still owns the logical paging session"
+    );
     assert_eq!(
         scrolling.target_position,
         Some(-320.0),
@@ -255,6 +305,7 @@ fn terminal_phase_closes_a_brand_new_overscroll_before_deferred_insertion() {
         position: 12.0,
         is_user_swiping: true,
         gesture_active: true,
+        physical_contact: PhysicalContact::Active,
         paging_gesture: Some(crate::ecs::PagingGesture {
             start_stop: 0.0,
             previous_stop: None,
@@ -348,7 +399,10 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
     let mut commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::TouchpadDown,
-        Event::Scroll { delta: -100.0 },
+        Event::Scroll {
+            delta: -100.0,
+            is_momentum: false,
+        },
         Event::TouchpadUp,
     ];
     commands.extend((0..10).map(|_| Event::Command {
@@ -433,7 +487,10 @@ fn mouse_down_removal_gets_a_zero_offset_restore_frame() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::TouchpadDown,
-        Event::Scroll { delta: -100.0 },
+        Event::Scroll {
+            delta: -100.0,
+            is_momentum: false,
+        },
         Event::MouseDown {
             point: CGPoint::new(100.0, 100.0),
             modifiers: Modifiers::empty(),
@@ -628,6 +685,7 @@ fn explicit_touchpad_contact_is_not_ended_by_inactivity_fallback() {
             world.entity_mut(entity).insert(Scrolling {
                 is_user_swiping: true,
                 gesture_active: true,
+                physical_contact: PhysicalContact::Active,
                 last_event: Instant::now()
                     .checked_sub(Duration::from_millis(100))
                     .expect("100ms must fit before now"),
@@ -641,6 +699,7 @@ fn explicit_touchpad_contact_is_not_ended_by_inactivity_fallback() {
                 .expect("active contact keeps scrolling alive");
             assert!(scrolling.is_user_swiping);
             assert!(scrolling.gesture_active);
+            assert!(scrolling.physical_contact.is_active());
         })
         .on_iteration(2, |world, _state| {
             let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
@@ -668,6 +727,7 @@ fn explicit_touchpad_begin_creates_lifecycle_state_before_first_delta() {
                 .expect("touch begin must create scrolling lifecycle state");
             assert!(scrolling.is_user_swiping);
             assert!(scrolling.gesture_active);
+            assert!(scrolling.physical_contact.is_active());
             assert!(scrolling.paging_gesture.is_some());
             let scroll_focus_origin = scrolling
                 .scroll_focus_origin
@@ -688,10 +748,16 @@ fn later_native_momentum_keeps_original_one_hop_paging_session() {
             command: Command::Window(crate::commands::Operation::SetWidth(2.0)),
         },
         Event::TouchpadDown,
-        Event::Scroll { delta: -100.0 },
+        Event::Scroll {
+            delta: -100.0,
+            is_momentum: false,
+        },
         Event::TouchpadPhysicalUp,
         Event::TouchpadMomentumStart,
-        Event::Scroll { delta: -100.0 },
+        Event::Scroll {
+            delta: -100.0,
+            is_momentum: true,
+        },
         Event::TouchpadUp,
         Event::Command {
             command: Command::PrintState,
@@ -752,7 +818,10 @@ fn touchpad_down_during_pending_snap_starts_from_reached_stop() {
             command: Command::Window(crate::commands::Operation::SetWidth(2.0)),
         },
         Event::TouchpadDown,
-        Event::Scroll { delta: 100.0 },
+        Event::Scroll {
+            delta: 100.0,
+            is_momentum: false,
+        },
     ];
     TestHarness::new()
         .with_windows(2)
@@ -789,7 +858,10 @@ fn scroll_delta_during_pending_snap_advances_without_waiting_for_animation() {
         },
         // Model a phase-less wheel tick or a batch where physical Began was
         // not observed separately from motion.
-        Event::Scroll { delta: 100.0 },
+        Event::Scroll {
+            delta: 100.0,
+            is_momentum: false,
+        },
     ];
     TestHarness::new()
         .with_windows(2)
@@ -842,7 +914,10 @@ fn physical_up_and_momentum_start_in_same_update_leave_momentum_active() {
             command: Command::Window(crate::commands::Operation::SetWidth(2.0)),
         },
         Event::TouchpadDown,
-        Event::Scroll { delta: -100.0 },
+        Event::Scroll {
+            delta: -100.0,
+            is_momentum: false,
+        },
         Event::Command {
             command: Command::PrintState,
         },
