@@ -70,8 +70,8 @@ fn snap_mode(paging: bool, sticky: bool, auto_center: bool) -> SnapMode {
 
 #[derive(Default)]
 struct GestureInput {
-    scroll_delta: Option<f64>,
-    scroll_is_momentum: bool,
+    physical_scroll_delta: Option<f64>,
+    momentum_scroll_delta: Option<f64>,
     gesture_delta: Option<f64>,
     touchpad_down: Option<usize>,
     touchpad_physical_up: Option<usize>,
@@ -132,8 +132,7 @@ fn cleanup_detached_scrolling(
     }
 }
 
-// This ECS system intentionally keeps event aggregation and component updates
-// in one schedule boundary; pure paging math lives in `scroll::paging`.
+// Event aggregation and component updates share one schedule boundary; paging math is separate.
 #[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
@@ -155,28 +154,24 @@ fn swipe_gesture(
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
     let snap_enabled = config.swipe_paging() || config.sticky_scroll() || config.auto_center();
-    // Normalization: Touchpad deltas are typically small fractions.
-    // Scroll wheel deltas can be larger. We scale it down slightly
-    // to match the "feel" of a finger swipe.
+    // Scale larger scroll-wheel deltas down toward fractional touchpad input.
     const SCROLL_SCALE_UPPER: f64 = 0.15;
     const SCROLL_SCALE_LOWER: f64 = 0.005;
     const SCROLL_FULL_RANGE: f64 = 2.0;
     let scroll_scale = SCROLL_SCALE_LOWER
         + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
     let input = read_gesture_input(&mut messages, &config, scroll_scale);
-    // A fast second gesture can arrive in the same ECS batch as terminal
-    // events from the first. Only lifecycle phases after the latest Down
-    // belong to the new contact; otherwise the old Up closes its input latch.
+    // Only phases after the latest Down belong to a fast second gesture.
     let touchpad_down = input.touchpad_down.is_some();
     let touchpad_physical_up = input.belongs_to_latest_contact(input.touchpad_physical_up);
     let touchpad_momentum_start = input.belongs_to_latest_contact(input.touchpad_momentum_start);
     let touchpad_up = input.belongs_to_latest_contact(input.touchpad_up);
-    let scroll_delta = input.scroll_delta;
-    let scroll_is_momentum = input.scroll_is_momentum;
+    let physical_scroll_delta = input.physical_scroll_delta;
+    let momentum_scroll_delta = input.momentum_scroll_delta;
     let gesture_delta = input.gesture_delta;
     let has_gesture_event = gesture_delta.is_some();
-    let has_scroll_event = scroll_delta.is_some() || has_gesture_event;
-    let mut scroll_delta = scroll_delta.unwrap_or_default();
+    let has_scroll_event =
+        physical_scroll_delta.is_some() || momentum_scroll_delta.is_some() || has_gesture_event;
     let gesture_delta = gesture_delta.unwrap_or_default();
 
     if !touchpad_down
@@ -195,26 +190,25 @@ fn swipe_gesture(
             || scrolling.snap_pending
             || scrolling.paging_gesture.is_some()
     });
-    let momentum_has_owner = scrolling
-        .as_ref()
-        .is_some_and(|scrolling| scrolling.gesture_active)
-        || (touchpad_momentum_start && has_active_session);
-    let accepts_momentum_scroll = accepts_scroll_delta(scroll_is_momentum, momentum_has_owner);
-    let ignored_orphaned_momentum = scroll_is_momentum && !accepts_momentum_scroll;
-    if ignored_orphaned_momentum {
-        scroll_delta = 0.0;
-    }
+    let momentum_has_owner = !touchpad_down
+        && (scrolling
+            .as_ref()
+            .is_some_and(|scrolling| scrolling.gesture_active)
+            || (touchpad_momentum_start && has_active_session));
+    let accepts_momentum_scroll = accepts_scroll_delta(true, momentum_has_owner);
+    let ignored_orphaned_momentum = momentum_scroll_delta.is_some() && !accepts_momentum_scroll;
+    let scroll_delta = physical_scroll_delta.unwrap_or_default()
+        + momentum_scroll_delta
+            .filter(|_| accepts_momentum_scroll)
+            .unwrap_or_default();
     let has_scroll_event = scroll_delta != 0.0 || has_gesture_event;
     let settling_motion_in_flight = scrolling.as_ref().is_some_and(|scrolling| {
         !scrolling.gesture_active
             && !scrolling.is_user_swiping
             && scrolling.target_position.is_some()
     });
-    // A fresh physical contact always starts a new gesture, even when the
-    // previous snap animation or momentum has not ended yet. Reusing that old
-    // paging session would keep its consumed edge as the one-hop bound and make
-    // the first swipe towards the next window a no-op. `TouchpadDown` is
-    // emitted only for AppKit's Began phase, not for Changed events.
+    // Fresh contact interrupts old snap/momentum and its consumed one-hop bound.
+    // `TouchpadDown` represents AppKit Began, not Changed.
     let starts_new_gesture = touchpad_down
         || ((!has_active_session || settling_motion_in_flight)
             && has_scroll_event
@@ -229,7 +223,8 @@ fn swipe_gesture(
         touchpad_momentum_start,
         touchpad_up,
         has_scroll_event,
-        scroll_is_momentum,
+        has_physical_scroll = physical_scroll_delta.is_some(),
+        has_momentum_scroll = momentum_scroll_delta.is_some(),
         ignored_orphaned_momentum,
         scroll_delta,
         gesture_delta,
@@ -308,8 +303,7 @@ fn swipe_gesture(
     if starts_new_gesture && let Some(scrolling) = scrolling.as_deref_mut() {
         scrolling.scroll_focus_origin = scroll_focus_origin;
     }
-    // AppKit can report physical Ended and momentum Began together. Apply the
-    // physical end first so the momentum phase remains the final state.
+    // Apply simultaneous physical Ended before momentum Began.
     mark_physical_touch_end(touchpad_physical_up, scrolling.as_deref_mut());
     resume_touchpad_gesture(resumes_gesture, scrolling.as_deref_mut());
 
@@ -332,8 +326,7 @@ fn swipe_gesture(
     }
 
     if has_scroll_event {
-        // Preserve the established gesture-distance normalization. Paging
-        // anchors themselves use the usable viewport below.
+        // Preserve established distance normalization; paging uses the usable viewport.
         let viewport_width = f64::from(active_display.bounds().width());
         let dt = time.delta_secs_f64();
         let new_velocity = if has_gesture_event && dt > 0.0 {
@@ -365,8 +358,7 @@ fn swipe_gesture(
             }
 
             if scroll_delta != 0.0 {
-                // A new physical gesture interrupts an in-flight sticky snap.
-                // Native momentum events keep extending the same target.
+                // Physical input interrupts sticky snap; momentum extends its target.
                 if !was_user_swiping {
                     scrolling.target_position = None;
                 }
@@ -399,10 +391,8 @@ fn swipe_gesture(
                 last_event: Instant::now(),
             };
             constrain_paging_motion(&mut scrolling, direction_modifier, true);
-            // Commands are deferred, so lifecycle handlers above could not
-            // mutate this brand-new component. Replay terminal phases before
-            // insertion; otherwise a short Began + delta + Ended batch leaves
-            // the rubber band armed and visually stuck.
+            // Replay terminal phases before deferred insertion so a short
+            // Began + delta + Ended batch cannot leave the rubber band armed.
             apply_initial_touchpad_lifecycle(&mut scrolling, initial_lifecycle);
             entity_commands.try_insert(scrolling);
         }
@@ -423,13 +413,21 @@ fn read_gesture_input(
     let mut input = GestureInput::default();
     for (order, event) in messages.read().enumerate() {
         match event {
-            Event::TouchpadDown => input.touchpad_down = Some(order),
+            Event::TouchpadDown => {
+                input.touchpad_down = Some(order);
+                input.physical_scroll_delta = None;
+                input.momentum_scroll_delta = None;
+            }
             Event::TouchpadPhysicalUp => input.touchpad_physical_up = Some(order),
             Event::TouchpadMomentumStart => input.touchpad_momentum_start = Some(order),
             Event::TouchpadUp => input.touchpad_up = Some(order),
             Event::Scroll { delta, is_momentum } => {
-                *input.scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
-                input.scroll_is_momentum |= *is_momentum;
+                let scroll_delta = if *is_momentum {
+                    &mut input.momentum_scroll_delta
+                } else {
+                    &mut input.physical_scroll_delta
+                };
+                *scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
             }
             Event::Swipe { delta, fingers }
                 if config
@@ -1192,6 +1190,8 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
     }));
 }
 
+#[cfg(test)]
+mod mixed_input_tests;
 #[cfg(test)]
 mod tests;
 

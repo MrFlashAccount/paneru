@@ -86,6 +86,8 @@ struct MockStateInner {
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
     focus_attempts: Vec<WinID>,
+    focus_with_raise_attempts: Vec<WinID>,
+    focus_without_raise_attempts: Vec<WinID>,
     native_actions: Vec<MockNativeAction>,
     raise_failures: HashSet<WinID>,
     auto_confirm_focus: bool,
@@ -114,6 +116,8 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 focus_attempts: Vec::new(),
+                focus_with_raise_attempts: Vec::new(),
+                focus_without_raise_attempts: Vec::new(),
                 native_actions: Vec::new(),
                 raise_failures: HashSet::new(),
                 auto_confirm_focus: true,
@@ -400,10 +404,20 @@ impl MockState {
     pub(crate) fn clear_focus_attempts(&self) {
         let mut inner = self.inner.force_write();
         inner.focus_attempts.clear();
+        inner.focus_with_raise_attempts.clear();
+        inner.focus_without_raise_attempts.clear();
     }
 
     pub(crate) fn focus_attempts(&self) -> Vec<WinID> {
         self.inner.force_read().focus_attempts.clone()
+    }
+
+    pub(crate) fn focus_with_raise_attempts(&self) -> Vec<WinID> {
+        self.inner.force_read().focus_with_raise_attempts.clone()
+    }
+
+    pub(crate) fn focus_without_raise_attempts(&self) -> Vec<WinID> {
+        self.inner.force_read().focus_without_raise_attempts.clone()
     }
 
     pub(crate) fn clear_native_actions(&self) {
@@ -466,6 +480,7 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
+            s.inner.force_write().focus_with_raise_attempts.push(id);
             s.focus_window(id);
         });
         let s = self.clone();
@@ -584,6 +599,7 @@ impl MockState {
         });
         let s = self.clone();
         mw.expect_focus_without_raise().returning(move |_, _, _| {
+            s.inner.force_write().focus_without_raise_attempts.push(id);
             s.focus_window(id);
         });
         mw.expect_set_padding().return_const(());

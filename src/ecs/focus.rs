@@ -165,6 +165,7 @@ pub(crate) struct PendingFocusIntent {
     retry_at: Instant,
     expires_at: Instant,
     retried: bool,
+    raise: bool,
     suppress_side_effects: bool,
 }
 
@@ -182,6 +183,7 @@ impl FocusIntentState {
         &mut self,
         entity: Entity,
         window_id: crate::platform::WinID,
+        raise: bool,
         suppress_side_effects: bool,
         now: Instant,
     ) -> u64 {
@@ -193,6 +195,7 @@ impl FocusIntentState {
             retry_at: now + FOCUS_RETRY_DELAY,
             expires_at: now + FOCUS_CONFIRM_TIMEOUT,
             retried: false,
+            raise,
             suppress_side_effects,
         });
         self.generation
@@ -269,6 +272,19 @@ pub(crate) fn exact_confirmation_policy(
 ) -> Option<bool> {
     if !app.is_frontmost() || app.focused_window_id().ok() != Some(window_id) {
         return None;
+    }
+    if focus_intent
+        .pending()
+        .is_some_and(|pending| pending.window_id != window_id)
+    {
+        let superseded = focus_intent.pending();
+        focus_intent.pending = None;
+        debug!(
+            window_id,
+            pending = ?superseded,
+            "authoritative external focus superseded pending intent"
+        );
+        return Some(false);
     }
     let policy = focus_intent.confirmation_policy(window_id);
     if policy.is_none() {
@@ -482,7 +498,13 @@ fn focus_window_trigger(
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
-    let generation = intent.request(entity, window.id(), suppress_side_effects, Instant::now());
+    let generation = intent.request(
+        entity,
+        window.id(),
+        raise,
+        suppress_side_effects,
+        Instant::now(),
+    );
     debug!(
         generation,
         window_id = window.id(),
@@ -551,7 +573,19 @@ fn reconcile_focus_intent(
                 window_id = pending.window_id,
                 "native focus not confirmed; retrying exact target once"
             );
-            window.focus_with_raise(app.psn());
+            if pending.raise {
+                window.focus_with_raise(app.psn());
+            } else if let Some((focused_window, _)) = windows.focused()
+                && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+            {
+                window.focus_without_raise(app.psn(), focused_window, focused_psn);
+            } else {
+                warn!(
+                    generation = pending.generation,
+                    window_id = pending.window_id,
+                    "no-raise focus retry skipped without a confirmed focused window"
+                );
+            }
         }
         return;
     }
@@ -707,8 +741,8 @@ mod tests {
         let now = Instant::now();
         let mut intent = FocusIntentState::default();
 
-        intent.request(first, 10, false, now);
-        intent.request(second, 20, true, now);
+        intent.request(first, 10, true, false, now);
+        intent.request(second, 20, true, true, now);
 
         assert_eq!(intent.confirmation_policy(10), None);
         assert_eq!(intent.effective_entity(Some(first)), Some(second));

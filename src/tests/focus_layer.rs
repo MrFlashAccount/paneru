@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::ecs::focus::FocusIntentState;
 use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, LayoutPosition, PagingGesture, Position, Scrolling,
-    Unmanaged, WindowDisposition,
+    SpawnCommandsExt, Unmanaged, WindowDisposition,
 };
 use crate::events::Event;
 use crate::manager::{Origin, Window, WindowManager};
@@ -285,15 +285,17 @@ fn exact_os_confirmation_commits_requested_focus() {
 fn stale_confirmation_cannot_override_latest_intent() {
     let mut harness = focus_request_before_snap_settlement();
     let latest = window_entity(harness.world(), 0);
+    harness.world().resource_mut::<FocusIntentState>().request(
+        latest,
+        0,
+        true,
+        true,
+        Instant::now(),
+    );
+
     harness
         .world()
-        .resource_mut::<FocusIntentState>()
-        .request(latest, 0, true, Instant::now());
-
-    harness.mock_state.confirm_window_focus(1);
-    for event in harness.mock_state.drain_events() {
-        harness.world().write_message(event);
-    }
+        .write_message(Event::WindowFocused { window_id: 1 });
     harness.app.update();
     harness.app.update();
 
@@ -319,6 +321,69 @@ fn stale_confirmation_cannot_override_latest_intent() {
             .resource::<FocusIntentState>()
             .pending()
             .is_none()
+    );
+}
+
+#[test]
+fn authoritative_external_focus_supersedes_pending_intent() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.run(print_state_events(1));
+    harness.mock_state.set_auto_confirm_focus(false);
+    harness.mock_state.clear_focus_attempts();
+
+    let pending_target = window_entity(harness.world(), 1);
+    harness.world().resource_mut::<FocusIntentState>().request(
+        pending_target,
+        1,
+        true,
+        false,
+        Instant::now() - Duration::from_millis(100),
+    );
+    harness.mock_state.confirm_window_focus(2);
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+
+    harness.app.update();
+    harness.app.update();
+
+    crate::assert_focused!(harness.world(), 2);
+    assert!(
+        harness
+            .world()
+            .resource::<FocusIntentState>()
+            .pending()
+            .is_none(),
+        "authoritative external focus must cancel the superseded intent"
+    );
+    assert!(
+        harness.mock_state.focus_attempts().is_empty(),
+        "the watchdog must not retry the old target after exact external focus"
+    );
+}
+
+#[test]
+fn delayed_no_raise_focus_retries_without_raise() {
+    let mut harness = TestHarness::new().with_windows(2).with_focused_window(0);
+    harness.run(print_state_events(1));
+    harness.mock_state.set_auto_confirm_focus(false);
+    harness.mock_state.clear_focus_attempts();
+
+    let target = window_entity(harness.world(), 1);
+    harness.world().commands().focus_entity(target, false);
+    harness.app.update();
+    std::thread::sleep(Duration::from_millis(45));
+    harness.app.update();
+
+    assert_eq!(harness.mock_state.focus_attempts(), vec![1, 1]);
+    assert_eq!(
+        harness.mock_state.focus_without_raise_attempts(),
+        vec![1, 1],
+        "both the original request and its retry must preserve no-raise policy"
+    );
+    assert!(
+        harness.mock_state.focus_with_raise_attempts().is_empty(),
+        "retry must not take the raise path"
     );
 }
 
