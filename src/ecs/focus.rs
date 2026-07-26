@@ -406,13 +406,8 @@ fn focus_window_trigger(
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
-    let generation = intent.request(
-        entity,
-        window.id(),
-        policy,
-        suppress_side_effects,
-        Instant::now(),
-    );
+    let now = Instant::now();
+    let generation = intent.request(entity, window.id(), policy, suppress_side_effects, now);
     debug!(
         generation,
         window_id = window.id(),
@@ -424,7 +419,15 @@ fn focus_window_trigger(
             if let Some((focused_window, _)) = windows.focused()
                 && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
             {
-                window.focus_without_raise(psn, focused_window, focused_psn);
+                begin_focus_without_raise(
+                    window,
+                    psn,
+                    focused_window,
+                    focused_psn,
+                    &mut intent,
+                    generation,
+                    now,
+                );
             } else {
                 window.focus_with_raise(psn);
             }
@@ -433,7 +436,15 @@ fn focus_window_trigger(
             if let Some((focused_window, _)) = windows.focused()
                 && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
             {
-                window.focus_without_raise(psn, focused_window, focused_psn);
+                begin_focus_without_raise(
+                    window,
+                    psn,
+                    focused_window,
+                    focused_psn,
+                    &mut intent,
+                    generation,
+                    now,
+                );
             } else {
                 warn!(
                     generation,
@@ -445,10 +456,31 @@ fn focus_window_trigger(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn begin_focus_without_raise(
+    window: &Window,
+    psn: crate::platform::ProcessSerialNumber,
+    focused_window: &Window,
+    focused_psn: crate::platform::ProcessSerialNumber,
+    intent: &mut FocusIntentState,
+    generation: u64,
+    now: Instant,
+) {
+    if window.begin_focus_without_raise(psn, focused_window, focused_psn)
+        && !intent.schedule_same_app_activation(generation, now)
+    {
+        warn!(
+            generation,
+            window_id = window.id(),
+            "same-app focus activation was superseded before it could be scheduled"
+        );
+    }
+}
+
 /// Performs one bounded, state-checked retry and authoritative readback.
 /// Deadlines only wake the runtime; app-frontmost plus AX focused-window
 /// equality remains the source of truth.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn reconcile_focus_intent(
     _main_thread: NonSend<AxMainThread>,
     windows: Windows,
@@ -462,12 +494,15 @@ fn reconcile_focus_intent(
         return;
     };
     let now = Instant::now();
-    let due = if pending.retried {
+    let retry_due = if pending.retried {
         now >= pending.expires_at
     } else {
         now >= pending.retry_at
     };
-    if !due {
+    let activation_due = pending
+        .activation_at
+        .is_some_and(|activation_at| now >= activation_at);
+    if !retry_due && !activation_due {
         return;
     }
 
@@ -489,6 +524,18 @@ fn reconcile_focus_intent(
         commands.trigger(SendMessageTrigger(Event::WindowFocused {
             window_id: pending.window_id,
         }));
+        return;
+    }
+
+    if activation_due {
+        if intent.take_due_same_app_activation(pending.generation, now) {
+            debug!(
+                generation = pending.generation,
+                window_id = pending.window_id,
+                "completing delayed same-app focus activation"
+            );
+            window.complete_focus_without_raise(app.psn());
+        }
         return;
     }
 
@@ -521,7 +568,15 @@ fn reconcile_focus_intent(
                     if let Some((focused_window, _)) = windows.focused()
                         && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
                     {
-                        window.focus_without_raise(app.psn(), focused_window, focused_psn);
+                        begin_focus_without_raise(
+                            window,
+                            app.psn(),
+                            focused_window,
+                            focused_psn,
+                            &mut intent,
+                            pending.generation,
+                            now,
+                        );
                     } else {
                         warn!(
                             generation = pending.generation,

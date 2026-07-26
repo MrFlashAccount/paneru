@@ -598,10 +598,21 @@ impl MockState {
             !inner.raise_failures.contains(&id)
         });
         let s = self.clone();
-        mw.expect_focus_without_raise().returning(move |_, _, _| {
-            s.inner.force_write().focus_without_raise_attempts.push(id);
-            s.focus_window(id);
-        });
+        mw.expect_begin_focus_without_raise()
+            .returning(move |psn, _, focused_psn| {
+                s.inner.force_write().focus_without_raise_attempts.push(id);
+                if psn == focused_psn {
+                    true
+                } else {
+                    s.focus_window(id);
+                    false
+                }
+            });
+        let s = self.clone();
+        mw.expect_complete_focus_without_raise()
+            .returning(move |_| {
+                s.focus_window(id);
+            });
         mw.expect_set_padding().return_const(());
 
         Window::new(Box::new(mw))

@@ -13,8 +13,6 @@ use objc2_core_foundation::{
 };
 use std::ptr::null_mut;
 use std::sync::OnceLock;
-use std::thread;
-use std::time::Duration;
 use stdext::function_name;
 use tracing::{Level, debug, instrument, trace, warn};
 
@@ -72,12 +70,18 @@ pub trait WindowApi: Send + Sync {
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     fn update_frame(&mut self) -> Result<IRect>;
-    fn focus_without_raise(
+    /// Starts a no-raise focus request. Returns `true` when the target belongs
+    /// to the currently focused application and the activation event must be
+    /// completed after a short, non-blocking delay.
+    fn begin_focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    );
+    ) -> bool;
+    /// Completes the delayed same-application activation started by
+    /// `begin_focus_without_raise`.
+    fn complete_focus_without_raise(&self, psn: ProcessSerialNumber);
     /// Selects this exact window for keyboard focus, activates its application,
     /// and raises the window as one ordered native operation.
     fn focus_with_raise(&self, psn: ProcessSerialNumber);
@@ -539,18 +543,18 @@ impl WindowApi for WindowOS {
         Ok(self.frame)
     }
 
-    /// Focuses the window without raising it. This involves sending specific events to the process.
+    /// Starts focusing the window without raising it.
     ///
     /// # Arguments
     ///
     /// * `currently_focused` - A reference to the currently focused window.
     #[instrument(level = Level::DEBUG, skip(currently_focused))]
-    fn focus_without_raise(
+    fn begin_focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    ) {
+    ) -> bool {
         let window_id = self.id();
         debug!("{window_id}");
         if focused_psn == psn {
@@ -563,19 +567,26 @@ impl WindowApi for WindowOS {
             unsafe {
                 SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast());
             }
-
-            // Artificially delay the activation. This is necessary because some
-            // applications appear to be confused if both of the events appear instantaneously.
-            thread::sleep(Duration::from_millis(20));
-
-            event_bytes[0x8a] = 0x01;
-            event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
-            unsafe {
-                SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
-            }
+            return true;
         }
 
         unsafe {
+            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
+        }
+        self.make_key_window(&psn);
+        false
+    }
+
+    #[instrument(level = Level::DEBUG)]
+    fn complete_focus_without_raise(&self, psn: ProcessSerialNumber) {
+        let window_id = self.id();
+        let mut event_bytes = [0u8; 0xf8];
+        event_bytes[0x04] = 0xf8;
+        event_bytes[0x08] = 0x0d;
+        event_bytes[0x8a] = 0x01;
+        event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
+        unsafe {
+            SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
         self.make_key_window(&psn);

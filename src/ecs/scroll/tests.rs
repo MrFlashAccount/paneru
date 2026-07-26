@@ -94,6 +94,9 @@ fn settled_scroll_focuses_visible_window_without_warping_cursor() {
         Event::Command {
             command: Command::PrintState,
         },
+        Event::Command {
+            command: Command::PrintState,
+        },
     ];
 
     TestHarness::new()
@@ -126,7 +129,10 @@ fn settled_scroll_focuses_visible_window_without_warping_cursor() {
                 ..Default::default()
             });
         })
-        .on_iteration(1, move |world, state| {
+        .on_iteration(1, |_world, _state| {
+            std::thread::sleep(Duration::from_millis(25));
+        })
+        .on_iteration(2, move |world, state| {
             crate::assert_focused!(world, 1);
             assert_eq!(
                 state.cursor_position(),
@@ -175,6 +181,7 @@ snap_padding = 100
         command: Command::PrintState,
     }));
     let final_iteration = commands.len() - 1;
+    let focus_deadline_iteration = final_iteration - 1;
 
     TestHarness::new()
         .with_config(config)
@@ -196,6 +203,9 @@ snap_padding = 100
                 world.get::<FocusedMarker>(origin).is_some(),
                 "captured origin must still own the focus marker"
             );
+        })
+        .on_iteration(focus_deadline_iteration, |_world, _state| {
+            std::thread::sleep(Duration::from_millis(25));
         })
         .on_iteration(final_iteration, |world, state| {
             let focused = {
