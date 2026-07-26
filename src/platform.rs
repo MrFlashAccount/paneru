@@ -311,11 +311,23 @@ impl PlatformCallbacks {
                         true,
                     );
                 }
+            } else if frame_display_id.is_some() {
+                // macOS 11-13 use a timer fallback. Native input sources may
+                // remain serviceable without returning after every handled
+                // source. This blocks until the frame interval expires and
+                // cannot spin under dense input.
+                let seconds = timeout.unwrap_or(Duration::from_millis(16)).as_secs_f64();
+                CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, false);
             } else {
                 let seconds = timeout.map_or(f64::MAX, |duration| duration.as_secs_f64());
                 CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);
             }
             if display_link_armed {
+                if self.frame_pacer.frame_fired() {
+                    crate::frame_metrics::record_display_link_tick();
+                } else {
+                    crate::frame_metrics::record_display_link_safety_timeout();
+                }
                 self.frame_pacer.pause();
             }
             self.dispatch_pending_cocoa_events();

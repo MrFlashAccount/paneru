@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use bevy::app::AppExit;
@@ -22,6 +20,11 @@ use crate::ecs::observation::ObserverDetachRetry;
 use crate::events::{Event, EventReceiver};
 use crate::manager::{Display, Window};
 use crate::platform::PlatformCallbacks;
+
+mod input_gate;
+#[cfg(test)]
+use input_gate::drain_event_channel;
+use input_gate::{PumpWait, pump_receiver};
 pub(crate) const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const FRESH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ORPHAN_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -184,7 +187,11 @@ pub(super) struct RuntimeWork<'w, 's> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity {
+fn runtime_activity(
+    work: &RuntimeWork<'_, '_>,
+    now: Instant,
+    active_scroll: bool,
+) -> RuntimeActivity {
     let timeout_deadline = work.timeouts.iter().map(Timeout::next_deadline).min();
     let fresh_poll_deadline = work
         .fresh_polls
@@ -262,14 +269,7 @@ fn runtime_activity(work: &RuntimeWork<'_, '_>, now: Instant) -> RuntimeActivity
                 .copied()
                 .unwrap_or(WindowDisposition::Managed)
                 .owns_geometry(unmanaged)
-        }) || work
-            .scrolling
-            .iter()
-            .any(super::scroll::scrolling_needs_frame)
-            || work
-                .edge_overscroll_visuals
-                .iter()
-                .any(|visual| visual.phase == EdgeOverscrollPhase::RestoreQueued)
+        }) || active_scroll
             || !work.flash_messages.is_empty(),
         nearest_deadline: RuntimeActivity::nearest([
             timeout_deadline,
@@ -305,17 +305,28 @@ pub(super) fn pump_events(
     };
 
     let now = Instant::now();
-    let activity = runtime_activity(&work, now);
-    let frame_display_id = activity
-        .frame_work
-        .then(|| work.active_display.iter().next().map(Display::id))
-        .flatten();
+    let active_scroll = input_gate::active_scroll_work(&work);
+    let activity = runtime_activity(&work, now, active_scroll);
     let synthetic_pending = synthetic_events.take();
-    let (received_events, should_exit, did_wait) =
-        pump_receiver(&incoming_events, activity, now, synthetic_pending, |wait| {
-            platform.pump_cocoa_event_loop(wait, frame_display_id);
-        });
-    if should_resync_real_time_after_wait(activity, did_wait)
+    let active_display_id = work.active_display.iter().next().map(Display::id);
+    let (received_events, should_exit, outcome) = pump_receiver(
+        &incoming_events,
+        activity,
+        now,
+        synthetic_pending,
+        |wait: PumpWait| {
+            let frame_display_id = wait.frame_pacing.then_some(active_display_id).flatten();
+            platform.pump_cocoa_event_loop(wait.timeout, frame_display_id);
+        },
+    );
+    if outcome.did_frame_wait {
+        crate::frame_metrics::record_presentation_frame(
+            active_scroll || outcome.presented_scroll_input,
+        );
+    }
+    // Idle time, including a following input-triggered frame wait, must not
+    // become animation delta.
+    if outcome.did_idle_wait
         && let Some(real_time) = real_time.as_mut()
     {
         real_time.update_with_instant(Instant::now());
@@ -324,92 +335,14 @@ pub(super) fn pump_events(
         exit.write(AppExit::Success);
     }
     messages.write_batch(received_events);
-}
-
-fn should_resync_real_time_after_wait(activity: RuntimeActivity, did_wait: bool) -> bool {
-    // Idle waits must not become animation delta; active frame waits must.
-    did_wait && !activity.frame_work
-}
-
-fn pump_receiver(
-    receiver: &EventReceiver,
-    activity: RuntimeActivity,
-    now: Instant,
-    synthetic_pending: bool,
-    mut pump: impl FnMut(Option<Duration>),
-) -> (Vec<Event>, bool, bool) {
-    let generation_before_drain = receiver.generation();
-    let (mut received_events, mut should_exit) = drain_event_channel(receiver);
-    let should_wait = !synthetic_pending
-        && received_events.is_empty()
-        && !should_exit
-        && receiver.generation() == generation_before_drain;
-    if should_wait {
-        pump(activity.wait(now));
-        let (after_wait, exit_after_wait) = drain_event_channel(receiver);
-        received_events = after_wait;
-        should_exit = exit_after_wait;
-    }
-    (received_events, should_exit, should_wait)
-}
-
-fn drain_event_channel(receiver: &EventReceiver) -> (Vec<Event>, bool) {
-    let mut received_events = Vec::new();
-    let mut pending_mouse = None;
-    let mut should_exit = false;
-    loop {
-        match receiver.try_recv() {
-            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
-                should_exit = true;
-                break;
-            }
-            Ok(event) if matches!(event, Event::MouseMoved { .. }) => {
-                pending_mouse = Some(event);
-            }
-            Ok(event) => {
-                received_events.extend(pending_mouse.take());
-                received_events.push(event);
-            }
-            Err(TryRecvError::Empty) => break,
-        }
-    }
-    received_events.extend(pending_mouse);
-    (
-        coalesce_window_geometry_events(received_events),
-        should_exit,
-    )
-}
-
-/// Keeps only the final geometry notification for each window and event kind.
-///
-/// Superseded events leave tombstones instead of moving their replacements
-/// forward, so every surviving event retains its original FIFO position
-/// relative to unrelated events and the other geometry kind.
-fn coalesce_window_geometry_events(events: Vec<Event>) -> Vec<Event> {
-    let mut latest_moved = BTreeMap::new();
-    let mut latest_resized = BTreeMap::new();
-    let mut coalesced = Vec::with_capacity(events.len());
-    for event in events {
-        let previous_position = match &event {
-            Event::WindowMoved { window_id } => latest_moved.insert(*window_id, coalesced.len()),
-            Event::WindowResized { window_id } => {
-                latest_resized.insert(*window_id, coalesced.len())
-            }
-            _ => None,
-        };
-        if let Some(previous_position) = previous_position {
-            coalesced[previous_position] = None;
-        }
-        coalesced.push(Some(event));
-    }
-    coalesced.into_iter().flatten().collect()
+    crate::frame_metrics::report_if_due();
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ACTIVE_FRAME_INTERVAL, FreshPollDeadline, RuntimeActivity, RuntimeWork,
-        SyntheticEventPending, pump_receiver, runtime_activity, should_resync_real_time_after_wait,
+        SyntheticEventPending, pump_receiver, runtime_activity,
     };
     use crate::ecs::{
         ActiveWorkspaceMarker, EdgeOverscrollPhase, EdgeOverscrollVisual, PhysicalContact,
@@ -499,9 +432,9 @@ mod tests {
         };
         let mut observed_wait = None;
 
-        let (events, should_exit, did_wait) =
+        let (events, should_exit, outcome) =
             pump_receiver(&receiver, activity, now, false, |wait| {
-                observed_wait = wait;
+                observed_wait = wait.timeout;
                 sender
                     .send(Event::UpdaterStatusChanged)
                     .expect("deadline wake event should send");
@@ -509,7 +442,7 @@ mod tests {
 
         assert_eq!(observed_wait, Some(Duration::from_millis(25)));
         assert!(!should_exit);
-        assert!(did_wait);
+        assert!(outcome.did_idle_wait);
         assert!(
             events
                 .iter()
@@ -568,7 +501,8 @@ mod tests {
 
     #[allow(clippy::needless_pass_by_value)]
     fn capture_activity(work: RuntimeWork, mut captured: ResMut<CapturedActivity>) {
-        captured.0 = Some(runtime_activity(&work, Instant::now()));
+        let active_scroll = super::input_gate::active_scroll_work(&work);
+        captured.0 = Some(runtime_activity(&work, Instant::now(), active_scroll));
     }
 
     #[test]
@@ -728,25 +662,6 @@ mod tests {
             app.world().resource::<ScrollProbe>().0 < 20.0,
             "40ms idle wait leaked into the next animation delta"
         );
-    }
-
-    #[test]
-    fn only_idle_waits_resync_the_real_clock() {
-        let idle = RuntimeActivity {
-            frame_work: false,
-            nearest_deadline: None,
-        };
-        let animating = RuntimeActivity {
-            frame_work: true,
-            nearest_deadline: None,
-        };
-
-        assert!(should_resync_real_time_after_wait(idle, true));
-        assert!(
-            !should_resync_real_time_after_wait(animating, true),
-            "active frame pacing must contribute to the next animation delta"
-        );
-        assert!(!should_resync_real_time_after_wait(idle, false));
     }
 
     #[derive(Resource, Default)]

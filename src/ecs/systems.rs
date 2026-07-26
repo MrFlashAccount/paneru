@@ -928,6 +928,7 @@ pub(super) fn commit_window_position(
     >,
     mut commands: Commands,
 ) {
+    crate::frame_metrics::record_commit_window_position_execution();
     for (entity, mut window, position, disposition, unmanaged, repositioning, observed) in
         &mut moved_windows
     {
@@ -952,9 +953,8 @@ pub(super) fn commit_window_position(
             continue;
         }
         window.reposition(position.0);
-        // During an animation the marker remains until the final frame. Chained systems apply
-        // its removal before this system runs, so only a completed/direct move starts the
-        // acknowledgement window. Direct scrolling may refresh this component every frame; the
+        // During animation the marker remains until the final frame; chained removal runs first.
+        // Only completed/direct moves start verification; scrolling may refresh every frame, but
         // final position is verified once scrolling stops.
         if repositioning.is_none()
             && let Ok(mut entity_commands) = commands.get_entity(entity)

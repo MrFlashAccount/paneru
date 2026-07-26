@@ -11,6 +11,7 @@ mod config;
 mod ecs;
 mod errors;
 mod events;
+mod frame_metrics;
 mod manager;
 mod menubar;
 mod overlay;

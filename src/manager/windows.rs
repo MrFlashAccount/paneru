@@ -282,6 +282,7 @@ impl WindowOS {
             )
         };
         if let Ok(position) = AXUIWrapper::retain(position_ref) {
+            crate::frame_metrics::record_ax_position_write(self.id);
             unsafe {
                 AXUIElementSetAttributeValue(
                     self.ax_element.as_ptr(),
