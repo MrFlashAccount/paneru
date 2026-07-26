@@ -26,6 +26,7 @@ use crate::manager::{Display, Window, WindowManager};
 use crate::platform::Modifiers;
 
 mod focus;
+mod input;
 mod motion;
 pub(crate) mod overscroll;
 mod paging;
@@ -35,6 +36,7 @@ use focus::request_for_offset as request_scroll_focus;
 use focus::request_when_aligned as request_scroll_focus_when_aligned;
 #[cfg(test)]
 use focus::target_after_scroll as focus_target_after_scroll;
+use input::GestureInput;
 use motion::{reconcile_integrated_position, smooth_native_scroll};
 use overscroll::apply_edge_overscroll;
 use paging::{
@@ -65,23 +67,6 @@ fn snap_mode(paging: bool, sticky: bool, auto_center: bool) -> SnapMode {
         SnapMode::AutoCenter
     } else {
         SnapMode::Disabled
-    }
-}
-
-#[derive(Default)]
-struct GestureInput {
-    physical_scroll_delta: Option<f64>,
-    momentum_scroll_delta: Option<f64>,
-    gesture_delta: Option<f64>,
-    touchpad_down: Option<usize>,
-    touchpad_physical_up: Option<usize>,
-    touchpad_momentum_start: Option<usize>,
-    touchpad_up: Option<usize>,
-}
-
-impl GestureInput {
-    fn belongs_to_latest_contact(&self, phase: Option<usize>) -> bool {
-        phase.is_some_and(|phase| self.touchpad_down.is_none_or(|down| phase > down))
     }
 }
 
@@ -412,32 +397,7 @@ fn read_gesture_input(
 ) -> GestureInput {
     let mut input = GestureInput::default();
     for (order, event) in messages.read().enumerate() {
-        match event {
-            Event::TouchpadDown => {
-                input.touchpad_down = Some(order);
-                input.physical_scroll_delta = None;
-                input.momentum_scroll_delta = None;
-            }
-            Event::TouchpadPhysicalUp => input.touchpad_physical_up = Some(order),
-            Event::TouchpadMomentumStart => input.touchpad_momentum_start = Some(order),
-            Event::TouchpadUp => input.touchpad_up = Some(order),
-            Event::Scroll { delta, is_momentum } => {
-                let scroll_delta = if *is_momentum {
-                    &mut input.momentum_scroll_delta
-                } else {
-                    &mut input.physical_scroll_delta
-                };
-                *scroll_delta.get_or_insert(0.0) += *delta * scroll_scale;
-            }
-            Event::Swipe { delta, fingers }
-                if config
-                    .swipe_gesture_fingers()
-                    .is_some_and(|configured| configured == *fingers) =>
-            {
-                *input.gesture_delta.get_or_insert(0.0) += *delta;
-            }
-            _ => {}
-        }
+        input.ingest(order, event, config, scroll_scale);
     }
     input
 }
@@ -911,6 +871,7 @@ fn integrate_scrolling(
     viewport_width: f64,
     direction_modifier: f64,
 ) {
+    crate::frame_metrics::record_scroll_integration_step();
     scroll.edge_overscroll.integrate(dt);
     if let Some(target) = scroll.target_position {
         let (position, settled) = smooth_native_scroll(scroll.position, target, dt);
@@ -1190,6 +1151,8 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
     }));
 }
 
+#[cfg(test)]
+mod frame_coalescing_tests;
 #[cfg(test)]
 mod mixed_input_tests;
 #[cfg(test)]
