@@ -1304,6 +1304,16 @@ paging = false
                 h.app.world_mut().write_message::<Event>(event);
             }
         }
+        // Same-application focus is intentionally completed on a non-blocking
+        // deadline. Let command-driven focus settle before issuing the next
+        // synthetic command in this test.
+        std::thread::sleep(Duration::from_millis(25));
+        for _ in 0..2 {
+            h.app.update();
+            for event in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(event);
+            }
+        }
     };
     let cmd = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
     let win_x = |h: &mut TestHarness, id: i32| -> i32 {

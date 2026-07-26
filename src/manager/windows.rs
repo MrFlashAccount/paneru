@@ -9,14 +9,10 @@ use bevy::math::IRect;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
-    kCFBooleanFalse, kCFBooleanTrue,
+    CFArray, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
-use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::{LazyLock, Mutex, OnceLock};
-use std::thread;
-use std::time::Duration;
+use std::sync::OnceLock;
 use stdext::function_name;
 use tracing::{Level, debug, instrument, trace, warn};
 
@@ -31,12 +27,7 @@ use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 
-/// Per-PID ref-count for the `AXEnhancedUserInterface` workaround. Tracks how many
-/// concurrent window operations are in-flight for each app so the attribute is only
-/// re-enabled after the last one completes (safe under `par_iter_mut`).
-static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
+mod enhanced_ui;
 mod focus;
 
 /// macOS may partially apply an AX width increase when the requested right edge
@@ -79,12 +70,18 @@ pub trait WindowApi: Send + Sync {
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     fn update_frame(&mut self) -> Result<IRect>;
-    fn focus_without_raise(
+    /// Starts a no-raise focus request. Returns `true` when the target belongs
+    /// to the currently focused application and the activation event must be
+    /// completed after a short, non-blocking delay.
+    fn begin_focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    );
+    ) -> bool;
+    /// Completes the delayed same-application activation started by
+    /// `begin_focus_without_raise`.
+    fn complete_focus_without_raise(&self, psn: ProcessSerialNumber);
     /// Selects this exact window for keyboard focus, activates its application,
     /// and raises the window as one ordered native operation.
     fn focus_with_raise(&self, psn: ProcessSerialNumber);
@@ -273,68 +270,6 @@ impl WindowOS {
             .clone()
     }
 
-    /// Disables `AXEnhancedUserInterface` on this window's app if it is currently enabled.
-    ///
-    /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
-    /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
-    ///
-    /// This avoids animated move/resize that breaks window management for apps like Chrome,
-    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
-    fn disable_enhanced_ui(&self) {
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&pid) {
-            *count += 1;
-            return;
-        }
-        let Some(app_element) = self.app_reference() else {
-            return;
-        };
-        let attr = CFString::from_static_str("AXEnhancedUserInterface");
-        let enabled = app_element
-            .get_attribute::<CFBoolean>(&attr)
-            .is_ok_and(|v| CFBoolean::value(&v));
-        if enabled {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanFalse.unwrap(),
-                );
-            }
-            counts.insert(pid, 1);
-        }
-    }
-
-    /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
-    /// caller has finished. Pairs with [`disable_enhanced_ui`].
-    fn reenable_enhanced_ui(&self) {
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(count) = counts.get_mut(&pid) else {
-            return;
-        };
-        *count -= 1;
-        if *count > 0 {
-            return;
-        }
-        counts.remove(&pid);
-        if let Some(app_element) = self.app_reference() {
-            let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanTrue.unwrap(),
-                );
-            }
-        }
-    }
-
     fn set_ax_position(&mut self, origin: Origin) {
         let mut point = CGPoint::new(
             f64::from(origin.x + self.horizontal_padding),
@@ -495,9 +430,9 @@ impl WindowApi for WindowOS {
             trace!("already in position.");
             return;
         }
-        self.disable_enhanced_ui();
+        enhanced_ui::disable(self);
         self.set_ax_position(origin);
-        self.reenable_enhanced_ui();
+        enhanced_ui::reenable(self);
     }
 
     #[instrument(level = Level::TRACE)]
@@ -508,7 +443,7 @@ impl WindowApi for WindowOS {
         }
         let previous_frame = self.frame;
         let target_origin = previous_frame.min;
-        self.disable_enhanced_ui();
+        enhanced_ui::disable(self);
         self.set_ax_size(size);
 
         let mut previous_observed_frame = previous_frame;
@@ -545,7 +480,7 @@ impl WindowApi for WindowOS {
             }
             self.set_ax_position(target_origin);
         }
-        self.reenable_enhanced_ui();
+        enhanced_ui::reenable(self);
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -608,18 +543,18 @@ impl WindowApi for WindowOS {
         Ok(self.frame)
     }
 
-    /// Focuses the window without raising it. This involves sending specific events to the process.
+    /// Starts focusing the window without raising it.
     ///
     /// # Arguments
     ///
     /// * `currently_focused` - A reference to the currently focused window.
     #[instrument(level = Level::DEBUG, skip(currently_focused))]
-    fn focus_without_raise(
+    fn begin_focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    ) {
+    ) -> bool {
         let window_id = self.id();
         debug!("{window_id}");
         if focused_psn == psn {
@@ -632,19 +567,26 @@ impl WindowApi for WindowOS {
             unsafe {
                 SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast());
             }
-
-            // Artificially delay the activation. This is necessary because some
-            // applications appear to be confused if both of the events appear instantaneously.
-            thread::sleep(Duration::from_millis(20));
-
-            event_bytes[0x8a] = 0x01;
-            event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
-            unsafe {
-                SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
-            }
+            return true;
         }
 
         unsafe {
+            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
+        }
+        self.make_key_window(&psn);
+        false
+    }
+
+    #[instrument(level = Level::DEBUG)]
+    fn complete_focus_without_raise(&self, psn: ProcessSerialNumber) {
+        let window_id = self.id();
+        let mut event_bytes = [0u8; 0xf8];
+        event_bytes[0x04] = 0xf8;
+        event_bytes[0x08] = 0x0d;
+        event_bytes[0x8a] = 0x01;
+        event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
+        unsafe {
+            SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
             _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
         }
         self.make_key_window(&psn);

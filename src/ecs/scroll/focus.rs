@@ -190,10 +190,6 @@ pub(super) fn request_for_offset(
     // auto-centering, or cursor movement.
     global_state.set_skip_reshuffle(true);
     global_state.set_ffm_flag(Some(window.id()));
-    commands.trigger(FocusWindow {
-        entity: target,
-        raise: true,
-        suppress_side_effects: true,
-    });
+    commands.trigger(FocusWindow::scrolling(target));
     scroll.scroll_focus_origin = Some(target);
 }
