@@ -62,6 +62,39 @@ fn latest_reverse_contact_discards_old_direction_and_interrupts_snap() {
 }
 
 #[test]
+fn latest_raw_swipe_contact_discards_pre_contact_delta() {
+    let config = Config::try_from(
+        "[options]\nswipe_gesture_fingers = 3\n\n[swipe]\npaging = false\n\n[bindings]\n",
+    )
+    .expect("raw swipe config should parse");
+    let mut input = GestureInput::default();
+    let events = [
+        Event::Swipe {
+            delta: 0.75,
+            fingers: 3,
+        },
+        Event::TouchpadDown,
+        Event::Swipe {
+            delta: -0.25,
+            fingers: 3,
+        },
+        Event::Swipe {
+            delta: -0.5,
+            fingers: 3,
+        },
+    ];
+    for (order, event) in events.iter().enumerate() {
+        input.ingest(order, event, &config, 1.0);
+    }
+
+    assert_eq!(
+        input.gesture_delta,
+        Some(-0.75),
+        "a new contact must discard raw swipe input from the previous contact"
+    );
+}
+
+#[test]
 fn integration_runs_once_per_tick_at_supported_refresh_rates() {
     for refresh_hz in [60_u32, 120, 240] {
         crate::frame_metrics::reset_for_tests();

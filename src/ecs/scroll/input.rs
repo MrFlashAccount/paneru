@@ -31,6 +31,7 @@ impl GestureInput {
                 self.touchpad_down = Some(order);
                 self.physical_scroll_delta = None;
                 self.momentum_scroll_delta = None;
+                self.gesture_delta = None;
             }
             Event::TouchpadPhysicalUp => self.touchpad_physical_up = Some(order),
             Event::TouchpadMomentumStart => self.touchpad_momentum_start = Some(order),
