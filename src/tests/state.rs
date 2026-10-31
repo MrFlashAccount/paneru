@@ -479,6 +479,68 @@ fn restore_plan_skips_ambiguous_fallback_match() {
     assert_eq!(plan.skipped_ambiguous_matches, 1);
 }
 
+#[test]
+fn restore_plan_matches_unique_window_after_dynamic_title_changes() {
+    use crate::ecs::restore::{CurrentWindowIdentity, PlannedColumn, RestorePlanner};
+
+    let mut world = World::new();
+    let current = world.spawn_empty().id();
+    let saved = saved_window(20, 120, "com.example.notes", "Yesterday");
+    let state = restore_state(vec![SavedWorkspace {
+        workspace_id: TEST_WORKSPACE_ID,
+        display_id: None,
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }],
+    }]);
+    let current_windows = vec![CurrentWindowIdentity::fallback_only(
+        current,
+        "com.example.notes",
+        "Today",
+    )];
+
+    let plan = RestorePlanner::new(&state).plan(&current_windows);
+
+    assert_eq!(plan.strips.len(), 1);
+    assert_eq!(plan.strips[0].columns, vec![PlannedColumn::Single(current)]);
+    assert_eq!(plan.consumed_entities, [current].into_iter().collect());
+    assert_eq!(plan.ignored_missing_windows, 0);
+    assert_eq!(plan.skipped_ambiguous_matches, 0);
+}
+
+#[test]
+fn restore_plan_does_not_guess_between_saved_windows_with_dynamic_titles() {
+    use crate::ecs::restore::{CurrentWindowIdentity, RestorePlanner};
+
+    let mut world = World::new();
+    let current = world.spawn_empty().id();
+    let state = restore_state(vec![SavedWorkspace {
+        workspace_id: TEST_WORKSPACE_ID,
+        display_id: None,
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![
+                SavedColumn::Single(saved_window(20, 120, "com.example.notes", "Yesterday")),
+                SavedColumn::Single(saved_window(21, 121, "com.example.notes", "Tomorrow")),
+            ],
+        }],
+    }]);
+    let current_windows = vec![CurrentWindowIdentity::fallback_only(
+        current,
+        "com.example.notes",
+        "Today",
+    )];
+
+    let plan = RestorePlanner::new(&state).plan(&current_windows);
+
+    assert!(plan.consumed_entities.is_empty());
+    assert_eq!(plan.strips.len(), 0);
+    assert_eq!(plan.ignored_missing_windows, 2);
+}
+
 fn restore_state(workspaces: Vec<SavedWorkspace>) -> PaneruState {
     PaneruState {
         version: 2,

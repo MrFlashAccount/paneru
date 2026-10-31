@@ -71,7 +71,7 @@ Menu commands apply to the window that was focused immediately before you opened
 
 The menu bar icon reflects the selected window's state: managed, unmanaged, or no manageable window.
 
-Paneru saves managed layout state by default. At startup, it restores window order, widths—including oversized ratios—and strip position for matching windows. A one-off **Toggle Managed** choice is restored from saved strip membership when Paneru itself restarts; explicit `manage = false` and `floating = true` window rules still take precedence. Missing saved windows are ignored rather than blocking startup.
+Paneru saves managed layout state by default. It restores window order, widths—including oversized ratios—and strip position when Paneru or a managed application restarts. A one-off **Toggle Managed** choice is restored from saved strip membership; explicitly switching the window out of Managed Mode removes its durable slot, and static `manage = false` or `floating = true` rules still take precedence. Missing windows are omitted from the live strip without blocking startup and return to their saved slot when relaunched.
 
 Native macOS tab groups remain usable. Paneru infers a new tab when a same-app window shares the existing window's frame; set `disable_native_tabs = true` if that heuristic groups unrelated windows.
 

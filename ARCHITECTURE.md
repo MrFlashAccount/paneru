@@ -91,7 +91,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
   restore, cleanup, and floating-layer operations must not mutate passthrough
   windows. Focus remains tracked so recovery does not steal focus.
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
-- **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
+- **Durable Restore Catalog:** The startup grace period bounds only initial discovery. `SessionRestore` remains active afterward so relaunched applications can reclaim saved logical slots. Explicit unmanage removes a slot; temporary window absence does not.
 - **Reactive Power Saving:** With no pending work, runtime waits indefinitely on a latched native source. Animation uses frame cadence; lifecycle polling, workspace refresh/recovery, persistence, restore, verification, retry, timeout, and updater jobs contribute monotonic nearest deadlines only while needed.
 
 ## 6. Session Restore
@@ -103,19 +103,21 @@ only after startup configuration confirms restore is enabled. Persisted-domain
 changes reset a 250 ms trailing debounce; failed writes remain dirty and retry
 with bounded backoff. Disabling restore performs no state-file read or write.
 
-`src/ecs/restore.rs` owns startup restore. It keeps the loaded `PaneruState`
-alive in `SessionRestore` for the configured grace period so applications have
-time to reopen their windows. As windows arrive, `restore_window_state` builds a
-restore plan from the saved state and the currently managed ECS windows.
+`src/ecs/restore.rs` owns persistent layout reconciliation. It keeps the loaded
+`PaneruState` alive in `SessionRestore`; the configured grace period marks the
+end of initial discovery, not the end of matching. As windows arrive,
+`restore_window_state` builds a restore plan from the saved state and the
+currently managed ECS windows.
 Passthrough and floating dispositions are excluded before matching, so stale
 session state cannot silently opt a window back into management.
 
 Window matching prefers stable identity (`window_id`, `pid`, and `bundle_id`)
-and uses the conservative fallback identity only when it can do so
-unambiguously. The fallback includes `bundle_id`, window title when available,
-window identifier, role, and subrole. Saved windows that are missing at startup
-are ignored by default, and the restored layout is compacted around the matched
-windows.
+and uses fallback identity only when it can do so unambiguously. Exact fallback
+includes `bundle_id`, title, window identifier, role, and subrole. A unique
+candidate may still match when a dynamic title changed. Saved windows that are
+currently absent are omitted from the live layout but retained in the durable
+catalog; persistence therefore cannot erase a slot merely because its
+application is closed.
 
 Restore rebuilds `LayoutStrip`s, virtual workspace rows, selected virtual
 workspace markers, display associations, saved oversized `WidthRatio`s, and

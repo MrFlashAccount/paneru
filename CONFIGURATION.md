@@ -259,12 +259,12 @@ title = "Screenshot.*"
 floating = true
 ```
 
-### Session Restore
+### Persistent Layout Restore
 
 Paneru saves its managed window layout and can restore it the next time it
-starts. Restore is a startup-only phase: Paneru loads the saved session, applies
-it after initial window discovery, keeps matching open for a short grace period,
-then stops consulting the saved state until the next Paneru process start.
+starts. Paneru loads the saved session after initial window discovery. The
+startup grace period covers that initial discovery pass; the durable catalog
+continues matching windows after the grace period ends.
 
 State writes are event-driven: each persisted layout/display/selection change
 resets a 250 ms trailing debounce, so continuous scrolling does not write every
@@ -282,19 +282,24 @@ The saved session includes:
 - horizontal strip pan positions
 - window identity for matching across restarts
 
+If a managed application is closed and launched again, its window returns to
+the saved strip, order, width, and pan position. Missing windows are omitted
+from the live strip, but their logical slots remain in the persisted catalog so
+restarting Paneru while an app is closed does not erase its placement.
+Explicitly switching a window out of Managed Mode removes that slot.
+
 Explicit ownership rules are evaluated before restore. `manage = false` and
 `floating = true` windows are never pulled into a saved strip. Without an
 explicit ownership rule, saved strip membership restores a window's Managed
 Mode after Paneru restarts. For restored windows, the saved layout, virtual
 workspace, and display win over static placement such as `index` and `width`
-during the startup restore window. Unmatched windows and all windows created
-after the restore grace period ends keep normal `[windows]` behavior.
+during initial restore. Unmatched windows keep normal `[windows]` behavior.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `enabled` | Boolean | `true` | Enables state persistence and startup restore. When false, no state-file I/O or persistence deadline is installed. |
-| `startup_grace_ms` | Integer (ms) | `2000` | How long Paneru keeps restore matching active after startup. This gives apps a chance to create windows shortly after Paneru starts. |
-| `missing_windows` | String | `"ignore"` | Behavior when a saved window is not present during restore. Currently only `"ignore"` is supported, which drops the missing window and compacts the restored layout. |
+| `enabled` | Boolean | `true` | Enables state persistence and durable layout restore. When false, no state-file I/O or persistence deadline is installed. |
+| `startup_grace_ms` | Integer (ms) | `2000` | Duration of the initial startup discovery phase. Durable matching remains active after this period. |
+| `missing_windows` | String | `"ignore"` | Omits a missing window from the live strip while retaining its logical slot for a later relaunch. |
 
 **Example:**
 ```toml
@@ -310,8 +315,8 @@ Restore matches windows first by stable startup identity:
 - process id
 - bundle id
 
-If an application has restarted and those ids changed, Paneru can use a
-conservative fallback match:
+If an application has restarted and those ids changed, Paneru first tries a
+conservative exact fallback match:
 
 - bundle id
 - non-empty window title
@@ -319,16 +324,19 @@ conservative fallback match:
 - accessibility role
 - accessibility subrole
 
+If the title changed, Paneru may match by bundle id, window identifier, role,
+and subrole when that produces exactly one candidate.
+
 Fallback matching is only used when it is unambiguous. If multiple current
 windows could match the same saved window, Paneru skips that saved window rather
 than moving the wrong one.
 
-If a saved app or window is missing, the default `"ignore"` policy simply drops
-it from the restored layout. Empty stacks, tab groups, columns, and virtual rows
-are removed. If the previously selected virtual row is removed because all of
-its windows are missing, Paneru selects the nearest remaining restored row for
-that native workspace. If no restored row remains, the normal startup workspace
-selection is kept.
+If a saved app or window is missing, the default `"ignore"` policy omits it from
+the current live layout without deleting its durable slot. Empty stacks, tab
+groups, columns, and virtual rows are compacted in memory. If the previously
+selected virtual row has no live windows, Paneru selects the nearest remaining
+restored row for that native workspace. When the missing window returns, the
+catalog reconstructs its saved structure.
 
 For screens, Paneru prefers the current macOS workspace-to-display mapping when
 the workspace is already present on a display. Otherwise it restores to the

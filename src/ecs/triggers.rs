@@ -479,6 +479,7 @@ pub(super) fn window_unmanaged_trigger(
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    mut restore: Option<ResMut<crate::ecs::restore::SessionRestore>>,
     mut commands: Commands,
 ) {
     const UNMANAGED_MAX_SCREEN_RATIO_NUM: i32 = 4;
@@ -508,6 +509,17 @@ pub(super) fn window_unmanaged_trigger(
     let Ok((_, mut app, observed)) = apps.get_mut(app_entity) else {
         return;
     };
+
+    if initializing.is_none()
+        && restore
+            .as_deref_mut()
+            .is_some_and(|restore| restore.forget_window(window, &app))
+    {
+        debug!(
+            window_id = window.id(),
+            "removed explicitly unmanaged window from durable restore catalog"
+        );
+    }
 
     let still_owns_managed = windows.managed_iter().any(|(_, managed_entity, parent)| {
         managed_entity != entity && parent.parent() == app_entity
@@ -886,6 +898,7 @@ pub(super) fn spawn_window_trigger(
     mut commands: Commands,
 ) {
     let new_windows = &mut trigger.event_mut().0;
+    let mut spawned_window_ids = Vec::new();
 
     while let Some(mut window) = new_windows.pop() {
         let window_id = window.id();
@@ -944,10 +957,11 @@ pub(super) fn spawn_window_trigger(
             disposition,
             ChildOf(app_entity),
         ));
+        spawned_window_ids.push(window_id);
     }
 
-    if initializing.is_none() && restore.is_some() {
-        commands.trigger(RestoreWindowState);
+    if initializing.is_none() && restore.is_some() && !spawned_window_ids.is_empty() {
+        commands.trigger(RestoreWindowState::for_added_windows(spawned_window_ids));
     }
 }
 

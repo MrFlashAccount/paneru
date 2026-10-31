@@ -244,7 +244,7 @@ fn runtime_activity(
     let restore_deadline = work
         .restore
         .as_deref()
-        .map(super::restore::SessionRestore::next_deadline);
+        .and_then(super::restore::SessionRestore::next_deadline);
     let persistence_deadline = work
         .persistence
         .as_deref()
