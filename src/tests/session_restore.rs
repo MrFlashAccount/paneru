@@ -456,7 +456,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
 }
 
 #[test]
-fn test_restore_resource_is_removed_after_grace_period() {
+fn test_restore_catalog_remains_after_startup_grace_period() {
     let mut harness = TestHarness::new().with_windows(1);
     harness
         .app
@@ -485,7 +485,7 @@ fn test_restore_resource_is_removed_after_grace_period() {
     harness.app.update();
 
     assert!(
-        !harness
+        harness
             .app
             .world()
             .contains_resource::<crate::ecs::restore::SessionRestore>()
@@ -783,6 +783,157 @@ fn test_late_startup_window_restores_during_grace_period() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn test_relaunched_window_restores_after_startup_grace_period() {
+    let mut harness = TestHarness::new();
+    let mut saved = saved_window(99);
+    saved.title = "Saved title".to_string();
+    saved.identifier = "testid".to_string();
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 1,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<crate::ecs::restore::SessionRestore>()
+        .expire_now();
+    harness.app.update();
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .mock_state
+        .update_window(0, |window| window.title = "Changed title".to_string());
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![window]));
+    harness.app.update();
+
+    let world = harness.world();
+    let restored_window = find_window_entity(0, world);
+    let mut query = world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
+    assert!(query.iter(world).any(|(strip, active)| {
+        strip.id() == TEST_WORKSPACE_ID
+            && strip.virtual_index == 1
+            && active
+            && strip.contains(restored_window)
+    }));
+}
+
+#[test]
+fn test_relaunched_window_returns_to_saved_order_after_startup_grace_period() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 1,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(99)),
+            ],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<crate::ecs::restore::SessionRestore>()
+        .expire_now();
+    harness.app.update();
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![window]));
+    harness.app.update();
+
+    let world = harness.world();
+    let first = find_window_entity(0, world);
+    let relaunched = find_window_entity(99, world);
+    let mut query = world.query::<&LayoutStrip>();
+    let restored = query
+        .iter(world)
+        .find(|strip| strip.virtual_index == 1 && strip.contains(relaunched))
+        .expect("relaunched window should return to its saved strip");
+    assert_eq!(restored.all_windows(), vec![first, relaunched]);
+}
+
+#[test]
+fn test_unrelated_new_window_does_not_rebuild_restored_strip() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let managed = find_window_entity(0, harness.world());
+    let restored_strip = harness
+        .world()
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(harness.world())
+        .find(|(_, strip)| strip.contains(managed))
+        .map(|(entity, _)| entity)
+        .expect("restored strip should exist");
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let unrelated = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![unrelated]));
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    assert!(harness.world().entities().contains(restored_strip));
+    assert!(
+        harness
+            .world()
+            .get::<LayoutStrip>(restored_strip)
+            .is_some_and(|strip| strip.contains(managed))
+    );
 }
 
 #[test]
