@@ -278,6 +278,7 @@ fn save_snapshot(
         &snapshot.displays,
         &snapshot.windows,
         &snapshot.apps,
+        restore.as_deref().map(SessionRestore::catalog),
     );
     let create_catalog = restore.is_none();
     let snapshot = restore.map_or(live_snapshot.clone(), |restore| {

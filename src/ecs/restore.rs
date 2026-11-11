@@ -69,15 +69,36 @@ impl SessionRestore {
         self.startup_grace_complete = true;
     }
 
+    pub(crate) fn catalog(&self) -> &PaneruState {
+        &self.state
+    }
+
     pub(crate) fn reconcile_persisted_state(&mut self, live: PaneruState) -> PaneruState {
-        if catalog_is_fully_present(&self.state, &live) {
+        let updates = persisted_window_updates(&self.state, &live);
+        if updates.len() == self.state.windows().count() {
             self.state = live;
-            self.saved_hard_keys = saved_hard_match_keys(&self.state);
+        } else {
+            // Keep the absent slots/order and full-layout viewport. A compacted
+            // live strip's pan is in a different coordinate system. Per-window
+            // identities and widths must still follow the open windows.
+            for saved in self.state.windows_mut() {
+                if let Some(current) = updates.get(&saved.hard_key()) {
+                    let full_layout_pan = saved.strip_position_x;
+                    saved.clone_from(current);
+                    saved.strip_position_x = full_layout_pan;
+                }
+            }
         }
+        self.saved_hard_keys = saved_hard_match_keys(&self.state);
         self.state.clone()
     }
 
-    pub(crate) fn forget_window(&mut self, window: &Window, app: &Application) -> bool {
+    pub(crate) fn forget_window(
+        &mut self,
+        window: &Window,
+        app: &Application,
+        mut live_windows: impl Iterator<Item = (WinID, Pid)>,
+    ) -> bool {
         let Ok(pid) = window.pid() else {
             return false;
         };
@@ -87,14 +108,19 @@ impl SessionRestore {
             .any(|saved| saved.hard_key() == hard_key)
             .then_some(hard_key)
             .or_else(|| {
-                unique_fallback_key(
+                let key = unique_fallback_key(
                     &self.state,
                     &bundle_id,
                     &window.title().unwrap_or_default(),
                     &window.identifier().unwrap_or_default(),
                     &window.role().unwrap_or_default(),
                     &window.subrole().unwrap_or_default(),
-                )
+                )?;
+                // A relaunched window may be toggled off before the debounced
+                // save refreshes its native identity. Fallback is valid only
+                // when the old native owner is absent, never for a live sibling.
+                (!live_windows.any(|(id, pid)| key.window_id == id && key.pid == pid))
+                    .then_some(key)
             });
         let removed = key.is_some_and(|key| remove_saved_window(&mut self.state, &key));
         if removed {
@@ -434,27 +460,69 @@ fn consume_window_match(
 }
 
 fn saved_windows_in_state(state: &PaneruState) -> impl Iterator<Item = &SavedWindow> {
-    state
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.strips)
-        .flat_map(|strip| &strip.columns)
-        .flat_map(saved_windows_in_column)
+    state.windows()
 }
 
-fn catalog_is_fully_present(catalog: &PaneruState, live: &PaneruState) -> bool {
+fn persisted_window_updates<'a>(
+    catalog: &PaneruState,
+    live: &'a PaneruState,
+) -> HashMap<WindowHardMatchKey, &'a SavedWindow> {
+    let saved_windows = saved_windows_in_state(catalog).collect::<Vec<_>>();
     let live_windows = saved_windows_in_state(live).collect::<Vec<_>>();
-    let mut consumed = HashSet::new();
-
-    saved_windows_in_state(catalog).all(|saved| {
-        live_windows
+    let saved_keys = saved_hard_match_keys(catalog);
+    let mut updates = HashMap::new();
+    for saved in &saved_windows {
+        let exact_native = live_windows
             .iter()
-            .enumerate()
-            .find(|(index, current)| {
-                !consumed.contains(index) && saved.matches_persisted_window(current)
-            })
-            .is_some_and(|(index, _)| consumed.insert(index))
-    })
+            .copied()
+            .find(|current| saved.hard_match(current.window_id, current.pid, &current.bundle_id));
+        let current = exact_native.or_else(|| {
+            // Reserve hard matches before using heuristics. Both sides must
+            // be unique, so a returning sibling cannot overwrite a missing
+            // window with the same app/identifier but a different title.
+            let available = || {
+                live_windows
+                    .iter()
+                    .copied()
+                    .filter(|current| !saved_keys.contains(&current.hard_key()))
+            };
+            let exact_title = |left: &SavedWindow, right: &SavedWindow| {
+                !left.title.is_empty()
+                    && left.title == right.title
+                    && left.compatible_persisted_identity(right)
+            };
+            if let Some(current) =
+                only_saved_window(available().filter(|current| exact_title(saved, current)))
+                && saved_windows
+                    .iter()
+                    .filter(|candidate| exact_title(candidate, current))
+                    .count()
+                    == 1
+            {
+                return Some(current);
+            }
+            let current = only_saved_window(
+                available().filter(|current| saved.compatible_persisted_identity(current)),
+            )?;
+            (saved_windows
+                .iter()
+                .filter(|candidate| candidate.compatible_persisted_identity(current))
+                .count()
+                == 1)
+                .then_some(current)
+        });
+        if let Some(current) = current {
+            updates.insert(saved.hard_key(), current);
+        }
+    }
+    updates
+}
+
+fn only_saved_window<'a>(
+    mut windows: impl Iterator<Item = &'a SavedWindow>,
+) -> Option<&'a SavedWindow> {
+    let first = windows.next()?;
+    windows.next().is_none().then_some(first)
 }
 
 fn unique_fallback_key(
@@ -537,22 +605,7 @@ fn retain_column_windows(column: &mut SavedColumn, key: &WindowHardMatchKey) -> 
 }
 
 fn saved_windows_in_column(column: &SavedColumn) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match column {
-        SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => {
-            Box::new(std::iter::once(saved))
-        }
-        SavedColumn::Tabs(tabs) => Box::new(tabs.iter()),
-        SavedColumn::Stack(items) => Box::new(items.iter().flat_map(saved_windows_in_stack_item)),
-    }
-}
-
-fn saved_windows_in_stack_item(
-    item: &SavedStackItem,
-) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match item {
-        SavedStackItem::Single(saved) => Box::new(std::iter::once(saved)),
-        SavedStackItem::Tabs(tabs) => Box::new(tabs.iter()),
-    }
+    column.windows()
 }
 
 impl SavedWindow {
@@ -562,6 +615,7 @@ impl SavedWindow {
 
     fn fallback_match(&self, current: &CurrentWindowIdentity) -> bool {
         !self.title.is_empty()
+            && !self.role.is_empty()
             && self.bundle_id == current.bundle_id
             && self.title == current.title
             && self.identifier == current.identifier
@@ -570,18 +624,19 @@ impl SavedWindow {
     }
 
     fn compatible_fallback_match(&self, current: &CurrentWindowIdentity) -> bool {
-        self.bundle_id == current.bundle_id
+        !self.role.is_empty()
+            && self.bundle_id == current.bundle_id
             && self.identifier == current.identifier
             && self.role == current.role
             && self.subrole == current.subrole
     }
 
-    fn matches_persisted_window(&self, current: &SavedWindow) -> bool {
-        self.hard_key() == current.hard_key()
-            || (self.bundle_id == current.bundle_id
-                && self.identifier == current.identifier
-                && self.role == current.role
-                && self.subrole == current.subrole)
+    fn compatible_persisted_identity(&self, current: &SavedWindow) -> bool {
+        !self.role.is_empty()
+            && self.bundle_id == current.bundle_id
+            && self.identifier == current.identifier
+            && self.role == current.role
+            && self.subrole == current.subrole
     }
 }
 
@@ -592,7 +647,7 @@ fn saved_hard_match_keys(state: &PaneruState) -> HashSet<WindowHardMatchKey> {
 }
 
 fn has_saved_fallback_windows(state: &PaneruState) -> bool {
-    saved_windows_in_state(state).any(|window| !window.title.is_empty())
+    saved_windows_in_state(state).any(|window| !window.role.is_empty())
 }
 
 pub(crate) fn matches_startup_restore_state(
@@ -898,9 +953,6 @@ fn hydrate_fallback_identities(
             continue;
         };
         identity.title = window.title().unwrap_or_default();
-        if identity.title.is_empty() {
-            continue;
-        }
         identity.identifier = window.identifier().unwrap_or_default();
         identity.role = window.role().unwrap_or_default();
         identity.subrole = window.subrole().unwrap_or_default();
@@ -1123,6 +1175,86 @@ mod deadline_tests {
         let persisted = restore.reconcile_persisted_state(live.clone());
 
         assert_eq!(persisted, live);
+    }
+
+    #[test]
+    fn persistence_updates_open_window_width_while_neighbor_is_closed() {
+        let missing = saved_window(2);
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(1, vec![saved_window(1), missing.clone()]));
+        let mut resized = saved_window(1);
+        resized.width_ratio = Some(1.75);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![resized.clone()]));
+        let windows = persisted.windows().collect::<Vec<_>>();
+        assert_eq!(windows, vec![&resized, &missing]);
+    }
+
+    #[test]
+    fn partial_catalog_keeps_full_layout_pan_while_saving_new_width() {
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(1, vec![saved_window(1), saved_window(2)]));
+        let mut compacted = saved_window(2);
+        compacted.width_ratio = Some(1.75);
+        compacted.strip_position_x = Some(0);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![compacted]));
+        let saved = persisted
+            .windows()
+            .find(|window| window.window_id == 2)
+            .unwrap();
+        assert_eq!(saved.width_ratio, Some(1.75));
+        assert_eq!(saved.strip_position_x, Some(-100));
+    }
+
+    #[test]
+    fn persistence_updates_relaunched_window_while_neighbor_is_closed() {
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(1, vec![saved_window(1), saved_window(2)]));
+        let mut relaunched = saved_window(1);
+        relaunched.window_id = 101;
+        relaunched.pid = 201;
+        relaunched.title = "Changed title".to_string();
+        relaunched.width_ratio = Some(1.75);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![relaunched.clone()]));
+        assert_eq!(persisted.windows().next(), Some(&relaunched));
+        assert!(restore.saved_hard_keys.contains(&relaunched.hard_key()));
+        assert!(
+            !restore
+                .saved_hard_keys
+                .contains(&saved_window(1).hard_key())
+        );
+    }
+
+    #[test]
+    fn persistence_matches_same_app_siblings_by_title_before_relaxed_identity() {
+        let first = saved_window(1);
+        let mut second = saved_window(2);
+        second.bundle_id.clone_from(&first.bundle_id);
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(1, vec![first.clone(), second.clone()]));
+        second.window_id = 102;
+        second.pid = 202;
+        second.width_ratio = Some(1.75);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![second.clone()]));
+        assert_eq!(
+            persisted.windows().collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+    }
+
+    #[test]
+    fn persistence_does_not_guess_between_ambiguous_saved_siblings() {
+        let first = saved_window(1);
+        let mut second = saved_window(2);
+        second.bundle_id.clone_from(&first.bundle_id);
+        let before = state(1, vec![first.clone(), second]);
+        let mut restore = SessionRestore::from_live_snapshot(before.clone());
+        let mut unknown = first;
+        unknown.window_id = 100;
+        unknown.pid = 200;
+        unknown.title = "Changed title".to_string();
+        unknown.width_ratio = Some(1.75);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![unknown]));
+        assert_eq!(persisted, before);
     }
 
     #[test]

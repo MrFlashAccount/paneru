@@ -287,6 +287,13 @@ the saved strip, order, width, and pan position. Missing windows are omitted
 from the live strip, but their logical slots remain in the persisted catalog so
 restarting Paneru while an app is closed does not erase its placement.
 Explicitly switching a window out of Managed Mode removes that slot.
+Opening another ordinary window of the same application does not remove the
+saved slot. Passthrough/floating configuration suppresses restoration without
+deleting the saved layout.
+Sizes and identities of matched open windows continue to be saved while a
+neighbor is closed. Transient Accessibility read failures retain the last
+known identity for that same native window instead of replacing it with empty
+values; successfully read empty optional attributes remain valid.
 
 Explicit ownership rules are evaluated before restore. `manage = false` and
 `floating = true` windows are never pulled into a saved strip. Without an

@@ -75,7 +75,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`Config`:** The current user configuration.
 - **`PaneruState`**: The durable snapshot of managed layout, display, native workspace, and virtual workspace state used for recovery after restarts.
-- **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.
+- **`SessionRestore`**: A durable restore catalog; the startup grace deadline ends initial discovery, not the catalog's lifetime.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
 
@@ -107,9 +107,9 @@ with bounded backoff. Disabling restore performs no state-file read or write.
 `PaneruState` alive in `SessionRestore`; the configured grace period marks the
 end of initial discovery, not the end of matching. As windows arrive,
 `restore_window_state` builds a restore plan from the saved state and the
-currently managed ECS windows.
-Passthrough and floating dispositions are excluded before matching, so stale
-session state cannot silently opt a window back into management.
+currently discovered ECS windows. Explicit passthrough/floating configuration
+is excluded before matching; a saved opt-in window can override the default
+passthrough disposition when it returns.
 
 Window matching prefers stable identity (`window_id`, `pid`, and `bundle_id`)
 and uses fallback identity only when it can do so unambiguously. Exact fallback
@@ -118,6 +118,17 @@ candidate may still match when a dynamic title changed. Saved windows that are
 currently absent are omitted from the live layout but retained in the durable
 catalog; persistence therefore cannot erase a slot merely because its
 application is closed.
+Only the explicit Toggle Managed off command forgets a saved slot. Generic
+`Unmanaged` lifecycle observers never delete catalog entries: a new passthrough
+sibling is not an opt-out of the saved window. An explicit command may use a
+unique fallback before the next save updates a relaunched window's native ID,
+but cannot forget a slot still owned by another live native window.
+Snapshot extraction retains last-known AX identity fields on failed reads for
+the exact same native window. A partial catalog updates matched windows' widths
+and identities without replacing missing slots or copying a compacted strip's
+pan into the full-layout coordinate system. A complete live layout replaces the
+catalog once every saved slot is present; ambiguous sibling matches are never
+used to overwrite a missing window.
 
 Restore rebuilds `LayoutStrip`s, virtual workspace rows, selected virtual
 workspace markers, display associations, saved oversized `WidthRatio`s, and

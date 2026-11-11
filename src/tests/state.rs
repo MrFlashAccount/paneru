@@ -149,7 +149,7 @@ fn test_state_extraction() {
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
     let (workspaces, displays, windows, apps) = system_state.get(world);
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps, None);
 
     assert_eq!(state.workspaces.len(), 1);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -192,7 +192,7 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
     let (workspaces, displays, windows, apps) = system_state.get(world);
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps, None);
 
     assert_eq!(state.version, 2);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -226,6 +226,133 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
     assert_eq!(json["workspaces"][0]["active_virtual_index"], 0);
 }
 
+pub(super) fn extract_state(
+    harness: &mut crate::tests::TestHarness,
+    previous: Option<&PaneruState>,
+) -> PaneruState {
+    let world = harness.world();
+    let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
+    let (workspaces, displays, windows, apps) = system_state.get(world);
+    PaneruState::extract(&workspaces, &displays, &windows, &apps, previous)
+}
+
+#[test]
+fn failed_ax_identity_reads_preserve_relaunch_matching_and_latest_width() {
+    use crate::ecs::WidthRatio;
+    use crate::ecs::restore::{RestorePlanner, SessionRestore};
+    use crate::tests::{MockIdentityAttribute, TestHarness, find_window_entity};
+
+    for attribute in [
+        MockIdentityAttribute::Role,
+        MockIdentityAttribute::Title,
+        MockIdentityAttribute::Identifier,
+        MockIdentityAttribute::Subrole,
+    ] {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.app.update();
+        let before = extract_state(&mut harness, None);
+        let original = before.windows().next().unwrap().clone();
+        harness
+            .mock_state
+            .update_window(0, |window| window.identity_failure = Some(attribute));
+        let entity = find_window_entity(0, harness.world());
+        harness.world().get_mut::<WidthRatio>(entity).unwrap().0 = 1.75;
+
+        let live = extract_state(&mut harness, Some(&before));
+        let mut catalog = SessionRestore::from_live_snapshot(before);
+        let persisted = catalog.reconcile_persisted_state(live);
+        let saved = persisted.windows().next().unwrap();
+        assert_eq!(saved.title, original.title, "{attribute:?}");
+        assert_eq!(saved.identifier, original.identifier, "{attribute:?}");
+        assert_eq!(saved.role, original.role, "{attribute:?}");
+        assert_eq!(saved.subrole, original.subrole, "{attribute:?}");
+        assert_eq!(saved.width_ratio, Some(1.75));
+
+        let current = CurrentWindowIdentity {
+            entity,
+            window_id: original.window_id + 100,
+            pid: original.pid + 100,
+            bundle_id: original.bundle_id,
+            title: "Title after relaunch".to_owned(),
+            identifier: original.identifier,
+            role: original.role,
+            subrole: original.subrole,
+        };
+        let plan = RestorePlanner::new(&persisted).plan(&[current]);
+        assert!(
+            plan.consumed_entities.contains(&entity),
+            "{attribute:?} must not break relaunch restore"
+        );
+        assert_eq!(plan.geometry[&entity].width_ratio, Some(1.75));
+    }
+}
+
+#[test]
+fn successful_empty_identity_values_are_not_treated_as_ax_failures() {
+    let mut harness = crate::tests::TestHarness::new().with_windows(1);
+    harness.app.update();
+    let before = extract_state(&mut harness, None);
+    harness.mock_state.update_window(0, |window| {
+        window.title.clear();
+        window.identifier.clear();
+        window.subrole.clear();
+    });
+    let after = extract_state(&mut harness, Some(&before));
+    let saved = after.windows().next().unwrap();
+    assert!(saved.title.is_empty());
+    assert!(saved.identifier.is_empty());
+    assert!(saved.subrole.is_empty());
+    assert_eq!(saved.role, "AXWindow");
+}
+
+#[test]
+fn locked_session_application_proxy_does_not_replace_window_identity() {
+    let mut harness = crate::tests::TestHarness::new().with_windows(1);
+    harness.app.update();
+    let before = extract_state(&mut harness, None);
+    harness.mock_state.update_window(0, |window| {
+        window.title = "Application".to_string();
+        window.role = "AXApplication".to_string();
+        window.identifier.clear();
+        window.subrole.clear();
+    });
+    let after = extract_state(&mut harness, Some(&before));
+    let saved = after.windows().next().unwrap();
+    let original = before.windows().next().unwrap();
+    assert_eq!(saved.title, original.title);
+    assert_eq!(saved.role, original.role);
+    assert_eq!(saved.subrole, original.subrole);
+    assert_eq!(saved.identifier, original.identifier);
+    assert_eq!(extract_state(&mut harness, None).windows().count(), 0);
+}
+
+#[test]
+fn snapshot_keeps_explicitly_managed_nonstandard_window_roles() {
+    let mut harness = crate::tests::TestHarness::new().with_windows(1);
+    harness.app.update();
+    harness.mock_state.update_window(0, |window| {
+        window.role = "AXSheet".to_string();
+    });
+    let state = extract_state(&mut harness, None);
+    assert_eq!(state.windows().next().unwrap().role, "AXSheet");
+}
+
+#[test]
+fn unreadable_identity_cannot_borrow_metadata_from_a_different_native_window() {
+    let mut harness = crate::tests::TestHarness::new().with_windows(1);
+    harness.app.update();
+    let mut before = extract_state(&mut harness, None);
+    before.windows_mut().next().unwrap().pid += 100;
+    harness.mock_state.update_window(0, |window| {
+        window.identity_failure = Some(crate::tests::MockIdentityAttribute::Role);
+    });
+    assert_eq!(
+        extract_state(&mut harness, Some(&before)).windows().count(),
+        0
+    );
+    assert_eq!(extract_state(&mut harness, None).windows().count(), 0);
+}
+
 #[test]
 fn test_state_extraction_includes_parentless_layout_strips() {
     use crate::tests::harness::TestHarness;
@@ -241,7 +368,7 @@ fn test_state_extraction_includes_parentless_layout_strips() {
     let mut system_state: StateExtractionState<'_, '_> = SystemState::new(world);
     let (workspaces, displays, windows, apps) = system_state.get(world);
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps, None);
 
     let parentless_workspace = state
         .workspaces
