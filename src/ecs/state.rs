@@ -17,7 +17,7 @@ use tracing::error;
 
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Position, Unmanaged};
+use crate::ecs::{ActiveDisplayMarker, Position, Unmanaged};
 use crate::manager::Application;
 use crate::manager::Display;
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
@@ -91,7 +91,7 @@ impl SavedColumn {
         }
     }
 
-    fn windows_mut(&mut self) -> Box<dyn Iterator<Item = &mut SavedWindow> + '_> {
+    pub(crate) fn windows_mut(&mut self) -> Box<dyn Iterator<Item = &mut SavedWindow> + '_> {
         match self {
             Self::Single(window) | Self::Fullscreen(window) => Box::new(std::iter::once(window)),
             Self::Tabs(windows) => Box::new(windows.iter_mut()),
@@ -231,6 +231,7 @@ impl PaneruState {
             .flat_map(SavedColumn::windows)
     }
 
+    #[cfg(test)]
     pub(crate) fn windows_mut(&mut self) -> impl Iterator<Item = &mut SavedWindow> {
         self.workspaces
             .iter_mut()
@@ -240,13 +241,15 @@ impl PaneruState {
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_lines)]
-    pub fn extract(
-        workspaces: &Query<(
-            Option<&ChildOf>,
-            &LayoutStrip,
-            Option<&Position>,
-            Has<ActiveWorkspaceMarker>,
-        )>,
+    pub fn extract<'a>(
+        workspaces: impl IntoIterator<
+            Item = (
+                Option<&'a ChildOf>,
+                &'a LayoutStrip,
+                Option<&'a Position>,
+                bool,
+            ),
+        >,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
         apps: &Query<&Application>,

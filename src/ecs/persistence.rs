@@ -274,7 +274,7 @@ fn save_snapshot(
         return;
     };
     let live_snapshot = PaneruState::extract(
-        &snapshot.workspaces,
+        snapshot.workspaces,
         &snapshot.displays,
         &snapshot.windows,
         &snapshot.apps,

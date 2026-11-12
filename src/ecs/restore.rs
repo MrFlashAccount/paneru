@@ -18,11 +18,13 @@ use crate::ecs::state::{
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, RestoreWindowState,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RefreshWindowSizes, RestoreWindowState,
     RestoredWindowMarker, SpawnCommandsExt, Unmanaged, WindowDisposition, WindowProperties,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
+
+mod catalog_merge;
 
 #[derive(Debug, Resource)]
 pub(crate) struct SessionRestore {
@@ -74,21 +76,7 @@ impl SessionRestore {
     }
 
     pub(crate) fn reconcile_persisted_state(&mut self, live: PaneruState) -> PaneruState {
-        let updates = persisted_window_updates(&self.state, &live);
-        if updates.len() == self.state.windows().count() {
-            self.state = live;
-        } else {
-            // Keep the absent slots/order and full-layout viewport. A compacted
-            // live strip's pan is in a different coordinate system. Per-window
-            // identities and widths must still follow the open windows.
-            for saved in self.state.windows_mut() {
-                if let Some(current) = updates.get(&saved.hard_key()) {
-                    let full_layout_pan = saved.strip_position_x;
-                    saved.clone_from(current);
-                    saved.strip_position_x = full_layout_pan;
-                }
-            }
-        }
+        self.state = catalog_merge::merge(&self.state, live);
         self.saved_hard_keys = saved_hard_match_keys(&self.state);
         self.state.clone()
     }
@@ -677,6 +665,18 @@ pub(crate) fn matches_startup_restore_state(
     saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
 }
 
+type RestoreWorkspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        Option<&'static ChildOf>,
+        Option<&'static Position>,
+        Has<ActiveWorkspaceMarker>,
+    ),
+>;
+
 #[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
@@ -686,30 +686,26 @@ pub(crate) fn matches_startup_restore_state(
 pub(super) fn restore_window_state(
     trigger: On<RestoreWindowState>,
     windows: Windows,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Option<&ChildOf>,
-        Has<ActiveWorkspaceMarker>,
-    )>,
-    displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
+    mut workspaces: RestoreWorkspaces<'_, '_>,
+    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     apps: Query<&Application>,
     config: Res<Config>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
     mut commands: Commands,
 ) {
+    if !config.restore_enabled() {
+        // The durable catalog can outlive a configuration reload. Keep it for
+        // a later re-enable, but never apply it while restoration is disabled.
+        commands.remove_resource::<PaneruState>();
+        return;
+    }
     let restoration = if let Some(session) = session.as_deref() {
         &session.state
     } else {
         let Some(restoration) = restoration.as_deref() else {
             return;
         };
-        if !config.restore_enabled() {
-            info!("Session restore disabled by configuration");
-            commands.remove_resource::<PaneruState>();
-            return;
-        }
         match config.restore_missing_windows() {
             MissingWindowBehavior::Ignore => {}
         }
@@ -722,7 +718,7 @@ pub(super) fn restore_window_state(
     };
 
     let current = current_window_identities(&windows, &apps, restoration, &config);
-    let plan = RestorePlanner::new(restoration).plan(&current);
+    let mut plan = RestorePlanner::new(restoration).plan(&current);
 
     if let Some(added_window_ids) = trigger.event().added_window_ids()
         && !current.iter().any(|window| {
@@ -737,6 +733,31 @@ pub(super) fn restore_window_state(
         return;
     }
 
+    if let Some(added_window_ids) = trigger.event().added_window_ids() {
+        // A late arrival must not roll back edits made since the debounced
+        // save. Merge the current managed layout before rebuilding any strip,
+        // including members that were never in the saved catalog.
+        let mut live = PaneruState::extract(
+            workspaces
+                .iter()
+                .map(|(_, strip, child, position, active)| (child, strip, position, active)),
+            &displays,
+            &windows,
+            &apps,
+            Some(restoration),
+        );
+        // Newly discovered windows still have their application's default
+        // geometry. Their durable slots, not that geometry, own restoration.
+        for incoming in current.iter().filter(|window| {
+            added_window_ids.contains(&window.window_id)
+                && plan.consumed_entities.contains(&window.entity)
+        }) {
+            remove_saved_window(&mut live, &incoming.hard_key());
+        }
+        let merged = catalog_merge::merge(restoration, live);
+        plan = RestorePlanner::new(&merged).plan(&current);
+    }
+
     if plan.consumed_entities.is_empty() {
         info!(
             "Session restore matched 0 windows; missing={}, ambiguous={}",
@@ -748,7 +769,7 @@ pub(super) fn restore_window_state(
     let mut existing_workspace_parents = HashMap::new();
     let mut active_workspace_ids = HashSet::new();
     let mut emptied_existing_strips = HashSet::new();
-    for (entity, mut strip, child, active) in &mut workspaces {
+    for (entity, mut strip, child, _, active) in &mut workspaces {
         if active {
             active_workspace_ids.insert(strip.id());
         }
@@ -814,7 +835,7 @@ pub(super) fn restore_window_state(
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
         if is_active {
-            for (entity, strip, _, _) in &mut workspaces {
+            for (entity, strip, _, _, _) in &mut workspaces {
                 if strip.id() == planned.workspace_id
                     && !emptied_existing_strips.contains(&entity)
                     && is_global_active
@@ -963,10 +984,10 @@ fn select_display<'a>(
     workspace_id: WorkspaceId,
     planned_display_id: Option<CGDirectDisplayID>,
     existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
-    displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
+    displays: &'a Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
 ) -> Option<(Entity, &'a Display)> {
     if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
+        && let Ok((display, entity, _)) = displays.get(*display_entity)
     {
         let current_display_id = display.id();
         if planned_display_id.is_some_and(|display_id| display_id != current_display_id) {
@@ -979,9 +1000,9 @@ fn select_display<'a>(
     }
 
     if let Some(display_id) = planned_display_id {
-        if let Some((entity, display, _)) = displays
+        if let Some((display, entity, _)) = displays
             .iter()
-            .find(|(_, display, _)| display.id() == display_id)
+            .find(|(display, _, _)| display.id() == display_id)
         {
             return Some((entity, display));
         }
@@ -992,7 +1013,7 @@ fn select_display<'a>(
     }
 
     if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
+        && let Ok((display, entity, _)) = displays.get(*display_entity)
     {
         return Some((entity, display));
     }
@@ -1000,8 +1021,8 @@ fn select_display<'a>(
     displays
         .iter()
         .find(|(_, _, active)| *active)
-        .or_else(|| displays.iter().min_by_key(|(_, display, _)| display.id()))
-        .map(|(entity, display, _)| (entity, display))
+        .or_else(|| displays.iter().min_by_key(|(display, _, _)| display.id()))
+        .map(|(display, entity, _)| (entity, display))
 }
 
 fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
@@ -1086,7 +1107,9 @@ mod deadline_tests {
         SessionRestore, WindowHardMatchKey, remove_saved_window, saved_windows_in_state,
         unique_fallback_key,
     };
-    use crate::ecs::state::{PaneruState, SavedColumn, SavedStrip, SavedWindow, SavedWorkspace};
+    use crate::ecs::state::{
+        PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    };
     use crate::platform::ProcessSerialNumber;
 
     fn saved_window(window_id: i32) -> SavedWindow {
@@ -1157,8 +1180,10 @@ mod deadline_tests {
 
         let persisted = restore.reconcile_persisted_state(state(2, vec![saved_window(1)]));
 
-        assert_eq!(saved_windows_in_state(&persisted).count(), 2);
-        assert_eq!(persisted.timestamp, 1);
+        assert_eq!(
+            persisted.windows().cloned().collect::<Vec<_>>(),
+            vec![saved_window(1), saved_window(2)]
+        );
     }
 
     #[test]
@@ -1253,8 +1278,175 @@ mod deadline_tests {
         unknown.pid = 200;
         unknown.title = "Changed title".to_string();
         unknown.width_ratio = Some(1.75);
-        let persisted = restore.reconcile_persisted_state(state(2, vec![unknown]));
-        assert_eq!(persisted, before);
+        let persisted = restore.reconcile_persisted_state(state(2, vec![unknown.clone()]));
+        for original in before.windows() {
+            assert_eq!(
+                persisted
+                    .windows()
+                    .find(|window| window.hard_key() == original.hard_key()),
+                Some(original),
+                "ambiguous live siblings must not replace either saved identity"
+            );
+        }
+        assert_eq!(
+            persisted
+                .windows()
+                .find(|window| window.hard_key() == unknown.hard_key()),
+            Some(&unknown),
+            "a newly managed sibling must also retain its own independent slot"
+        );
+    }
+
+    #[test]
+    fn partial_catalog_preserves_live_order_and_anchors_missing_runs() {
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(0, (1..=6).map(saved_window).collect()));
+        let live = state(0, vec![saved_window(6), saved_window(3), saved_window(7)]);
+        let persisted = restore.reconcile_persisted_state(live);
+        assert_eq!(
+            persisted
+                .windows()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            vec![6, 1, 2, 3, 4, 5, 7]
+        );
+    }
+
+    #[test]
+    fn partial_catalog_does_not_move_live_windows_back_to_old_workspaces() {
+        let mut restore =
+            SessionRestore::from_live_snapshot(state(0, vec![saved_window(1), saved_window(2)]));
+        let mut live = state(0, vec![saved_window(3), saved_window(1)]);
+        live.workspaces[0].workspace_id = 2;
+        live.workspaces[0].active_virtual_index = Some(4);
+        live.workspaces[0].strips[0].virtual_index = 4;
+        let live_workspace = live.workspaces[0].clone();
+        let persisted = restore.reconcile_persisted_state(live);
+        assert_eq!(
+            persisted
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == 2),
+            Some(&live_workspace)
+        );
+        let old = persisted
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == 1)
+            .unwrap();
+        assert_eq!(
+            old.strips[0].columns,
+            vec![SavedColumn::Single(saved_window(2))]
+        );
+        assert_eq!(persisted.windows().count(), 3);
+    }
+
+    #[test]
+    fn partial_catalog_preserves_reordered_tabs_and_new_stack_members() {
+        let mut catalog = state(0, vec![]);
+        catalog.workspaces[0].strips[0].columns = vec![SavedColumn::Stack(vec![
+            SavedStackItem::Tabs(vec![saved_window(1), saved_window(2), saved_window(3)]),
+            SavedStackItem::Single(saved_window(4)),
+        ])];
+        let mut live = state(0, vec![]);
+        live.workspaces[0].strips[0].columns = vec![SavedColumn::Stack(vec![
+            SavedStackItem::Single(saved_window(5)),
+            SavedStackItem::Tabs(vec![saved_window(3), saved_window(1)]),
+        ])];
+        let mut restore = SessionRestore::from_live_snapshot(catalog);
+        let persisted = restore.reconcile_persisted_state(live);
+        assert_eq!(
+            persisted.workspaces[0].strips[0].columns,
+            vec![SavedColumn::Stack(vec![
+                SavedStackItem::Single(saved_window(5)),
+                SavedStackItem::Tabs(vec![saved_window(3), saved_window(1), saved_window(2)]),
+                SavedStackItem::Single(saved_window(4)),
+            ])]
+        );
+    }
+
+    #[test]
+    fn partial_catalog_restores_compacted_groups_without_duplicating_survivors() {
+        for group in [
+            SavedColumn::Tabs(vec![saved_window(1), saved_window(2)]),
+            SavedColumn::Stack(vec![
+                SavedStackItem::Tabs(vec![saved_window(1), saved_window(2)]),
+                SavedStackItem::Single(saved_window(3)),
+            ]),
+        ] {
+            let mut catalog = state(0, vec![]);
+            catalog.workspaces[0].strips[0].columns = vec![group.clone()];
+            let live = state(0, vec![saved_window(1), saved_window(4)]);
+            let mut restore = SessionRestore::from_live_snapshot(catalog);
+            let persisted = restore.reconcile_persisted_state(live);
+            assert_eq!(
+                persisted.workspaces[0].strips[0].columns,
+                vec![group, SavedColumn::Single(saved_window(4))]
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_restore_rejects_direct_events_even_with_a_retained_catalog() {
+        use crate::config::Config;
+        use crate::ecs::{
+            DefaultWindowDisposition, RestoreWindowState, WidthRatio, WindowDisposition,
+        };
+        use crate::tests::{TEST_PROCESS_ID, TEST_WINDOW_WIDTH, TestHarness, find_window_entity};
+
+        let mut harness = TestHarness::new();
+        harness
+            .world()
+            .insert_resource(DefaultWindowDisposition(WindowDisposition::Passthrough));
+        let mut harness = harness.with_windows(1);
+        for _ in 0..5 {
+            harness.app.update();
+        }
+        let mut saved = saved_window(0);
+        saved.pid = TEST_PROCESS_ID;
+        saved.bundle_id = "test".to_string();
+        saved.width_ratio = Some(1.5);
+        harness
+            .world()
+            .insert_resource(SessionRestore::from_live_snapshot(state(0, vec![saved])));
+        let enabled = harness.world().resource::<Config>().clone();
+        harness.world().insert_resource(
+            Config::try_from("[options]\n[restore]\nenabled = false\n[bindings]\n").unwrap(),
+        );
+
+        for event in [
+            RestoreWindowState::startup(),
+            RestoreWindowState::for_added_windows(vec![0]),
+        ] {
+            harness.world().trigger(event);
+            harness.app.update();
+            let world = harness.world();
+            let entity = find_window_entity(0, world);
+            assert_eq!(
+                world.get::<WindowDisposition>(entity),
+                Some(&WindowDisposition::Passthrough)
+            );
+            assert_eq!(
+                world
+                    .get::<crate::manager::Window>(entity)
+                    .unwrap()
+                    .frame()
+                    .width(),
+                TEST_WINDOW_WIDTH
+            );
+        }
+        harness.world().insert_resource(enabled);
+        harness
+            .world()
+            .trigger(RestoreWindowState::for_added_windows(vec![0]));
+        harness.app.update();
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        assert_eq!(
+            world.get::<WindowDisposition>(entity),
+            Some(&WindowDisposition::Managed)
+        );
+        assert_eq!(world.get::<WidthRatio>(entity).unwrap().0, 1.5);
     }
 
     #[test]

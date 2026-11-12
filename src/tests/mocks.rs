@@ -459,7 +459,7 @@ impl MockState {
     ) -> crate::errors::Result<String> {
         let inner = self.inner.force_read();
         let Some(window) = inner.windows.get(&id) else {
-            return Ok(String::new());
+            return Err(Error::InvalidWindow);
         };
         if window.identity_failure == Some(attribute) {
             return Err(Error::InvalidWindow);

@@ -948,7 +948,11 @@ pub(super) fn spawn_window_trigger(
         spawned_window_ids.push(window_id);
     }
 
-    if initializing.is_none() && restore.is_some() && !spawned_window_ids.is_empty() {
+    if initializing.is_none()
+        && config.restore_enabled()
+        && restore.is_some()
+        && !spawned_window_ids.is_empty()
+    {
         commands.trigger(RestoreWindowState::for_added_windows(spawned_window_ids));
     }
 }

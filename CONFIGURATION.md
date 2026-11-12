@@ -270,7 +270,9 @@ State writes are event-driven: each persisted layout/display/selection change
 resets a 250 ms trailing debounce, so continuous scrolling does not write every
 frame. Pending dirty state is flushed on shutdown; failed writes remain dirty
 and retry with bounded backoff. With `enabled = false`, Paneru does not read or
-write the state file.
+write the state file or restore arriving windows, even if a catalog was loaded
+before the setting changed. Re-enabling restore allows later arrivals to use
+that retained catalog again.
 
 The saved session includes:
 
@@ -342,8 +344,12 @@ If a saved app or window is missing, the default `"ignore"` policy omits it from
 the current live layout without deleting its durable slot. Empty stacks, tab
 groups, columns, and virtual rows are compacted in memory. If the previously
 selected virtual row has no live windows, Paneru selects the nearest remaining
-restored row for that native workspace. When the missing window returns, the
-catalog reconstructs its saved structure.
+restored row for that native workspace. Live changes continue to be saved while
+other windows are missing: new managed windows, resized widths, reordering, and
+workspace moves are not frozen by a closed application. Missing slots are kept
+in their saved row, next to surviving saved neighbors. When a window returns,
+restore also incorporates live edits that have not reached the debounced save
+yet, without splitting new live neighbors into another row.
 
 For screens, Paneru prefers the current macOS workspace-to-display mapping when
 the workspace is already present on a display. Otherwise it restores to the

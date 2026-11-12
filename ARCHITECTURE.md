@@ -124,11 +124,23 @@ sibling is not an opt-out of the saved window. An explicit command may use a
 unique fallback before the next save updates a relaunched window's native ID,
 but cannot forget a slot still owned by another live native window.
 Snapshot extraction retains last-known AX identity fields on failed reads for
-the exact same native window. A partial catalog updates matched windows' widths
-and identities without replacing missing slots or copying a compacted strip's
-pan into the full-layout coordinate system. A complete live layout replaces the
+the exact same native window. Catalog reconciliation starts from the live
+snapshot: new managed windows, current widths, live order, grouping, and workspace
+placement remain authoritative. Only absent saved slots are merged back into
+their original workspace and row, next to the nearest surviving saved neighbor.
+Compacted stacks and tab groups retain their missing members without duplicating
+live ones. Rows with missing slots keep their saved full-layout pan rather than
+copying the compacted live coordinate. A complete live layout replaces the
 catalog once every saved slot is present; ambiguous sibling matches are never
 used to overwrite a missing window.
+
+Late-arrival restore uses the same reconciliation against a fresh live snapshot,
+not just the last debounced save. This keeps new live members in their current
+strip and prevents a returning application from rolling back unsaved reordering
+or resizing. The arriving matched window still uses its saved width, not its
+application's initial width. Both the arrival trigger and the restore observer
+check the current `restore.enabled` setting, including after configuration
+reload; disabling restore retains the catalog but never applies it.
 
 Restore rebuilds `LayoutStrip`s, virtual workspace rows, selected virtual
 workspace markers, display associations, saved oversized `WidthRatio`s, and
