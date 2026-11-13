@@ -1,4 +1,5 @@
 mod display;
+mod durable_restore;
 mod focus_layer;
 mod focus_tier;
 mod harness;

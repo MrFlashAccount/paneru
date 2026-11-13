@@ -28,6 +28,14 @@ pub(crate) struct MockAppData {
 }
 
 /// Data for a mocked window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MockIdentityAttribute {
+    Title,
+    Identifier,
+    Role,
+    Subrole,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
@@ -45,6 +53,7 @@ pub(crate) struct MockWindowData {
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
+    pub(crate) identity_failure: Option<MockIdentityAttribute>,
 }
 
 impl Default for MockWindowData {
@@ -65,6 +74,7 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
+            identity_failure: None,
         }
     }
 }
@@ -132,6 +142,14 @@ impl MockState {
     }
 
     // --- OS Behavior Methods ---
+
+    pub(crate) fn os_close_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        inner.windows.remove(&id);
+        inner
+            .event_queue
+            .push_back(Event::WindowDestroyed { window_id: id });
+    }
 
     pub fn spawn_app(&self, pid: Pid, bundle_id: &str, name: &str) {
         let mut inner = self.inner.force_write();
@@ -434,6 +452,27 @@ impl MockState {
 
     // --- Mock Factory Methods ---
 
+    fn identity_attribute(
+        &self,
+        id: WinID,
+        attribute: MockIdentityAttribute,
+    ) -> crate::errors::Result<String> {
+        let inner = self.inner.force_read();
+        let Some(window) = inner.windows.get(&id) else {
+            return Err(Error::InvalidWindow);
+        };
+        if window.identity_failure == Some(attribute) {
+            return Err(Error::InvalidWindow);
+        }
+        Ok(match attribute {
+            MockIdentityAttribute::Title => &window.title,
+            MockIdentityAttribute::Identifier => &window.identifier,
+            MockIdentityAttribute::Role => &window.role,
+            MockIdentityAttribute::Subrole => &window.subrole,
+        }
+        .clone())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn create_window(&self, id: WinID) -> Window {
         let mut mw = MockWindowApi::new();
@@ -484,14 +523,8 @@ impl MockState {
             s.focus_window(id);
         });
         let s = self.clone();
-        mw.expect_title().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.title.clone())
-                .unwrap_or_default())
-        });
+        mw.expect_title()
+            .returning(move || s.identity_attribute(id, MockIdentityAttribute::Title));
 
         let s = self.clone();
         mw.expect_is_minimized().returning(move || {
@@ -513,34 +546,16 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_identifier().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.identifier.clone())
-                .unwrap_or_default())
-        });
+        mw.expect_identifier()
+            .returning(move || s.identity_attribute(id, MockIdentityAttribute::Identifier));
 
         let s = self.clone();
-        mw.expect_role().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.role.clone())
-                .unwrap_or_default())
-        });
+        mw.expect_role()
+            .returning(move || s.identity_attribute(id, MockIdentityAttribute::Role));
 
         let s = self.clone();
-        mw.expect_subrole().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.subrole.clone())
-                .unwrap_or_default())
-        });
+        mw.expect_subrole()
+            .returning(move || s.identity_attribute(id, MockIdentityAttribute::Subrole));
 
         let s = self.clone();
         mw.expect_child_role().returning(move || {

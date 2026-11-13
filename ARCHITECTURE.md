@@ -75,7 +75,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`Config`:** The current user configuration.
 - **`PaneruState`**: The durable snapshot of managed layout, display, native workspace, and virtual workspace state used for recovery after restarts.
-- **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.
+- **`SessionRestore`**: A durable restore catalog; the startup grace deadline ends initial discovery, not the catalog's lifetime.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
 
@@ -91,7 +91,7 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
   restore, cleanup, and floating-layer operations must not mutate passthrough
   windows. Focus remains tracked so recovery does not steal focus.
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
-- **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
+- **Durable Restore Catalog:** The startup grace period bounds only initial discovery. `SessionRestore` remains active afterward so relaunched applications can reclaim saved logical slots. Explicit unmanage removes a slot; temporary window absence does not.
 - **Reactive Power Saving:** With no pending work, runtime waits indefinitely on a latched native source. Animation uses frame cadence; lifecycle polling, workspace refresh/recovery, persistence, restore, verification, retry, timeout, and updater jobs contribute monotonic nearest deadlines only while needed.
 
 ## 6. Session Restore
@@ -103,19 +103,44 @@ only after startup configuration confirms restore is enabled. Persisted-domain
 changes reset a 250 ms trailing debounce; failed writes remain dirty and retry
 with bounded backoff. Disabling restore performs no state-file read or write.
 
-`src/ecs/restore.rs` owns startup restore. It keeps the loaded `PaneruState`
-alive in `SessionRestore` for the configured grace period so applications have
-time to reopen their windows. As windows arrive, `restore_window_state` builds a
-restore plan from the saved state and the currently managed ECS windows.
-Passthrough and floating dispositions are excluded before matching, so stale
-session state cannot silently opt a window back into management.
+`src/ecs/restore.rs` owns persistent layout reconciliation. It keeps the loaded
+`PaneruState` alive in `SessionRestore`; the configured grace period marks the
+end of initial discovery, not the end of matching. As windows arrive,
+`restore_window_state` builds a restore plan from the saved state and the
+currently discovered ECS windows. Explicit passthrough/floating configuration
+is excluded before matching; a saved opt-in window can override the default
+passthrough disposition when it returns.
 
 Window matching prefers stable identity (`window_id`, `pid`, and `bundle_id`)
-and uses the conservative fallback identity only when it can do so
-unambiguously. The fallback includes `bundle_id`, window title when available,
-window identifier, role, and subrole. Saved windows that are missing at startup
-are ignored by default, and the restored layout is compacted around the matched
-windows.
+and uses fallback identity only when it can do so unambiguously. Exact fallback
+includes `bundle_id`, title, window identifier, role, and subrole. A unique
+candidate may still match when a dynamic title changed. Saved windows that are
+currently absent are omitted from the live layout but retained in the durable
+catalog; persistence therefore cannot erase a slot merely because its
+application is closed.
+Only the explicit Toggle Managed off command forgets a saved slot. Generic
+`Unmanaged` lifecycle observers never delete catalog entries: a new passthrough
+sibling is not an opt-out of the saved window. An explicit command may use a
+unique fallback before the next save updates a relaunched window's native ID,
+but cannot forget a slot still owned by another live native window.
+Snapshot extraction retains last-known AX identity fields on failed reads for
+the exact same native window. Catalog reconciliation starts from the live
+snapshot: new managed windows, current widths, live order, grouping, and workspace
+placement remain authoritative. Only absent saved slots are merged back into
+their original workspace and row, next to the nearest surviving saved neighbor.
+Compacted stacks and tab groups retain their missing members without duplicating
+live ones. Rows with missing slots keep their saved full-layout pan rather than
+copying the compacted live coordinate. A complete live layout replaces the
+catalog once every saved slot is present; ambiguous sibling matches are never
+used to overwrite a missing window.
+
+Late-arrival restore uses the same reconciliation against a fresh live snapshot,
+not just the last debounced save. This keeps new live members in their current
+strip and prevents a returning application from rolling back unsaved reordering
+or resizing. The arriving matched window still uses its saved width, not its
+application's initial width. Both the arrival trigger and the restore observer
+check the current `restore.enabled` setting, including after configuration
+reload; disabling restore retains the catalog but never applies it.
 
 Restore rebuilds `LayoutStrip`s, virtual workspace rows, selected virtual
 workspace markers, display associations, saved oversized `WidthRatio`s, and

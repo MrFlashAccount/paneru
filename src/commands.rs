@@ -7,7 +7,7 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, NonSend, Query, Res, Single};
+use bevy::ecs::system::{Commands, NonSend, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
 use tracing::{debug, info};
@@ -924,6 +924,8 @@ fn manage_window(
         &mut WindowDisposition,
         Option<&PreManagedFrame>,
     )>,
+    apps: Query<&Application>,
+    mut restore: Option<ResMut<crate::ecs::restore::SessionRestore>>,
     mut commands: Commands,
 ) {
     let Some(target_window_id) =
@@ -935,6 +937,27 @@ fn manage_window(
     else {
         return;
     };
+
+    // Only an explicit Managed -> Passthrough command forgets a saved slot.
+    // Adding Unmanaged also happens for ordinary new windows and lifecycle
+    // events, and must never be interpreted as this user intent.
+    if let Some((_, window, _, _, WindowDisposition::Managed, _)) = windows
+        .iter()
+        .find(|(_, window, ..)| window.id() == target_window_id)
+        && let Ok(pid) = window.pid()
+        && let Some(app) = apps.iter().find(|app| app.pid() == pid)
+        && let Some(restore) = restore.as_deref_mut()
+    {
+        let live_windows = windows
+            .iter()
+            .filter_map(|(_, window, ..)| window.pid().ok().map(|pid| (window.id(), pid)));
+        if restore.forget_window(window, app, live_windows) {
+            info!(
+                window_id = target_window_id,
+                "Removed saved window after explicit Toggle Managed off"
+            );
+        }
+    }
 
     let Some((entity, mut window, mut position, mut bounds, mut disposition, previous_frame)) =
         windows

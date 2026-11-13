@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use super::layout::LayoutStrip;
 use super::params::Windows;
+use super::restore::SessionRestore;
 use super::state::PaneruState;
 use super::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, Unmanaged, WidthRatio};
 use crate::config::Config;
@@ -189,14 +190,23 @@ pub(crate) fn flush_due_state(
     _main_thread: NonSend<AxMainThread>,
     config: Res<Config>,
     store: Option<Res<PersistenceStore>>,
-    mut state: ResMut<PersistenceState>,
-    snapshot: PersistenceSnapshot,
+    mut flush: PersistenceFlush,
 ) {
     let now = Instant::now();
-    if !config.restore_enabled() || !state.due(now) {
+    if !config.restore_enabled() || !flush.state.due(now) {
         return;
     }
-    save_snapshot(store.as_deref(), &snapshot, &mut state, now);
+    if flush.pending_restore.is_some() && flush.restore.is_none() {
+        return;
+    }
+    save_snapshot(
+        store.as_deref(),
+        &flush.snapshot,
+        flush.restore.as_deref_mut(),
+        &mut flush.commands,
+        &mut flush.state,
+        now,
+    );
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
@@ -205,13 +215,31 @@ pub(crate) fn flush_on_exit(
     mut exits: MessageReader<AppExit>,
     config: Res<Config>,
     store: Option<Res<PersistenceStore>>,
-    mut state: ResMut<PersistenceState>,
-    snapshot: PersistenceSnapshot,
+    mut flush: PersistenceFlush,
 ) {
-    if exits.read().next().is_none() || !config.restore_enabled() || !state.is_dirty() {
+    if exits.read().next().is_none() || !config.restore_enabled() || !flush.state.is_dirty() {
         return;
     }
-    save_snapshot(store.as_deref(), &snapshot, &mut state, Instant::now());
+    if flush.pending_restore.is_some() && flush.restore.is_none() {
+        return;
+    }
+    save_snapshot(
+        store.as_deref(),
+        &flush.snapshot,
+        flush.restore.as_deref_mut(),
+        &mut flush.commands,
+        &mut flush.state,
+        Instant::now(),
+    );
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PersistenceFlush<'w, 's> {
+    state: ResMut<'w, PersistenceState>,
+    snapshot: PersistenceSnapshot<'w, 's>,
+    pending_restore: Option<Res<'w, PaneruState>>,
+    restore: Option<ResMut<'w, SessionRestore>>,
+    commands: Commands<'w, 's>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -235,6 +263,8 @@ pub(crate) struct PersistenceSnapshot<'w, 's> {
 fn save_snapshot(
     store: Option<&PersistenceStore>,
     snapshot: &PersistenceSnapshot,
+    restore: Option<&mut SessionRestore>,
+    commands: &mut Commands,
     state: &mut PersistenceState,
     now: Instant,
 ) {
@@ -243,14 +273,22 @@ fn save_snapshot(
         warn!("persistence store missing; retry scheduled");
         return;
     };
-    let snapshot = PaneruState::extract(
-        &snapshot.workspaces,
+    let live_snapshot = PaneruState::extract(
+        snapshot.workspaces,
         &snapshot.displays,
         &snapshot.windows,
         &snapshot.apps,
+        restore.as_deref().map(SessionRestore::catalog),
     );
+    let create_catalog = restore.is_none();
+    let snapshot = restore.map_or(live_snapshot.clone(), |restore| {
+        restore.reconcile_persisted_state(live_snapshot)
+    });
     match store.0.save(&snapshot) {
         Ok(()) => {
+            if create_catalog {
+                commands.insert_resource(SessionRestore::from_live_snapshot(snapshot));
+            }
             state.saved();
             debug!("saved dirty state");
         }
@@ -420,6 +458,28 @@ mod tests {
         app.update();
         assert_eq!(store.saves.load(Ordering::Relaxed), 1);
         assert!(!app.world().resource::<PersistenceState>().is_dirty());
+    }
+
+    #[test]
+    fn first_successful_save_seeds_durable_restore_catalog() {
+        let store = Arc::new(TestStore::default());
+        let mut app = persistence_app(Config::default(), Arc::clone(&store));
+        app.update();
+        make_due(&mut app);
+
+        app.update();
+
+        assert_eq!(store.saves.load(Ordering::Relaxed), 1);
+        assert!(
+            app.world()
+                .contains_resource::<crate::ecs::restore::SessionRestore>()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<crate::ecs::restore::SessionRestore>()
+                .next_deadline(),
+            None
+        );
     }
 
     #[test]

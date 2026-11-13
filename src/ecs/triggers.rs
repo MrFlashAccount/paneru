@@ -886,6 +886,7 @@ pub(super) fn spawn_window_trigger(
     mut commands: Commands,
 ) {
     let new_windows = &mut trigger.event_mut().0;
+    let mut spawned_window_ids = Vec::new();
 
     while let Some(mut window) = new_windows.pop() {
         let window_id = window.id();
@@ -944,10 +945,15 @@ pub(super) fn spawn_window_trigger(
             disposition,
             ChildOf(app_entity),
         ));
+        spawned_window_ids.push(window_id);
     }
 
-    if initializing.is_none() && restore.is_some() {
-        commands.trigger(RestoreWindowState);
+    if initializing.is_none()
+        && config.restore_enabled()
+        && restore.is_some()
+        && !spawned_window_ids.is_empty()
+    {
+        commands.trigger(RestoreWindowState::for_added_windows(spawned_window_ids));
     }
 }
 

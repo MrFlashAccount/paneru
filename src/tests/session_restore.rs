@@ -456,7 +456,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
 }
 
 #[test]
-fn test_restore_resource_is_removed_after_grace_period() {
+fn test_restore_catalog_remains_after_startup_grace_period() {
     let mut harness = TestHarness::new().with_windows(1);
     harness
         .app
@@ -485,7 +485,7 @@ fn test_restore_resource_is_removed_after_grace_period() {
     harness.app.update();
 
     assert!(
-        !harness
+        harness
             .app
             .world()
             .contains_resource::<crate::ecs::restore::SessionRestore>()
@@ -783,6 +783,509 @@ fn test_late_startup_window_restores_during_grace_period() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn test_relaunched_window_restores_after_startup_grace_period() {
+    let mut harness = TestHarness::new();
+    let mut saved = saved_window(99);
+    saved.title = "Saved title".to_string();
+    saved.identifier = "testid".to_string();
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 1,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<crate::ecs::restore::SessionRestore>()
+        .expire_now();
+    harness.app.update();
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .mock_state
+        .update_window(0, |window| window.title = "Changed title".to_string());
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![window]));
+    harness.app.update();
+
+    let world = harness.world();
+    let restored_window = find_window_entity(0, world);
+    let mut query = world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
+    assert!(query.iter(world).any(|(strip, active)| {
+        strip.id() == TEST_WORKSPACE_ID
+            && strip.virtual_index == 1
+            && active
+            && strip.contains(restored_window)
+    }));
+}
+
+#[test]
+fn test_relaunched_window_returns_to_saved_order_after_startup_grace_period() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 1,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(99)),
+            ],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<crate::ecs::restore::SessionRestore>()
+        .expire_now();
+    harness.app.update();
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![window]));
+    harness.app.update();
+
+    let world = harness.world();
+    let first = find_window_entity(0, world);
+    let relaunched = find_window_entity(99, world);
+    let mut query = world.query::<&LayoutStrip>();
+    let restored = query
+        .iter(world)
+        .find(|strip| strip.virtual_index == 1 && strip.contains(relaunched))
+        .expect("relaunched window should return to its saved strip");
+    assert_eq!(restored.all_windows(), vec![first, relaunched]);
+}
+
+#[test]
+fn test_unrelated_new_window_does_not_rebuild_restored_strip() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .world_mut()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        }]));
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let managed = find_window_entity(0, harness.world());
+    let restored_strip = harness
+        .world()
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(harness.world())
+        .find(|(_, strip)| strip.contains(managed))
+        .map(|(entity, _)| entity)
+        .expect("restored strip should exist");
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let unrelated = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness
+        .app
+        .world_mut()
+        .trigger(SpawnWindowTrigger(vec![unrelated]));
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    assert!(harness.world().entities().contains(restored_strip));
+    assert!(
+        harness
+            .world()
+            .get::<LayoutStrip>(restored_strip)
+            .is_some_and(|strip| strip.contains(managed))
+    );
+}
+
+#[test]
+fn reopened_window_restores_managed_mode_and_width_after_shutdown_ax_failure() {
+    use crate::ecs::DefaultWindowDisposition;
+    use crate::ecs::restore::SessionRestore;
+    use crate::tests::{MockIdentityAttribute, state::extract_state};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    for _ in 0..10 {
+        harness.app.update();
+    }
+    let entity = find_window_entity(0, harness.world());
+    harness.world().get_mut::<WidthRatio>(entity).unwrap().0 = 1.5;
+    let before = extract_state(&mut harness, None);
+    harness.mock_state.update_window(0, |window| {
+        window.identity_failure = Some(MockIdentityAttribute::Role);
+    });
+    let shutdown_snapshot = extract_state(&mut harness, Some(&before));
+    let mut catalog = SessionRestore::from_live_snapshot(before);
+    catalog.reconcile_persisted_state(shutdown_snapshot);
+    harness.world().insert_resource(catalog);
+    harness
+        .world()
+        .insert_resource(DefaultWindowDisposition(WindowDisposition::Passthrough));
+
+    harness.mock_state.os_close_window(0);
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::new(
+            0,
+            TEST_MENUBAR_HEIGHT,
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT,
+        ),
+    );
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    for _ in 0..20 {
+        harness.app.update();
+        for event in harness.mock_state.drain_events() {
+            harness.world().write_message(event);
+        }
+    }
+    let world = harness.world();
+    let restored = find_window_entity(99, world);
+    assert_eq!(
+        world.get::<WindowDisposition>(restored),
+        Some(&WindowDisposition::Managed)
+    );
+    assert!(world.get::<Unmanaged>(restored).is_none());
+    assert_eq!(
+        world
+            .get::<crate::manager::Window>(restored)
+            .unwrap()
+            .frame()
+            .width(),
+        TEST_DISPLAY_WIDTH * 3 / 2
+    );
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.contains(restored))
+    );
+}
+
+#[test]
+fn reopened_untitled_window_restores_by_unique_non_title_identity() {
+    let mut saved = saved_window(99);
+    saved.title.clear();
+    saved.identifier = "testid".to_string();
+    saved.width_ratio = Some(1.5);
+    let mut harness = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_state(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        100,
+        IRect::new(
+            0,
+            TEST_MENUBAR_HEIGHT,
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT,
+        ),
+    );
+    harness
+        .mock_state
+        .update_window(100, |window| window.title.clear());
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    for _ in 0..20 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    let restored = find_window_entity(100, world);
+    assert_eq!(
+        world.get::<WindowDisposition>(restored),
+        Some(&WindowDisposition::Managed)
+    );
+    assert!(world.get::<Unmanaged>(restored).is_none());
+    assert_eq!(
+        world
+            .get::<crate::manager::Window>(restored)
+            .unwrap()
+            .frame()
+            .width(),
+        TEST_DISPLAY_WIDTH * 3 / 2
+    );
+}
+
+#[test]
+fn default_passthrough_sibling_does_not_erase_saved_managed_window() {
+    use crate::ecs::restore::SessionRestore;
+
+    let mut harness = saved_main_with_passthrough_sibling();
+    let world = harness.world();
+    let managed = find_window_entity(0, world);
+    let sibling = find_window_entity(99, world);
+    assert_eq!(
+        world.get::<Unmanaged>(sibling),
+        Some(&Unmanaged::Passthrough)
+    );
+    assert!(world.get::<Unmanaged>(managed).is_none());
+    let catalog = world.resource::<SessionRestore>().catalog();
+    assert_eq!(
+        catalog.windows().count(),
+        1,
+        "default passthrough is not an explicit opt-out of a different managed window"
+    );
+    assert_eq!(catalog.windows().next().unwrap().window_id, 0);
+}
+
+#[test]
+fn toggling_new_sibling_off_cannot_forget_live_saved_owner() {
+    use crate::commands::Operation;
+    use crate::ecs::restore::SessionRestore;
+
+    let mut harness = saved_main_with_passthrough_sibling();
+    // No persistence flush in between: the newly opted-in sibling does not
+    // have its own saved slot yet and shares the main window's AX identity.
+    for _ in 0..2 {
+        harness.world().write_message(Event::Command {
+            command: Command::Window(Operation::Manage(Some(99))),
+        });
+        harness.app.update();
+    }
+    let world = harness.world();
+    let sibling = find_window_entity(99, world);
+    assert_eq!(
+        world.get::<Unmanaged>(sibling),
+        Some(&Unmanaged::Passthrough)
+    );
+    let saved = world.resource::<SessionRestore>().catalog();
+    assert_eq!(saved.windows().count(), 1);
+    assert_eq!(saved.windows().next().unwrap().window_id, 0);
+}
+
+#[test]
+fn explicit_toggle_off_removes_only_target_and_survives_restart() {
+    use crate::commands::Operation;
+    use crate::ecs::restore::SessionRestore;
+
+    let mut harness = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_windows(2)
+        .with_state(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(1)),
+            ],
+        }]));
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Manage(Some(0))),
+    });
+    harness.app.update();
+    let persisted = harness
+        .world()
+        .resource::<SessionRestore>()
+        .catalog()
+        .clone();
+    assert_eq!(persisted.windows().count(), 1);
+    assert_eq!(persisted.windows().next().unwrap().window_id, 1);
+
+    let mut restarted = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_windows(2)
+        .with_state(persisted);
+    for _ in 0..5 {
+        restarted.app.update();
+    }
+    let world = restarted.world();
+    let opted_out = find_window_entity(0, world);
+    let retained = find_window_entity(1, world);
+    assert_eq!(
+        world.get::<Unmanaged>(opted_out),
+        Some(&Unmanaged::Passthrough)
+    );
+    assert!(world.get::<Unmanaged>(retained).is_none());
+}
+
+#[test]
+fn relaunch_after_passthrough_sibling_preserves_width_and_explicit_opt_out() {
+    use std::time::Duration;
+
+    use bevy::time::TimeUpdateStrategy;
+
+    use crate::commands::Operation;
+    use crate::ecs::restore::SessionRestore;
+    use crate::tests::state::extract_state;
+
+    let mut harness = saved_main_with_passthrough_sibling();
+    for id in [99, 0] {
+        harness.mock_state.os_close_window(id);
+    }
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message(event);
+    }
+    harness
+        .world()
+        .resource_mut::<SessionRestore>()
+        .expire_now();
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(180)));
+    harness.app.update();
+    harness
+        .world()
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            100,
+        )));
+    let before = harness
+        .world()
+        .resource::<SessionRestore>()
+        .catalog()
+        .clone();
+    let empty_snapshot = extract_state(&mut harness, Some(&before));
+    let persisted = harness
+        .world()
+        .resource_mut::<SessionRestore>()
+        .reconcile_persisted_state(empty_snapshot);
+    assert_eq!(persisted.windows().next().unwrap().width_ratio, Some(1.5));
+
+    let new_pid = TEST_PROCESS_ID + 1;
+    harness = harness.with_app(new_pid, "test", "Relaunched app", |_| {});
+    let window = harness.mock_state.spawn_window(
+        new_pid,
+        TEST_WORKSPACE_ID,
+        100,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness.mock_state.update_window(100, |window| {
+        window.identifier.clear();
+        window.title = "Changed main title".to_string();
+    });
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+    for _ in 0..20 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    let restored = find_window_entity(100, world);
+    assert_eq!(
+        world.get::<WindowDisposition>(restored),
+        Some(&WindowDisposition::Managed)
+    );
+    assert!(world.get::<Unmanaged>(restored).is_none());
+    assert_eq!(
+        world
+            .get::<crate::manager::Window>(restored)
+            .unwrap()
+            .frame()
+            .width(),
+        TEST_DISPLAY_WIDTH * 3 / 2
+    );
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.contains(restored))
+    );
+
+    // Explicit opt-out must still work before a save refreshes the old PID/ID.
+    world.write_message(Event::Command {
+        command: Command::Window(Operation::Manage(Some(100))),
+    });
+    harness.app.update();
+    assert_eq!(
+        harness
+            .world()
+            .resource::<SessionRestore>()
+            .catalog()
+            .windows()
+            .count(),
+        0
+    );
+}
+
+fn saved_main_with_passthrough_sibling() -> TestHarness {
+    let mut saved = saved_window(0);
+    saved.width_ratio = Some(1.5);
+    let mut harness = TestHarness::new()
+        .with_default_window_disposition(WindowDisposition::Passthrough)
+        .with_window(0, |window| window.identifier.clear())
+        .with_state(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }]));
+    for _ in 0..5 {
+        harness.app.update();
+    }
+    let managed = find_window_entity(0, harness.world());
+    assert!(harness.world().get::<Unmanaged>(managed).is_none());
+
+    let sibling = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        99,
+        IRect::new(
+            0,
+            TEST_MENUBAR_HEIGHT,
+            TEST_WINDOW_WIDTH,
+            TEST_WINDOW_HEIGHT,
+        ),
+    );
+    harness.mock_state.update_window(99, |window| {
+        window.identifier.clear();
+        window.title = "Auxiliary window".to_string();
+    });
+    harness.world().trigger(SpawnWindowTrigger(vec![sibling]));
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    harness
 }
 
 #[test]

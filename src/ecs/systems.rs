@@ -242,7 +242,7 @@ pub(crate) fn finish_setup(
     }
 
     commands.remove_resource::<Initializing>();
-    commands.trigger(RestoreWindowState);
+    commands.trigger(RestoreWindowState::startup());
 }
 
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,

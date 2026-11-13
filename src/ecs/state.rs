@@ -17,7 +17,7 @@ use tracing::error;
 
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Position, Unmanaged};
+use crate::ecs::{ActiveDisplayMarker, Position, Unmanaged};
 use crate::manager::Application;
 use crate::manager::Display;
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
@@ -79,6 +79,30 @@ pub enum SavedStackItem {
     Tabs(Vec<SavedWindow>),
 }
 
+impl SavedColumn {
+    pub(crate) fn windows(&self) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
+        match self {
+            Self::Single(window) | Self::Fullscreen(window) => Box::new(std::iter::once(window)),
+            Self::Tabs(windows) => Box::new(windows.iter()),
+            Self::Stack(items) => Box::new(items.iter().flat_map(|item| match item {
+                SavedStackItem::Single(window) => std::slice::from_ref(window).iter(),
+                SavedStackItem::Tabs(windows) => windows.iter(),
+            })),
+        }
+    }
+
+    pub(crate) fn windows_mut(&mut self) -> Box<dyn Iterator<Item = &mut SavedWindow> + '_> {
+        match self {
+            Self::Single(window) | Self::Fullscreen(window) => Box::new(std::iter::once(window)),
+            Self::Tabs(windows) => Box::new(windows.iter_mut()),
+            Self::Stack(items) => Box::new(items.iter_mut().flat_map(|item| match item {
+                SavedStackItem::Single(window) => std::slice::from_mut(window).iter_mut(),
+                SavedStackItem::Tabs(windows) => windows.iter_mut(),
+            })),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SavedWindow {
     // Primary matching (stable across WM restarts)
@@ -114,12 +138,20 @@ impl From<IRect> for SavedRect {
     }
 }
 
+fn usable_window_role(role: &str) -> bool {
+    // A locked session can return an application proxy in AXWindows. It is
+    // not an identity update for the native window we are persisting. Keep
+    // custom/forced window roles supported; reject only missing/app identity.
+    !role.is_empty() && role != accessibility_sys::kAXApplicationRole
+}
+
 impl SavedWindow {
     pub fn from_entity(
         entity: Entity,
         windows: &Windows,
         apps: &Query<&Application>,
         strip_position_x: Option<i32>,
+        previous: Option<&PaneruState>,
     ) -> Option<Self> {
         let (window, _, unmanaged) = windows.get_managed(entity)?;
         if matches!(unmanaged, Some(Unmanaged::Passthrough)) {
@@ -128,15 +160,57 @@ impl SavedWindow {
         let (_, _, app_entity) = windows.find_parent(window.id())?;
         let app = apps.get(app_entity).ok()?;
 
+        let pid = window.pid().ok()?;
+        let bundle_id = app.bundle_id().unwrap_or_default().clone();
+        let previous = previous.and_then(|state| {
+            state
+                .windows()
+                .find(|saved| saved.hard_match(window.id(), pid, &bundle_id))
+        });
+        // An app can stop answering AX queries before its destroy/terminate
+        // event reaches us. A failed read is not an empty identity. Preserve
+        // the last valid identity for this exact native window, while still
+        // capturing its latest logical width and viewport position.
+        let (title, identifier, role, subrole) = if let Ok(role) = window.role()
+            && usable_window_role(&role)
+        {
+            (
+                window.title().unwrap_or_else(|_| {
+                    previous
+                        .map(|saved| saved.title.clone())
+                        .unwrap_or_default()
+                }),
+                window.identifier().unwrap_or_else(|_| {
+                    previous
+                        .map(|saved| saved.identifier.clone())
+                        .unwrap_or_default()
+                }),
+                role,
+                window.subrole().unwrap_or_else(|_| {
+                    previous
+                        .map(|saved| saved.subrole.clone())
+                        .unwrap_or_default()
+                }),
+            )
+        } else {
+            let previous = previous.filter(|saved| usable_window_role(&saved.role))?;
+            (
+                previous.title.clone(),
+                previous.identifier.clone(),
+                previous.role.clone(),
+                previous.subrole.clone(),
+            )
+        };
+
         Some(Self {
             window_id: window.id(),
-            pid: window.pid().ok()?,
+            pid,
             psn: app.psn(),
-            bundle_id: app.bundle_id().unwrap_or_default().clone(),
-            title: window.title().unwrap_or_default(),
-            identifier: window.identifier().unwrap_or_default(),
-            role: window.role().unwrap_or_default(),
-            subrole: window.subrole().unwrap_or_default(),
+            bundle_id,
+            title,
+            identifier,
+            role,
+            subrole,
             width_ratio: windows.width_ratio(entity),
             strip_position_x,
         })
@@ -149,17 +223,37 @@ impl SavedWindow {
 }
 
 impl PaneruState {
+    pub(crate) fn windows(&self) -> impl Iterator<Item = &SavedWindow> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.strips)
+            .flat_map(|strip| &strip.columns)
+            .flat_map(SavedColumn::windows)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn windows_mut(&mut self) -> impl Iterator<Item = &mut SavedWindow> {
+        self.workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.strips)
+            .flat_map(|strip| &mut strip.columns)
+            .flat_map(SavedColumn::windows_mut)
+    }
+
     #[allow(clippy::type_complexity, clippy::too_many_lines)]
-    pub fn extract(
-        workspaces: &Query<(
-            Option<&ChildOf>,
-            &LayoutStrip,
-            Option<&Position>,
-            Has<ActiveWorkspaceMarker>,
-        )>,
+    pub fn extract<'a>(
+        workspaces: impl IntoIterator<
+            Item = (
+                Option<&'a ChildOf>,
+                &'a LayoutStrip,
+                Option<&'a Position>,
+                bool,
+            ),
+        >,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
         apps: &Query<&Application>,
+        previous: Option<&Self>,
     ) -> Self {
         let mut display_entity_ids = HashMap::new();
         let mut display_workspace_ids: HashMap<Entity, Vec<WorkspaceId>> = HashMap::new();
@@ -190,7 +284,7 @@ impl PaneruState {
             for col in strip.columns() {
                 let saved_col = match col {
                     Column::Single(entity) => {
-                        SavedWindow::from_entity(*entity, windows, apps, strip_position_x)
+                        SavedWindow::from_entity(*entity, windows, apps, strip_position_x, previous)
                             .map(SavedColumn::Single)
                     }
                     Column::Stack(items) => {
@@ -202,6 +296,7 @@ impl PaneruState {
                                     windows,
                                     apps,
                                     strip_position_x,
+                                    previous,
                                 )
                                 .map(SavedStackItem::Single),
                                 StackItem::Tabs(tabs) => {
@@ -213,6 +308,7 @@ impl PaneruState {
                                                 windows,
                                                 apps,
                                                 strip_position_x,
+                                                previous,
                                             )
                                         })
                                         .collect();
@@ -234,7 +330,13 @@ impl PaneruState {
                         let saved_tabs: Vec<_> = tabs
                             .iter()
                             .filter_map(|&e| {
-                                SavedWindow::from_entity(e, windows, apps, strip_position_x)
+                                SavedWindow::from_entity(
+                                    e,
+                                    windows,
+                                    apps,
+                                    strip_position_x,
+                                    previous,
+                                )
                             })
                             .collect();
                         if saved_tabs.is_empty() {
@@ -244,7 +346,7 @@ impl PaneruState {
                         }
                     }
                     Column::Fullscren(entity) => {
-                        SavedWindow::from_entity(*entity, windows, apps, strip_position_x)
+                        SavedWindow::from_entity(*entity, windows, apps, strip_position_x, previous)
                             .map(SavedColumn::Fullscreen)
                     }
                 };

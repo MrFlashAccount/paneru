@@ -673,7 +673,27 @@ pub struct ReadDisplayProperties(pub Entity);
 pub struct SendMessageTrigger(pub Event);
 
 #[derive(BevyEvent)]
-pub struct RestoreWindowState;
+pub struct RestoreWindowState {
+    added_window_ids: Option<Vec<WinID>>,
+}
+
+impl RestoreWindowState {
+    fn startup() -> Self {
+        Self {
+            added_window_ids: None,
+        }
+    }
+
+    fn for_added_windows(added_window_ids: Vec<WinID>) -> Self {
+        Self {
+            added_window_ids: Some(added_window_ids),
+        }
+    }
+
+    fn added_window_ids(&self) -> Option<&[WinID]> {
+        self.added_window_ids.as_deref()
+    }
+}
 
 /// Marks ownership chosen by the session restore planner until the normal
 /// Added<Window> setup pass has observed it.
