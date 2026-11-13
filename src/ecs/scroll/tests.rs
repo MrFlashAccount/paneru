@@ -473,13 +473,27 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
                 .expect("first window has a transient position");
             state.os_move_window(0, delayed_position);
         })
+        .on_iteration(12, |world, _state| {
+            // Animation time advances manually, but scroll cleanup uses a
+            // monotonic deadline. Exercise cleanup explicitly instead of
+            // assuming the runner finishes this test within the idle timeout.
+            let mut strips = world.query_filtered::<&mut Scrolling, With<ActiveWorkspaceMarker>>();
+            for mut scrolling in strips.iter_mut(world) {
+                scrolling.last_event = Instant::now() - Duration::from_millis(100);
+            }
+        })
         .on_iteration(13, |world, _state| {
-            let mut strip =
-                world.query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>();
-            let (position, scrolling) = strip.single(world).expect("active scrolling workspace");
+            let mut strip = world.query_filtered::<
+                (&Position, Option<&Scrolling>, Has<EdgeOverscrollVisual>),
+                With<ActiveWorkspaceMarker>,
+            >();
+            let (position, scrolling, overscroll) = strip.single(world).expect("active workspace");
             assert_eq!(position.x, 0);
-            assert_eq!(scrolling.position, 0.0);
-            assert!(!scrolling.edge_overscroll.is_active());
+            assert!(
+                scrolling.is_none(),
+                "settled scroll state is reclaimed after its deadline"
+            );
+            assert!(!overscroll, "no transient offset survives settlement");
 
             let mut windows = world.query::<(&Window, &Position)>();
             assert!(
@@ -488,6 +502,9 @@ fn edge_overscroll_moves_only_visual_frames_then_restores_authored_positions() {
                     .all(|(window, position)| window.frame().min == position.0),
                 "settlement restores exact authored window positions"
             );
+            for (window, position) in windows.iter(world) {
+                assert_eq!(position.x, window.id() * crate::tests::TEST_WINDOW_WIDTH);
+            }
         })
         .run(commands);
 }

@@ -1432,19 +1432,33 @@ fn test_move_appends_to_end_by_default() {
 /// mid-move would be invisible to a settle-then-check.
 #[test]
 fn test_mid_strip_move_does_not_animate() {
-    let config: Config = (
-        MainOptions {
-            insert_windows_mid_strip: Some(true),
-            animation_speed: Some(12.0),
-            virtual_workspace_animations: Some(false),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
+    // Keep this off-grid workspace-move scenario independent of paging's
+    // release snap, whose wall-clock deadline can fire between test updates.
+    let config = Config::try_from(
+        r"
+[options]
+insert_windows_mid_strip = true
+animation_speed = 12.0
+virtual_workspace_animations = false
+swipe_gesture_fingers = 3
+
+[swipe]
+paging = false
+
+[bindings]
+",
     )
-        .into();
+    .expect("valid mid-strip move config");
 
     let mut h = TestHarness::new().with_config(config).with_windows(8);
+    // Discovery creates the initial focus in Update; movement commands run
+    // in PreUpdate and would otherwise drop the first setup move.
+    for _ in 0..5 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+    }
     let pump = |h: &mut TestHarness, c: Command| {
         h.app
             .world_mut()
@@ -1455,6 +1469,34 @@ fn test_mid_strip_move_does_not_animate() {
                 h.app.world_mut().write_message::<Event>(e);
             }
         }
+        // Moving within one app confirms focus on a monotonic deadline, not
+        // after a fixed number of Bevy frames. Finish that setup operation
+        // before the next command chooses its focused window.
+        for _ in 0..8 {
+            let Some(deadline) = h
+                .app
+                .world()
+                .resource::<crate::ecs::focus::FocusIntentState>()
+                .next_deadline()
+            else {
+                break;
+            };
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            for _ in 0..3 {
+                h.app.update();
+                for event in h.mock_state.drain_events() {
+                    h.app.world_mut().write_message::<Event>(event);
+                }
+            }
+        }
+        assert!(
+            h.app
+                .world()
+                .resource::<crate::ecs::focus::FocusIntentState>()
+                .pending()
+                .is_none(),
+            "setup command must finish native focus before the next command"
+        );
     };
 
     // Build a scrolled VW1 and scroll VW0 too, so the move is off the grid.
@@ -1465,6 +1507,9 @@ fn test_mid_strip_move_does_not_animate() {
         );
     }
     pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::TouchpadDown);
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
@@ -1476,6 +1521,9 @@ fn test_mid_strip_move_does_not_animate() {
         }
     }
     pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::TouchpadDown);
     h.app.world_mut().write_message::<Event>(Event::Swipe {
         delta: 0.3,
         fingers: 3,
@@ -1488,6 +1536,19 @@ fn test_mid_strip_move_does_not_animate() {
     }
 
     // Follow-move into the existing VW1, checking every update for animation.
+    let mover = {
+        let world = h.app.world_mut();
+        let mover = find_window_entity(focused_window_id(world), world);
+        let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+        let source = strips.iter(world).find(|(_, active)| *active).unwrap().0;
+        assert_eq!(source.virtual_index, 0);
+        assert_eq!(source.len(), 4, "setup moves exactly four windows to VW1");
+        assert!(
+            source.contains(mover),
+            "the next command must target the active row"
+        );
+        mover
+    };
     h.app.world_mut().write_message::<Event>(Event::Command {
         command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
     });
@@ -1504,6 +1565,15 @@ fn test_mid_strip_move_does_not_animate() {
             "step {step}: no window should animate during a mid-strip move, got {animating:?}",
         );
     }
+    let world = h.app.world_mut();
+    let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+    let target = strips.iter(world).find(|(_, active)| *active).unwrap().0;
+    assert_eq!(target.virtual_index, 1);
+    assert_eq!(target.len(), 5);
+    assert!(
+        target.contains(mover),
+        "the command must actually move the focused window"
+    );
 }
 
 /// Switching virtual workspaces with `virtual_workspace_animations = false` must
